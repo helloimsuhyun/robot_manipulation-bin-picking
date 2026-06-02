@@ -479,6 +479,11 @@ class ObjectPoseTransformNode(Node):
         self.declare_parameter("peg_output_topic", "/vision/peg_targets")
         self.declare_parameter("hole_output_topic", "/vision/hole_targets")
 
+        # Mode switching is handled in the vision node.
+        # This node waits after publishing /detect_mode before it either
+        # sends the object 6D trigger or starts accepting insert results.
+        # Do NOT drop callbacks using this value; delay the request/accept state instead.
+        self.declare_parameter("detect_mode_settle_sec", 0.5)
 
         self.class_to_id = {
             "cylinder": 0,
@@ -521,6 +526,9 @@ class ObjectPoseTransformNode(Node):
         self.pending_trigger_msg = None
         self.pending_object_idx = None
 
+        self.object_trigger_delay_timer = None
+        self.insert_settle_timer = None
+
         # ----------------------------
         # ROS I/O
         # ----------------------------
@@ -561,7 +569,18 @@ class ObjectPoseTransformNode(Node):
     # State helpers
     # ============================================================
 
+    def cancel_timer_if_alive(self, timer_attr: str):
+        timer = getattr(self, timer_attr, None)
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+            setattr(self, timer_attr, None)
+
     def reset_pending(self):
+        self.cancel_timer_if_alive("object_trigger_delay_timer")
+        self.cancel_timer_if_alive("insert_settle_timer")
         self.pending_task = None
         self.pending_trigger_msg = None
         self.pending_object_idx = None
@@ -1058,6 +1077,21 @@ class ObjectPoseTransformNode(Node):
         validate_T(base_T_ee, name="base_T_ee")
         return object_idx, base_T_ee
 
+    def schedule_once(self, delay_sec: float, timer_attr: str, callback):
+        delay_sec = max(float(delay_sec), 0.0)
+
+        self.cancel_timer_if_alive(timer_attr)
+
+        if delay_sec <= 1e-6:
+            callback()
+            return
+
+        def _wrapped_callback():
+            self.cancel_timer_if_alive(timer_attr)
+            callback()
+
+        setattr(self, timer_attr, self.create_timer(delay_sec, _wrapped_callback))
+
     def peg_trigger_callback(self, trigger_msg):
         if self.pending_task is not None:
             self.get_logger().warn(f"ignore peg trigger: pending_task={self.pending_task}")
@@ -1072,9 +1106,29 @@ class ObjectPoseTransformNode(Node):
 
         self.pending_trigger_msg = trigger_msg
         self.pending_object_idx = object_idx
-        self.pending_task = "peg_wait_object"
+        self.pending_task = "peg_settling"
 
         self.publish_detect_mode("object")
+
+        delay_sec = float(self.get_parameter("detect_mode_settle_sec").value)
+        self.get_logger().info(
+            f"peg trigger accepted: switch detect_mode=object, "
+            f"wait {delay_sec:.3f}s, then send object 6D trigger"
+        )
+        self.schedule_once(
+            delay_sec,
+            "object_trigger_delay_timer",
+            lambda: self.finish_peg_settle_and_trigger_object(object_idx),
+        )
+
+    def finish_peg_settle_and_trigger_object(self, object_idx: int):
+        if self.pending_task != "peg_settling":
+            self.get_logger().warn(
+                f"skip delayed object 6D trigger: pending_task={self.pending_task}"
+            )
+            return
+
+        self.pending_task = "peg_wait_object"
         self.publish_object_6d_trigger(object_idx)
 
     def hole_trigger_callback(self, trigger_msg):
@@ -1083,9 +1137,30 @@ class ObjectPoseTransformNode(Node):
             return
 
         self.pending_trigger_msg = trigger_msg
-        self.pending_task = "hole_wait_insert"
+        self.pending_task = "hole_settling"
 
         self.publish_detect_mode("insert")
+
+        delay_sec = float(self.get_parameter("detect_mode_settle_sec").value)
+        self.get_logger().info(
+            f"hole trigger accepted: switch detect_mode=insert, "
+            f"wait {delay_sec:.3f}s, then accept next insert result"
+        )
+        self.schedule_once(
+            delay_sec,
+            "insert_settle_timer",
+            self.finish_hole_settle_and_wait_insert,
+        )
+
+    def finish_hole_settle_and_wait_insert(self):
+        if self.pending_task != "hole_settling":
+            self.get_logger().warn(
+                f"skip insert wait after settling: pending_task={self.pending_task}"
+            )
+            return
+
+        self.pending_task = "hole_wait_insert"
+        self.get_logger().info("hole trigger: now accepting next /insert_poses message")
 
     def collect_peg_object_frame(self):
         object_idx, base_T_ee = self.parse_peg_trigger_data(self.pending_trigger_msg)
