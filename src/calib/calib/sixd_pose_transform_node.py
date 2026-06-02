@@ -212,6 +212,104 @@ def matrix_from_data(data, unit: str = "mm") -> np.ndarray:
     return T
 
 
+def normalize_vec(v: np.ndarray, name: str = "vector") -> np.ndarray:
+    v = np.asarray(v, dtype=np.float64).reshape(3)
+    n = float(np.linalg.norm(v))
+    if n < 1e-12:
+        raise ValueError(f"{name}: norm is too small.")
+    return v / n
+
+
+def canonicalize_object_axes_z_up_xy_order(
+    T_base_obj: np.ndarray,
+    up_axis_base: np.ndarray = np.array([0.0, 0.0, 1.0], dtype=np.float64),
+    z_flip_margin: float = 0.05,
+    xy_down_margin: float = 0.05,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    Canonicalize object frame axes with respect to the base/world ground plane.
+
+    Assumption:
+        base/world +Z is upward, so a negative dot with +Z means
+        the axis points into the ground.
+
+    Rules:
+      1) If object +Z points into the ground, use the opposite direction as +Z.
+         To preserve a right-handed frame, +X is flipped together with +Z.
+
+      2) Between object +X and +Y, if +X points more into the ground than +Y,
+         swap the planar axis role while preserving right-handedness:
+             new_x = old_y
+             new_y = -old_x
+             new_z = old_z
+
+    Translation is not changed.
+    """
+    T = np.asarray(T_base_obj, dtype=np.float64).reshape(4, 4).copy()
+    validate_T(T, name="canonicalize input")
+
+    up = normalize_vec(up_axis_base, name="up_axis_base")
+
+    R = orthonormalize_R(T[:3, :3])
+    x = R[:, 0].copy()
+    y = R[:, 1].copy()
+    z = R[:, 2].copy()
+
+    info: Dict[str, Any] = {
+        "z_flipped": False,
+        "xy_swapped": False,
+        "before_dot_up": {
+            "x": float(np.dot(x, up)),
+            "y": float(np.dot(y, up)),
+            "z": float(np.dot(z, up)),
+        },
+    }
+
+    z_dot_up = float(np.dot(z, up))
+
+    # Rule 1: object +Z must not point into the ground.
+    # Use a small margin so near-horizontal/noisy axes do not flip randomly.
+    if z_dot_up < -float(z_flip_margin):
+        # [x, y, z] -> [-x, y, -z] keeps det(R)=+1.
+        x = -x
+        z = -z
+        info["z_flipped"] = True
+
+    # Rule 2: Compare only the downward component of +X and +Y.
+    # down_score = 0 means not pointing into the ground.
+    # Larger down_score means closer to base/world -Z.
+    down_x = max(0.0, -float(np.dot(x, up)))
+    down_y = max(0.0, -float(np.dot(y, up)))
+    info["down_score"] = {"x": float(down_x), "y": float(down_y)}
+
+    if down_x > down_y + float(xy_down_margin):
+        old_x = x.copy()
+        old_y = y.copy()
+        x = old_y
+        y = -old_x
+        info["xy_swapped"] = True
+
+    # Rebuild a clean right-handed orthonormal frame while preserving chosen +Z and +X.
+    z = normalize_vec(z, name="canonicalized z")
+    x = x - z * float(np.dot(x, z))
+    x = normalize_vec(x, name="canonicalized x")
+    y = np.cross(z, x)
+    y = normalize_vec(y, name="canonicalized y")
+
+    R_new = np.column_stack([x, y, z])
+    R_new = orthonormalize_R(R_new)
+
+    T[:3, :3] = R_new
+    validate_T(T, name="canonicalized base_T_obj")
+
+    info["after_dot_up"] = {
+        "x": float(np.dot(T[:3, 0], up)),
+        "y": float(np.dot(T[:3, 1], up)),
+        "z": float(np.dot(T[:3, 2], up)),
+    }
+    return T, info
+
+
 def object_json_to_cam_T_obj_mm(obj: Dict[str, Any]) -> np.ndarray:
     """
     Convert object pose JSON from FoundationPose / detector node to camera_T_object in mm.
@@ -353,6 +451,19 @@ class ObjectPoseTransformNode(Node):
         self.declare_parameter("object_grasp_yaml_path", "")
         self.declare_parameter("peg_target_pose_mode", "object")  # object | grasp
 
+        # Axis canonicalization is applied to the final target frame, not to the raw
+        # object frame before object_T_grasp. This preserves the meaning of
+        # object_T_grasp as a transform defined in the raw/CAD object frame.
+        #
+        # object mode:
+        #     base_T_obj_raw -> optional canonicalized base_T_object
+        # grasp mode:
+        #     base_T_obj_raw @ object_T_grasp -> optional canonicalized base_T_grasp
+        self.declare_parameter("canonicalize_object_axes", True)
+        self.declare_parameter("canonicalize_grasp_axes", True)
+        self.declare_parameter("canonicalize_z_flip_margin", 0.05)
+        self.declare_parameter("canonicalize_xy_down_margin", 0.05)
+
         self.declare_parameter("min_confidence", 0.3)
         self.declare_parameter("object_topic", "/object_poses")
         self.declare_parameter("insert_topic", "/insert_poses")
@@ -368,12 +479,6 @@ class ObjectPoseTransformNode(Node):
         self.declare_parameter("peg_output_topic", "/vision/peg_targets")
         self.declare_parameter("hole_output_topic", "/vision/hole_targets")
 
-        self.declare_parameter("duplicate_dist_mm", 12.0)
-        self.declare_parameter("collect_frames", 5)
-        self.declare_parameter("detect_mode_settle_sec", 0.5)
-
-        # If true, output only the best target by confidence after duplicate suppression.
-        self.declare_parameter("publish_best_only", True)
 
         self.class_to_id = {
             "cylinder": 0,
@@ -416,10 +521,6 @@ class ObjectPoseTransformNode(Node):
         self.pending_trigger_msg = None
         self.pending_object_idx = None
 
-        self.collect_count = 0
-        self.collected_targets = []
-        self.mode_switch_time = None
-
         # ----------------------------
         # ROS I/O
         # ----------------------------
@@ -457,31 +558,13 @@ class ObjectPoseTransformNode(Node):
         )
 
     # ============================================================
-    # Time / state helpers
+    # State helpers
     # ============================================================
-
-    def now_sec(self):
-        return self.get_clock().now().nanoseconds * 1e-9
-
-    def is_settle_done(self):
-        if self.mode_switch_time is None:
-            return True
-
-        settle_sec = float(self.get_parameter("detect_mode_settle_sec").value)
-        return (self.now_sec() - self.mode_switch_time) >= settle_sec
-
-    def start_collect(self):
-        self.collect_count = 0
-        self.collected_targets = []
-        self.mode_switch_time = self.now_sec()
 
     def reset_pending(self):
         self.pending_task = None
         self.pending_trigger_msg = None
         self.pending_object_idx = None
-        self.collect_count = 0
-        self.collected_targets = []
-        self.mode_switch_time = None
 
     def publish_detect_mode(self, mode):
         msg = String()
@@ -746,18 +829,64 @@ class ObjectPoseTransformNode(Node):
 
         try:
             cam_T_obj = object_json_to_cam_T_obj_mm(obj)
-            base_T_obj = base_T_ee @ self.ee_T_cam @ cam_T_obj
-            validate_T(base_T_obj, name=f"base_T_obj[{cls}]")
+            base_T_obj_raw = base_T_ee @ self.ee_T_cam @ cam_T_obj
+            validate_T(base_T_obj_raw, name=f"base_T_obj_raw[{cls}]")
 
             target_mode = str(self.get_parameter("peg_target_pose_mode").value).strip().lower()
+
             if target_mode == "object":
-                base_T_target = base_T_obj
+                # Object output: canonicalization is applied directly to the object frame.
+                if bool(self.get_parameter("canonicalize_object_axes").value):
+                    base_T_target, axis_info = canonicalize_object_axes_z_up_xy_order(
+                        base_T_obj_raw,
+                        z_flip_margin=float(self.get_parameter("canonicalize_z_flip_margin").value),
+                        xy_down_margin=float(self.get_parameter("canonicalize_xy_down_margin").value),
+                    )
+                    if axis_info["z_flipped"] or axis_info["xy_swapped"]:
+                        self.get_logger().info(
+                            f"canonicalized object target axes class={cls} "
+                            f"z_flipped={axis_info['z_flipped']} "
+                            f"xy_swapped={axis_info['xy_swapped']} "
+                            f"before_dot_up={axis_info['before_dot_up']} "
+                            f"down_score={axis_info.get('down_score', {})} "
+                            f"after_dot_up={axis_info['after_dot_up']}"
+                        )
+                else:
+                    base_T_target = base_T_obj_raw
+
+                validate_T(base_T_target, name=f"base_T_object_target[{cls}]")
                 target_frame = "object"
+
             elif target_mode == "grasp":
+                # Grasp output: first apply object_T_grasp in the raw/CAD object frame,
+                # then canonicalize the resulting grasp frame in base/world coordinates.
+                # This is the intended pipeline:
+                #     RAW object -> 1st grasp -> final axis-canonical grasp
                 object_T_grasp = self.get_object_to_grasp_for_class(cls)
-                base_T_target = base_T_obj @ object_T_grasp
-                validate_T(base_T_target, name=f"base_T_grasp[{cls}]")
+                base_T_grasp_raw = base_T_obj_raw @ object_T_grasp
+                validate_T(base_T_grasp_raw, name=f"base_T_grasp_raw[{cls}]")
+
+                if bool(self.get_parameter("canonicalize_grasp_axes").value):
+                    base_T_target, axis_info = canonicalize_object_axes_z_up_xy_order(
+                        base_T_grasp_raw,
+                        z_flip_margin=float(self.get_parameter("canonicalize_z_flip_margin").value),
+                        xy_down_margin=float(self.get_parameter("canonicalize_xy_down_margin").value),
+                    )
+                    if axis_info["z_flipped"] or axis_info["xy_swapped"]:
+                        self.get_logger().info(
+                            f"canonicalized grasp target axes class={cls} "
+                            f"z_flipped={axis_info['z_flipped']} "
+                            f"xy_swapped={axis_info['xy_swapped']} "
+                            f"before_dot_up={axis_info['before_dot_up']} "
+                            f"down_score={axis_info.get('down_score', {})} "
+                            f"after_dot_up={axis_info['after_dot_up']}"
+                        )
+                else:
+                    base_T_target = base_T_grasp_raw
+
+                validate_T(base_T_target, name=f"base_T_grasp_target[{cls}]")
                 target_frame = "grasp"
+
             else:
                 raise ValueError("peg_target_pose_mode must be 'object' or 'grasp'.")
 
@@ -854,41 +983,6 @@ class ObjectPoseTransformNode(Node):
                 targets.append(target)
         return targets
 
-    def suppress_duplicate_targets_by_conf(self, targets, dist_thresh_mm):
-        kept = []
-        targets_sorted = sorted(
-            targets,
-            key=lambda t: float(t["confidence"]),
-            reverse=True,
-        )
-
-        for t in targets_sorted:
-            duplicate = False
-
-            for k in kept:
-                if int(t["id"]) != int(k["id"]):
-                    continue
-
-                dist_mm = float(np.hypot(t["x"] - k["x"], t["y"] - k["y"]))
-
-                if dist_mm < dist_thresh_mm:
-                    duplicate = True
-                    self.get_logger().info(
-                        f"suppress duplicate target | "
-                        f"drop={t['class']} conf={t['confidence']:.2f} "
-                        f"keep={k['class']} conf={k['confidence']:.2f} "
-                        f"id={t['id']} dist={dist_mm:.1f}mm"
-                    )
-                    break
-
-            if not duplicate:
-                kept.append(t)
-
-        if bool(self.get_parameter("publish_best_only").value) and len(kept) > 1:
-            kept = sorted(kept, key=lambda t: float(t["confidence"]), reverse=True)[:1]
-
-        return kept
-
     @staticmethod
     def object_targets_to_msg_data(targets):
         """
@@ -980,7 +1074,6 @@ class ObjectPoseTransformNode(Node):
         self.pending_object_idx = object_idx
         self.pending_task = "peg_wait_object"
 
-        self.start_collect()
         self.publish_detect_mode("object")
         self.publish_object_6d_trigger(object_idx)
 
@@ -992,13 +1085,9 @@ class ObjectPoseTransformNode(Node):
         self.pending_trigger_msg = trigger_msg
         self.pending_task = "hole_wait_insert"
 
-        self.start_collect()
         self.publish_detect_mode("insert")
 
     def collect_peg_object_frame(self):
-        if not self.is_settle_done():
-            return
-
         object_idx, base_T_ee = self.parse_peg_trigger_data(self.pending_trigger_msg)
         if self.pending_object_idx is not None:
             object_idx = int(self.pending_object_idx)
@@ -1008,22 +1097,15 @@ class ObjectPoseTransformNode(Node):
             base_T_ee,
             requested_object_idx=object_idx,
         )
-        self.collected_targets.extend(targets)
-        self.collect_count += 1
 
-        collect_frames = int(self.get_parameter("collect_frames").value)
         self.get_logger().info(
-            f"[COLLECT PEG-OBJECT] frame={self.collect_count}/{collect_frames}, "
-            f"requested_id={object_idx}, targets={len(targets)}, "
+            f"[PEG-OBJECT] requested_id={object_idx}, "
+            f"targets={len(targets)}, "
             f"visible_ids={self.latest_object_available_ids}, "
-            f"perception_status={self.latest_object_status}, "
-            f"total={len(self.collected_targets)}"
+            f"perception_status={self.latest_object_status}"
         )
 
-        # Object 6D node publishes one JSON response per explicit trigger.
-        # If that response has no valid requested target, immediately return
-        # the currently visible object-id list on /vision/peg_targets.
-        if not targets and self.latest_object_status in {"no_detection", "fp_failed"}:
+        if not targets:
             self.publish_object_visible_ids_response(
                 publisher=self.peg_pub,
                 topic_name=self.peg_output_topic,
@@ -1033,40 +1115,40 @@ class ObjectPoseTransformNode(Node):
             )
             return
 
-        if self.collect_count < collect_frames:
-            return
+        # requested_object_idx already filters the requested class/id.
+        # If multiple detections remain, use the highest-confidence target.
+        target = max(targets, key=lambda t: float(t["confidence"]))
 
-        self.publish_final_object_targets(
+        self.publish_object_target_once(
             publisher=self.peg_pub,
             topic_name=self.peg_output_topic,
-            targets=self.collected_targets,
+            target=target,
             label="PEG-OBJECT",
         )
 
     def collect_hole_insert_frame(self):
-        if not self.is_settle_done():
-            return
-
         base_T_ee = pose6_mm_deg_to_T_mm(self.pending_trigger_msg.data)
         validate_T(base_T_ee, name="base_T_ee")
 
+        # Legacy insert/hole behavior without multi-frame collection
+        # and without distance-based duplicate suppression.
+        # Publish all valid targets from the current /insert_poses message
+        # in [x_mm, y_mm, yaw_deg, id] chunks.
         targets = self.make_legacy_targets_from_inserts(self.latest_inserts, base_T_ee)
-        self.collected_targets.extend(targets)
-        self.collect_count += 1
 
-        collect_frames = int(self.get_parameter("collect_frames").value)
         self.get_logger().info(
-            f"[COLLECT HOLE-INSERT] frame={self.collect_count}/{collect_frames}, "
-            f"targets={len(targets)}, total={len(self.collected_targets)}"
+            f"[HOLE-INSERT] current_frame_targets={len(targets)}"
         )
 
-        if self.collect_count < collect_frames:
+        if not targets:
+            self.get_logger().warn("[HOLE-INSERT] no valid target")
+            self.reset_pending()
             return
 
-        self.publish_final_insert_targets(
+        self.publish_insert_targets_once(
             publisher=self.hole_pub,
             topic_name=self.hole_output_topic,
-            targets=self.collected_targets,
+            targets=targets,
             label="HOLE-INSERT",
         )
 
@@ -1090,80 +1172,52 @@ class ObjectPoseTransformNode(Node):
         self.publish_repeated(publisher, msg, count=10)
         self.reset_pending()
 
-    def publish_final_object_targets(self, publisher, topic_name: str, targets: List[Dict[str, Any]], label: str):
-        final_targets = self.suppress_duplicate_targets_by_conf(
-            targets,
-            dist_thresh_mm=float(self.get_parameter("duplicate_dist_mm").value),
-        )
-
-        if not final_targets:
-            self.publish_object_visible_ids_response(
-                publisher=publisher,
-                topic_name=topic_name,
-                visible_ids=self.latest_object_available_ids,
-                requested_id=self.pending_object_idx,
-                label=label,
-            )
-            return
-
+    def publish_object_target_once(self, publisher, topic_name: str, target: Dict[str, Any], label: str):
         msg = Float64MultiArray()
-        msg.data = self.object_targets_to_msg_data(final_targets)
+        msg.data = self.object_targets_to_msg_data([target])
 
-        debug_targets = []
-        for t in final_targets:
-            debug_targets.append({
-                "class": t["class"],
-                "id": t["id"],
-                "confidence": round(float(t["confidence"]), 3),
-                "target_frame": t["target_frame"],
-                "target_T": np.asarray(t["target_T"]).round(3).tolist(),
-            })
+        debug_target = {
+            "class": target["class"],
+            "id": target["id"],
+            "confidence": round(float(target["confidence"]), 3),
+            "target_frame": target["target_frame"],
+            "target_T": np.asarray(target["target_T"]).round(3).tolist(),
+        }
 
         self.get_logger().info(
             f"[PUBLISH] topic={topic_name} type={label} format=matrix16_id_17_success "
-            f"num_targets={len(final_targets)} targets={debug_targets} "
-            f"data_len={len(msg.data)}"
+            f"target={debug_target} data_len={len(msg.data)}"
         )
 
         self.publish_repeated(publisher, msg, count=10)
         self.reset_pending()
 
-    def publish_final_insert_targets(self, publisher, topic_name: str, targets: List[Dict[str, Any]], label: str):
-        final_targets = self.suppress_duplicate_targets_by_conf(
-            targets,
-            dist_thresh_mm=float(self.get_parameter("duplicate_dist_mm").value),
-        )
-
-        if not final_targets:
-            self.get_logger().warn(f"{label}: no valid target after collection")
-            self.reset_pending()
-            return
-
+    def publish_insert_targets_once(self, publisher, topic_name: str, targets: List[Dict[str, Any]], label: str):
         msg = Float64MultiArray()
-        msg.data = self.insert_targets_to_msg_data(final_targets)
+        msg.data = self.insert_targets_to_msg_data(targets)
 
         debug_targets = []
-        for t in final_targets:
+        for target in targets:
             debug_targets.append({
-                "class": t["class"],
-                "id": t["id"],
-                "confidence": round(float(t["confidence"]), 3),
-                "x": round(float(t["x"]), 3),
-                "y": round(float(t["y"]), 3),
-                "yaw": round(float(t["yaw"]), 3),
-                "yaw_source": t.get("yaw_source", None),
-                "source_yaw_deg": t.get("source_yaw_deg", None),
-                "source_yaw_score": t.get("source_yaw_score", None),
+                "class": target["class"],
+                "id": target["id"],
+                "confidence": round(float(target["confidence"]), 3),
+                "x": round(float(target["x"]), 3),
+                "y": round(float(target["y"]), 3),
+                "yaw": round(float(target["yaw"]), 3),
+                "yaw_source": target.get("yaw_source", None),
+                "source_yaw_deg": target.get("source_yaw_deg", None),
+                "source_yaw_score": target.get("source_yaw_score", None),
             })
 
         self.get_logger().info(
-            f"[PUBLISH] topic={topic_name} type={label} format=legacy_xyyaw_4 "
-            f"num_targets={len(final_targets)} targets={debug_targets} "
-            f"data_len={len(msg.data)}"
+            f"[PUBLISH] topic={topic_name} type={label} format=legacy_xyyaw_4xN "
+            f"num_targets={len(targets)} targets={debug_targets} data_len={len(msg.data)}"
         )
 
         self.publish_repeated(publisher, msg, count=10)
         self.reset_pending()
+
 
 def main(args=None):
     rclpy.init(args=args)
