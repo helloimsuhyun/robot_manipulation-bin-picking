@@ -1,0 +1,70 @@
+unit: mm
+default_pregrasp_distance_mm: 80.0
+default_pregrasp_axis: -z
+objects:
+  cylinder:
+    object_to_grasp:
+      unit: mm
+      matrix:
+      - - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+      - - 0.0
+        - 1.0
+        - 0.0
+        - 0.0
+      - - 0.0
+        - 0.0
+        - 1.0
+        - 0.0
+      - - 0.0
+        - 0.0
+        - 0.0
+        - 1.0
+    pregrasp_distance_mm: 80.0
+    pregrasp_axis: -z
+  hole:
+    object_to_grasp:
+      unit: mm
+      matrix:
+      - - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+      - - 0.0
+        - 1.0
+        - 0.0
+        - 0.0
+      - - 0.0
+        - 0.0
+        - 1.0
+        - 0.0
+      - - 0.0
+        - 0.0
+        - 0.0
+        - 1.0
+    pregrasp_distance_mm: 80.0
+    pregrasp_axis: -z
+  cross:
+    object_to_grasp:
+      unit: mm
+      matrix:
+      - - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+      - - 0.0
+        - 1.0
+        - 0.0
+        - 0.0
+      - - 0.0
+        - 0.0
+        - 1.0
+        - 0.0
+      - - 0.0
+        - 0.0
+        - 0.0
+        - 1.0
+    pregrasp_distance_mm: 80.0
+    pregrasp_axis: -z

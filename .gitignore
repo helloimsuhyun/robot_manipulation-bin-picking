@@ -47,3 +47,6 @@ Thumbs.db
 # Hand-eye calibration captures
 **/handeye_capture_rs/*
 !**/handeye_capture_rs/handeye_result.json
+
+cylinder/
+FoundationPose/
