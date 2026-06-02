@@ -1,0 +1,128 @@
+"""
+cd ~/course/robot_manipulation-bin-picking
+
+rm -rf build/ install/ log/
+
+colcon build --symlink-install --packages-select sixd_pose_vision calib control bringup
+
+source install/setup.bash
+
+ros2 launch bringup 6d_peg_in_hole_bringup.launch.py
+
+"""
+
+
+from launch import LaunchDescription
+from launch.actions import IncludeLaunchDescription, TimerAction
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import PathJoinSubstitution
+from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
+
+
+def generate_launch_description():
+    sixd_pose_share = FindPackageShare("sixd_pose_vision")
+
+    mixed_pose_vision_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            PathJoinSubstitution([
+                sixd_pose_share,
+                "launch",
+                "mixed_pose_vision.launch.py",
+            ])
+        )
+    )
+
+    sixd_pose_transform_node = Node(
+        package="calib",
+        executable="object_pose_transform_node",
+        name="sixd_pose_transform_node",
+        output="screen",
+        parameters=[{
+            "handeye_result_path": (
+                "/home/choisuhyun/course/robot_manipulation-bin-picking/"
+                "src/calib/config/handeye_capture_rs/handeye_result.json"
+            ),
+            "object_grasp_yaml_path": (
+                "/home/choisuhyun/course/robot_manipulation-bin-picking/"
+                "src/sixd_pose_vision/config/object_grasp.yaml"
+            ),
+            "peg_target_pose_mode": "object",
+            "min_confidence": 0.3,
+
+            "object_topic": "/object_poses",
+            "insert_topic": "/insert_poses",
+            "detect_mode_topic": "/detect_mode",
+
+            "peg_trigger_topic": "/manipulation/trigger_peg",
+            "hole_trigger_topic": "/manipulation/trigger_hole",
+
+            "object_6d_trigger_topic": "/object_6d_trigger",
+
+            "peg_output_topic": "/vision/peg_targets",
+            "hole_output_topic": "/vision/hole_targets",
+
+            "duplicate_dist_mm": 12.0,
+            "collect_frames": 5,
+            "detect_mode_settle_sec": 0.5,
+            "publish_best_only": True,
+        }],
+    )
+
+    peg_in_hole_controller_node = Node(
+        package="control",
+        executable="peg_in_hole_controller",
+        name="peg_in_hole_controller",
+        output="screen",
+        parameters=[{
+            "robot_ip": "192.168.1.10",
+            "use_simulation_mode": False,
+
+            "gripper_topic": "/grip_state",
+            "grip_open": 1,
+            "grip_close": 0,
+            "grip_stop": 2,
+
+            "home_joint": [-90.0, 0.0, 90.0, 0.0, 90.0, 45.0],
+            "peg_camera_joint": [10.87, 2.78, 79.15, 8.07, 90.0, 34.16],
+            "hole_camera_joint": [-169.23, 2.78, 79.15, 8.07, 90.0, 34.16],
+            "peg_return_mid_joint": [-47.0, 2.78, 79.15, 8.07, 90.0, 34.16],
+
+            "pick_down_target_z_mm": 69.83,
+            "pick_approach_offset_z_mm": 30.0,
+            "pick_up_target_z_mm": 110.0,
+
+            "place_approach_target_z_mm": 108.0,
+            "place_down_target_z_mm": 98.0,
+            "place_up_target_z_mm": 110.0,
+
+            "move_j_speed": 60.0,
+            "move_j_acc": 60.0,
+            "move_l_speed": 60.0,
+            "move_l_acc": 120.0,
+            "approach_move_l_speed": 60.0,
+            "approach_move_l_acc": 120.0,
+            "descend_move_l_speed": 20.0,
+            "descend_move_l_acc": 40.0,
+
+            "peg_targets_topic": "/vision/peg_targets",
+            "hole_targets_topic": "/vision/hole_targets",
+            "trigger_peg_topic": "/manipulation/trigger_peg",
+            "trigger_hole_topic": "/manipulation/trigger_hole",
+
+            "camera_settle_sec": 0.5,
+            "vision_wait_timeout_sec": 3.0,
+            "grasp_wait_sec": 1.0,
+            "release_wait_sec": 1.0,
+            "move_start_timeout_sec": 3.0,
+        }],
+    )
+
+    return LaunchDescription([
+        mixed_pose_vision_launch,
+        sixd_pose_transform_node,
+        TimerAction(
+            period=5.0,
+            actions=[peg_in_hole_controller_node],
+        ),
+    ])

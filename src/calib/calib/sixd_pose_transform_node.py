@@ -340,7 +340,7 @@ class ObjectPoseTransformNode(Node):
     """
 
     def __init__(self):
-        super().__init__("object_pose_transform_node")
+        super().__init__("sixd_pose_transform_node")
 
         # ----------------------------
         # Parameters

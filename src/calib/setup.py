@@ -36,6 +36,7 @@ setup(
     entry_points={
         'console_scripts': [
             'object_pose_transform_node = calib.object_pose_transform_node:main',
+            'sixd_pose_transform_node = calib.sixd_pose_transform_node:main',
         ],
     },
 )
