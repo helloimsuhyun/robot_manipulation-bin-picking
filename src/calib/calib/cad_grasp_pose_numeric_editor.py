@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """
-python cad_grasp_pose_editor.py \
-  --cad /home/choisuhyun/course/robot_manipulation-bin-picking/src/sixd_pose_vision/CAD/cross.stl\
-  --yaml /home/choisuhyun/course/robot_manipulation-bin-picking/src/calib/config/object_grasp.yaml\
-  --object cross \
+python cad_grasp_pose_numeric_editor.py \
+  --cad /home/choisuhyun/course/robot_manipulation-bin-picking/src/sixd_pose_vision/CAD/cylinder.stl \
+  --yaml /home/choisuhyun/course/robot_manipulation-bin-picking/src/calib/config/object_grasp.yaml \
+  --object cylinder \
   --output-yaml /home/choisuhyun/course/robot_manipulation-bin-picking/src/calib/config/object_grasp.yaml
 """
 
 import argparse
 import copy
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import yaml
+
+
+# ----------------------------- SE(3) utilities -----------------------------
 
 
 def orthonormalize_R(R: np.ndarray) -> np.ndarray:
@@ -40,6 +43,111 @@ def validate_T(T: np.ndarray, name: str = "T", atol: float = 1e-3) -> None:
         raise ValueError(f"{name}: R.T @ R must be close to I.")
 
 
+def Rx(angle_deg: float) -> np.ndarray:
+    t = np.deg2rad(float(angle_deg))
+    c, s = np.cos(t), np.sin(t)
+    return np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, c, -s],
+            [0.0, s, c],
+        ],
+        dtype=np.float64,
+    )
+
+
+def Ry(angle_deg: float) -> np.ndarray:
+    t = np.deg2rad(float(angle_deg))
+    c, s = np.cos(t), np.sin(t)
+    return np.array(
+        [
+            [c, 0.0, s],
+            [0.0, 1.0, 0.0],
+            [-s, 0.0, c],
+        ],
+        dtype=np.float64,
+    )
+
+
+def Rz(angle_deg: float) -> np.ndarray:
+    t = np.deg2rad(float(angle_deg))
+    c, s = np.cos(t), np.sin(t)
+    return np.array(
+        [
+            [c, -s, 0.0],
+            [s, c, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+def R_from_rpy_zyx_deg(rx_deg: float, ry_deg: float, rz_deg: float) -> np.ndarray:
+    """
+    Roll-pitch-yaw input, ZYX matrix construction.
+
+    Column-vector convention:
+      p_object = R @ p_grasp + t
+      R = Rz(rz) @ Ry(ry) @ Rx(rx)
+    """
+    R = Rz(rz_deg) @ Ry(ry_deg) @ Rx(rx_deg)
+    return orthonormalize_R(R)
+
+
+def rpy_zyx_deg_from_R(R: np.ndarray) -> np.ndarray:
+    R = orthonormalize_R(np.asarray(R, dtype=np.float64).reshape(3, 3))
+    sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
+
+    if sy >= 1e-9:
+        rx = np.arctan2(R[2, 1], R[2, 2])
+        ry = np.arctan2(-R[2, 0], sy)
+        rz = np.arctan2(R[1, 0], R[0, 0])
+    else:
+        rx = np.arctan2(-R[1, 2], R[1, 1])
+        ry = np.arctan2(-R[2, 0], sy)
+        rz = 0.0
+
+    return np.rad2deg([rx, ry, rz])
+
+
+def T_from_xyz_rpy_mm_deg(
+    tx_mm: float,
+    ty_mm: float,
+    tz_mm: float,
+    rx_deg: float,
+    ry_deg: float,
+    rz_deg: float,
+) -> np.ndarray:
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = R_from_rpy_zyx_deg(rx_deg, ry_deg, rz_deg)
+    T[:3, 3] = [float(tx_mm), float(ty_mm), float(tz_mm)]
+    validate_T(T, "object_T_grasp")
+    return T
+
+
+def axis_angle_R(axis: str, angle_deg: float) -> np.ndarray:
+    axis = axis.lower()
+    idx_map = {"x": 0, "y": 1, "z": 2}
+    if axis not in idx_map:
+        raise ValueError(f"axis must be x, y, or z. got {axis}")
+
+    v = np.zeros(3, dtype=np.float64)
+    v[idx_map[axis]] = 1.0
+
+    theta = np.deg2rad(float(angle_deg))
+    K = np.array(
+        [
+            [0.0, -v[2], v[1]],
+            [v[2], 0.0, -v[0]],
+            [-v[1], v[0], 0.0],
+        ],
+        dtype=np.float64,
+    )
+
+    R = np.eye(3) + np.sin(theta) * K + (1.0 - np.cos(theta)) * (K @ K)
+    return orthonormalize_R(R)
+
+
 def matrix_from_yaml(data: Any, unit: str = "mm") -> np.ndarray:
     T = np.asarray(data, dtype=np.float64).reshape(4, 4).copy()
     T[:3, :3] = orthonormalize_R(T[:3, :3])
@@ -60,59 +168,17 @@ def format_matrix_for_yaml(T: np.ndarray, ndigits: int = 6) -> List[List[float]]
     T[:3, :3] = orthonormalize_R(T[:3, :3])
     T[3] = [0.0, 0.0, 0.0, 1.0]
 
-    return [
-        [round(float(v), ndigits) for v in row]
-        for row in T
-    ]
+    return [[round(float(v), ndigits) for v in row] for row in T]
 
 
-def local_offset_T_mm(axis: str, distance_mm: float) -> np.ndarray:
-    axis = str(axis).strip().lower()
-    sign = 1.0
-
-    if axis.startswith("-"):
-        sign = -1.0
-        axis_name = axis[1:]
-    elif axis.startswith("+"):
-        axis_name = axis[1:]
-    else:
-        axis_name = axis
-
-    idx_map = {"x": 0, "y": 1, "z": 2}
-    if axis_name not in idx_map:
-        raise ValueError(f"Unsupported pregrasp_axis: {axis}. Use x, y, z, -x, -y, -z.")
-
-    T = np.eye(4, dtype=np.float64)
-    T[idx_map[axis_name], 3] = sign * float(distance_mm)
-    return T
+def format_vector_for_yaml(v: np.ndarray, ndigits: int = 6) -> List[float]:
+    return [round(float(x), ndigits) for x in np.asarray(v, dtype=np.float64).reshape(-1)]
 
 
-def axis_angle_R(axis: str, angle_deg: float) -> np.ndarray:
-    axis = axis.lower()
-    idx_map = {"x": 0, "y": 1, "z": 2}
-    if axis not in idx_map:
-        raise ValueError(f"axis must be x, y, or z. got {axis}")
-
-    v = np.zeros(3, dtype=np.float64)
-    v[idx_map[axis]] = 1.0
-
-    theta = np.deg2rad(float(angle_deg))
-    K = np.array([
-        [0.0, -v[2], v[1]],
-        [v[2], 0.0, -v[0]],
-        [-v[1], v[0], 0.0],
-    ], dtype=np.float64)
-
-    R = np.eye(3) + np.sin(theta) * K + (1.0 - np.cos(theta)) * (K @ K)
-    return orthonormalize_R(R)
+# ----------------------------- YAML utilities -----------------------------
 
 
-def read_grasp_yaml(
-    yaml_path: Path,
-    object_name: str,
-    default_pregrasp_distance_mm: float,
-    default_pregrasp_axis: str,
-) -> Tuple[Dict[str, Any], np.ndarray, float, str]:
+def read_grasp_yaml(yaml_path: Path, object_name: str) -> Tuple[Dict[str, Any], np.ndarray]:
     if yaml_path.exists():
         with open(yaml_path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
@@ -120,29 +186,50 @@ def read_grasp_yaml(
         data = {}
 
     global_unit = data.get("unit", "mm")
-    global_pre_dist = float(data.get("default_pregrasp_distance_mm", default_pregrasp_distance_mm))
-    global_pre_axis = str(data.get("default_pregrasp_axis", default_pregrasp_axis))
-
     objects = data.get("objects", {})
     obj_data = objects.get(object_name, {}) if isinstance(objects, dict) else {}
-
     grasp_data = obj_data.get("object_to_grasp", {}) if isinstance(obj_data, dict) else {}
-    unit = grasp_data.get("unit", obj_data.get("unit", global_unit)) if isinstance(obj_data, dict) else global_unit
+
+    unit = global_unit
+    if isinstance(obj_data, dict):
+        unit = obj_data.get("unit", unit)
+    if isinstance(grasp_data, dict):
+        unit = grasp_data.get("unit", unit)
 
     if isinstance(grasp_data, dict) and "matrix" in grasp_data:
         T_obj_grasp = matrix_from_yaml(grasp_data["matrix"], unit=unit)
-        print(f"[INFO] Loaded object_T_grasp for object='{object_name}' from {yaml_path}")
+        print(f"[INFO] Loaded object_T_grasp matrix for object='{object_name}' from {yaml_path}")
+    elif isinstance(grasp_data, dict) and {"translation_mm", "rotation_rpy_deg"}.issubset(grasp_data.keys()):
+        tx, ty, tz = grasp_data["translation_mm"]
+        rx, ry, rz = grasp_data["rotation_rpy_deg"]
+        T_obj_grasp = T_from_xyz_rpy_mm_deg(tx, ty, tz, rx, ry, rz)
+        print(f"[INFO] Loaded object_T_grasp numeric pose for object='{object_name}' from {yaml_path}")
     elif isinstance(obj_data, dict) and "matrix" in obj_data:
         T_obj_grasp = matrix_from_yaml(obj_data["matrix"], unit=unit)
         print(f"[INFO] Loaded legacy matrix for object='{object_name}' from {yaml_path}")
     else:
         T_obj_grasp = np.eye(4, dtype=np.float64)
-        print(f"[WARN] No matrix found for object='{object_name}'. Starting with identity.")
+        print(f"[WARN] No object_T_grasp found for object='{object_name}'. Starting with identity.")
 
-    pre_dist = float(obj_data.get("pregrasp_distance_mm", global_pre_dist)) if isinstance(obj_data, dict) else global_pre_dist
-    pre_axis = str(obj_data.get("pregrasp_axis", global_pre_axis)) if isinstance(obj_data, dict) else global_pre_axis
+    return data, T_obj_grasp
 
-    return data, T_obj_grasp, pre_dist, pre_axis
+
+def remove_pregrasp_fields(data: Dict[str, Any]) -> None:
+    """Remove old pregrasp keys from YAML in-place."""
+    if not isinstance(data, dict):
+        return
+
+    data.pop("default_pregrasp_distance_mm", None)
+    data.pop("default_pregrasp_axis", None)
+
+    objects = data.get("objects", {})
+    if not isinstance(objects, dict):
+        return
+
+    for _, obj in objects.items():
+        if isinstance(obj, dict):
+            obj.pop("pregrasp_distance_mm", None)
+            obj.pop("pregrasp_axis", None)
 
 
 def save_grasp_yaml(
@@ -150,19 +237,12 @@ def save_grasp_yaml(
     output_path: Path,
     object_name: str,
     T_obj_grasp: np.ndarray,
-    pregrasp_distance_mm: float,
-    pregrasp_axis: str,
 ) -> None:
     data = copy.deepcopy(data) if isinstance(data, dict) else {}
+    remove_pregrasp_fields(data)
 
     if "unit" not in data:
         data["unit"] = "mm"
-
-    if "default_pregrasp_distance_mm" not in data:
-        data["default_pregrasp_distance_mm"] = float(pregrasp_distance_mm)
-
-    if "default_pregrasp_axis" not in data:
-        data["default_pregrasp_axis"] = str(pregrasp_axis)
 
     if "objects" not in data or not isinstance(data["objects"], dict):
         data["objects"] = {}
@@ -170,16 +250,24 @@ def save_grasp_yaml(
     if object_name not in data["objects"] or not isinstance(data["objects"][object_name], dict):
         data["objects"][object_name] = {}
 
+    T = np.asarray(T_obj_grasp, dtype=np.float64).reshape(4, 4).copy()
+    T[:3, :3] = orthonormalize_R(T[:3, :3])
+    T[3] = [0.0, 0.0, 0.0, 1.0]
+    validate_T(T, "object_T_grasp")
+
+    t = T[:3, 3]
+    rpy = rpy_zyx_deg_from_R(T[:3, :3])
+
     obj = data["objects"][object_name]
     obj["object_to_grasp"] = {
         "unit": "mm",
-        "matrix": format_matrix_for_yaml(T_obj_grasp),
+        "translation_mm": format_vector_for_yaml(t),
+        "rotation_rpy_deg": format_vector_for_yaml(rpy),
+        "rotation_convention": "R = Rz(rz) @ Ry(ry) @ Rx(rx), column-vector convention",
+        "matrix": format_matrix_for_yaml(T),
     }
-    obj["pregrasp_distance_mm"] = float(pregrasp_distance_mm)
-    obj["pregrasp_axis"] = str(pregrasp_axis)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
     with open(output_path, "w", encoding="utf-8") as f:
         yaml.safe_dump(
             data,
@@ -192,34 +280,70 @@ def save_grasp_yaml(
     print(f"[SAVE] Updated YAML saved to: {output_path}")
 
 
+def print_pose_summary(T: np.ndarray, object_name: str = "") -> None:
+    T = np.asarray(T, dtype=np.float64).reshape(4, 4)
+    p = T[:3, 3]
+    rpy = rpy_zyx_deg_from_R(T[:3, :3])
+
+    prefix = f"object='{object_name}' | " if object_name else ""
+    print(
+        f"[POSE] {prefix}"
+        f"translation_mm=[{p[0]:.6f}, {p[1]:.6f}, {p[2]:.6f}] | "
+        f"rotation_rpy_deg=[{rpy[0]:.6f}, {rpy[1]:.6f}, {rpy[2]:.6f}]"
+    )
+
+
 def print_matrix_block(T: np.ndarray) -> None:
     T = np.asarray(T, dtype=np.float64).reshape(4, 4)
+    p = T[:3, 3]
+    rpy = rpy_zyx_deg_from_R(T[:3, :3])
+
     print("\nobject_to_grasp:")
     print("  unit: mm")
+    print(f"  translation_mm: {format_vector_for_yaml(p)}")
+    print(f"  rotation_rpy_deg: {format_vector_for_yaml(rpy)}")
+    print('  rotation_convention: "R = Rz(rz) @ Ry(ry) @ Rx(rx), column-vector convention"')
     print("  matrix:")
     for row in format_matrix_for_yaml(T):
         print(f"    - {row}")
     print("")
 
 
-def yaw_pitch_roll_deg_from_R_zyx(R: np.ndarray) -> np.ndarray:
-    R = orthonormalize_R(np.asarray(R, dtype=np.float64).reshape(3, 3))
-    sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
+# ----------------------------- CLI pose update -----------------------------
 
-    if sy >= 1e-9:
-        rx = np.arctan2(R[2, 1], R[2, 2])
-        ry = np.arctan2(-R[2, 0], sy)
-        rz = np.arctan2(R[1, 0], R[0, 0])
-    else:
-        rx = np.arctan2(-R[1, 2], R[1, 1])
-        ry = np.arctan2(-R[2, 0], sy)
-        rz = 0.0
 
-    return np.rad2deg([rx, ry, rz])
+def has_numeric_pose_args(args: argparse.Namespace) -> bool:
+    return any(
+        v is not None
+        for v in [args.tx_mm, args.ty_mm, args.tz_mm, args.rx_deg, args.ry_deg, args.rz_deg]
+    )
+
+
+def apply_numeric_pose_args(T_current: np.ndarray, args: argparse.Namespace) -> np.ndarray:
+    """
+    Set pose using numeric arguments.
+    Unspecified values are inherited from the currently loaded pose.
+    """
+    T_current = np.asarray(T_current, dtype=np.float64).reshape(4, 4)
+    current_t = T_current[:3, 3]
+    current_rpy = rpy_zyx_deg_from_R(T_current[:3, :3])
+
+    tx = current_t[0] if args.tx_mm is None else args.tx_mm
+    ty = current_t[1] if args.ty_mm is None else args.ty_mm
+    tz = current_t[2] if args.tz_mm is None else args.tz_mm
+
+    rx = current_rpy[0] if args.rx_deg is None else args.rx_deg
+    ry = current_rpy[1] if args.ry_deg is None else args.ry_deg
+    rz = current_rpy[2] if args.rz_deg is None else args.rz_deg
+
+    return T_from_xyz_rpy_mm_deg(tx, ty, tz, rx, ry, rz)
+
+
+# ----------------------------- Open3D viewer -----------------------------
 
 
 class GraspPoseEditor:
-    def __init__(self, args: argparse.Namespace):
+    def __init__(self, args: argparse.Namespace, yaml_data: Dict[str, Any], T_obj_grasp: np.ndarray):
         try:
             import open3d as o3d
         except ImportError as e:
@@ -227,24 +351,15 @@ class GraspPoseEditor:
 
         self.o3d = o3d
         self.args = args
+        self.yaml_data = yaml_data
 
         self.cad_path = Path(args.cad)
-        self.yaml_path = Path(args.yaml)
-        self.output_yaml = Path(args.output_yaml) if args.output_yaml else self.yaml_path.with_name(
-            self.yaml_path.stem + "_updated.yaml"
+        self.output_yaml = Path(args.output_yaml) if args.output_yaml else Path(args.yaml).with_name(
+            Path(args.yaml).stem + "_updated.yaml"
         )
-
         self.object_name = args.object
-        self.default_pregrasp_distance_mm = float(args.default_pregrasp_distance_mm)
-        self.default_pregrasp_axis = str(args.default_pregrasp_axis)
 
-        self.yaml_data, self.T_obj_grasp, self.pre_dist_mm, self.pre_axis = read_grasp_yaml(
-            self.yaml_path,
-            self.object_name,
-            self.default_pregrasp_distance_mm,
-            self.default_pregrasp_axis,
-        )
-
+        self.T_obj_grasp = np.asarray(T_obj_grasp, dtype=np.float64).reshape(4, 4).copy()
         self.T_initial = self.T_obj_grasp.copy()
 
         self.active_axis = "z"
@@ -312,26 +427,13 @@ class GraspPoseEditor:
         )
         grasp_frame.transform(self.T_obj_grasp)
 
-        T_obj_pre = self.T_obj_grasp @ local_offset_T_mm(self.pre_axis, self.pre_dist_mm)
-        pregrasp_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
-            size=float(self.args.frame_size) * 0.75,
-            origin=[0.0, 0.0, 0.0],
-        )
-        pregrasp_frame.transform(T_obj_pre)
-
         line_to_grasp = self.create_line(
             [0.0, 0.0, 0.0],
             self.T_obj_grasp[:3, 3].tolist(),
             [1.0, 0.6, 0.0],
         )
 
-        line_grasp_to_pre = self.create_line(
-            self.T_obj_grasp[:3, 3].tolist(),
-            T_obj_pre[:3, 3].tolist(),
-            [0.0, 0.8, 1.0],
-        )
-
-        return [grasp_frame, pregrasp_frame, line_to_grasp, line_grasp_to_pre]
+        return [grasp_frame, line_to_grasp]
 
     def refresh_dynamic_geometry(self):
         if self.vis is None:
@@ -349,14 +451,10 @@ class GraspPoseEditor:
         self.vis.update_renderer()
 
     def show_status(self):
-        p = self.T_obj_grasp[:3, 3]
-        rpy = yaw_pitch_roll_deg_from_R_zyx(self.T_obj_grasp[:3, :3])
+        print_pose_summary(self.T_obj_grasp, object_name=self.object_name)
         print(
-            f"[STATUS] object='{self.object_name}' | "
-            f"mode={self.edit_mode} | axis={self.active_axis.upper()} | "
-            f"trans_step={self.trans_step_mm:.3f}mm | rot_step={self.rot_step_deg:.3f}deg | "
-            f"t=[{p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f}] mm | "
-            f"rpy_zyx_deg=[{rpy[0]:.3f}, {rpy[1]:.3f}, {rpy[2]:.3f}]"
+            f"[EDIT] mode={self.edit_mode} | axis={self.active_axis.upper()} | "
+            f"trans_step={self.trans_step_mm:.3f}mm | rot_step={self.rot_step_deg:.3f}deg"
         )
 
     def print_help(self):
@@ -381,7 +479,7 @@ Rotate grasp frame:
   E                        rotate +step around active axis
 
 Mode:
-  G                        toggle edit mode: local axis <-> object/world axis
+  G                        toggle edit mode: local axis <-> object/CAD axis
 
 Step size:
   [                        translation step / 2
@@ -390,7 +488,7 @@ Step size:
   =                        rotation step * 2
 
 YAML / print:
-  P                        print current object_to_grasp matrix
+  P                        print current object_to_grasp block
   S                        save updated YAML
   R                        reset to initial matrix
   H                        print this help
@@ -398,7 +496,9 @@ YAML / print:
 Meaning:
   object frame             CAD 원점 좌표계
   grasp frame              object_T_grasp
-  pregrasp frame           object_T_grasp @ local_offset(pregrasp_axis, distance)
+  orange line              object origin -> grasp origin
+
+No pregrasp frame is used or saved.
 
 =======================================================================
 """
@@ -437,6 +537,7 @@ Meaning:
                 self.active_axis = axis
                 self.show_status()
                 return False
+
             return callback
 
         def cb_translate_minus(_vis):
@@ -491,8 +592,6 @@ Meaning:
                 output_path=self.output_yaml,
                 object_name=self.object_name,
                 T_obj_grasp=self.T_obj_grasp,
-                pregrasp_distance_mm=self.pre_dist_mm,
-                pregrasp_axis=self.pre_axis,
             )
             print_matrix_block(self.T_obj_grasp)
             return False
@@ -531,7 +630,6 @@ Meaning:
 
     def run(self):
         o3d = self.o3d
-
         cad_geom = self.load_cad_geometry()
 
         object_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
@@ -541,7 +639,7 @@ Meaning:
 
         self.vis = o3d.visualization.VisualizerWithKeyCallback()
         self.vis.create_window(
-            window_name=f"CAD Grasp Pose Editor - {self.object_name}",
+            window_name=f"CAD Grasp Pose Numeric Editor - {self.object_name}",
             width=int(self.args.width),
             height=int(self.args.height),
         )
@@ -568,22 +666,31 @@ Meaning:
         self.vis.destroy_window()
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Interactive CAD grasp pose editor for object_grasp.yaml")
+# ----------------------------- main -----------------------------
 
-    parser.add_argument("--cad", required=True, help="CAD path: .stl, .obj, .ply, etc.")
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Numeric CAD grasp pose editor for object_grasp.yaml")
+
+    parser.add_argument("--cad", default="", help="CAD path: .stl, .obj, .ply, etc. Required unless --save-only is used.")
     parser.add_argument("--yaml", required=True, help="object_grasp.yaml path")
     parser.add_argument("--object", required=True, help="object name in YAML, e.g. cylinder, hole, cross")
 
     parser.add_argument("--output-yaml", default="", help="output YAML path. Default: <input>_updated.yaml")
     parser.add_argument("--cad-unit", default="mm", choices=["mm", "m"], help="CAD coordinate unit. Default: mm")
 
-    parser.add_argument("--frame-size", type=float, default=50.0, help="coordinate frame size in mm")
-    parser.add_argument("--trans-step-mm", type=float, default=5.0, help="initial translation step in mm")
-    parser.add_argument("--rot-step-deg", type=float, default=5.0, help="initial rotation step in degree")
+    parser.add_argument("--tx-mm", type=float, default=None, help="grasp origin x in object/CAD frame [mm]")
+    parser.add_argument("--ty-mm", type=float, default=None, help="grasp origin y in object/CAD frame [mm]")
+    parser.add_argument("--tz-mm", type=float, default=None, help="grasp origin z in object/CAD frame [mm]")
+    parser.add_argument("--rx-deg", type=float, default=None, help="roll around X [deg]")
+    parser.add_argument("--ry-deg", type=float, default=None, help="pitch around Y [deg]")
+    parser.add_argument("--rz-deg", type=float, default=None, help="yaw around Z [deg]")
 
-    parser.add_argument("--default-pregrasp-distance-mm", type=float, default=80.0)
-    parser.add_argument("--default-pregrasp-axis", default="-z")
+    parser.add_argument("--save-only", action="store_true", help="save YAML and exit without Open3D viewer")
+
+    parser.add_argument("--frame-size", type=float, default=50.0, help="coordinate frame size in mm")
+    parser.add_argument("--trans-step-mm", type=float, default=5.0, help="interactive translation step in mm")
+    parser.add_argument("--rot-step-deg", type=float, default=5.0, help="interactive rotation step in degree")
 
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=800)
@@ -593,7 +700,32 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
-    editor = GraspPoseEditor(args)
+
+    yaml_path = Path(args.yaml)
+    output_yaml = Path(args.output_yaml) if args.output_yaml else yaml_path.with_name(yaml_path.stem + "_updated.yaml")
+
+    yaml_data, T_obj_grasp = read_grasp_yaml(yaml_path, args.object)
+
+    if has_numeric_pose_args(args):
+        T_obj_grasp = apply_numeric_pose_args(T_obj_grasp, args)
+        print("[INFO] Applied numeric pose arguments.")
+
+    print_matrix_block(T_obj_grasp)
+    print_pose_summary(T_obj_grasp, object_name=args.object)
+
+    if args.save_only:
+        save_grasp_yaml(
+            data=yaml_data,
+            output_path=output_yaml,
+            object_name=args.object,
+            T_obj_grasp=T_obj_grasp,
+        )
+        return
+
+    if not args.cad:
+        raise ValueError("--cad is required unless --save-only is used.")
+
+    editor = GraspPoseEditor(args, yaml_data, T_obj_grasp)
     editor.run()
 
 
