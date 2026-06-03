@@ -146,6 +146,9 @@ class RobotMotion:
         x, y, z는 유지한다.
         rx, ry는 수평 자세로 강제한다.
         rz는 vision yaw 보정값이므로 유지한다.
+
+        6D peg grasp에서는 이 함수를 적용하지 않고,
+        비전에서 계산된 rx, ry, rz를 그대로 사용한다.
         """
         pose = np.array(pose, dtype=float).copy()
 
@@ -299,6 +302,7 @@ class RobotMotion:
         pose: np.ndarray,
         speed: float | None = None,
         acc: float | None = None,
+        preserve_orientation: bool = False,
     ):
         """
         rbpodo Python API 기준 move_l 사용.
@@ -314,8 +318,9 @@ class RobotMotion:
             rx, ry, rz = deg
 
         중요:
-            어떤 pose가 들어와도 rx, ry, rz는 flat_tcp_* 값으로 강제한다.
-            즉, MoveL 구간에서는 그리퍼를 항상 땅과 평행한 자세로 유지한다.
+            preserve_orientation=False이면 기존 방식대로 rx, ry는 flat_tcp_* 값으로 강제한다.
+            preserve_orientation=True이면 입력 pose의 rx, ry, rz를 그대로 사용한다.
+            6D peg grasp에서는 preserve_orientation=True를 사용한다.
         """
         if speed is None:
             speed = self.ctx.move_l_speed
@@ -325,10 +330,15 @@ class RobotMotion:
         rc = rb.ResponseCollector()
 
         raw_pose = np.array(pose, dtype=float)
-        pose = self.force_flat_gripper_pose(raw_pose)
+        if preserve_orientation:
+            pose = raw_pose.copy()
+            pose_mode = "preserve"
+        else:
+            pose = self.force_flat_gripper_pose(raw_pose)
+            pose_mode = "flat"
 
         self.node.get_logger().info(f"[MOVE_L] raw target pose = {raw_pose}")
-        self.node.get_logger().info(f"[MOVE_L] flat target pose = {pose}")
+        self.node.get_logger().info(f"[MOVE_L] {pose_mode} target pose = {pose}")
         self.node.get_logger().info(f"[MOVE_L] speed = {speed}, acc = {acc}")
 
         try:

@@ -46,7 +46,8 @@ class VisionTarget:
     pose:
         [x, y, z, rx, ry, rz]
         x, y는 vision에서 받은 base 좌표계 물체 위치.
-        z는 이후 상태에서 작업 높이로 덮어쓴다.
+        2D/yaw 방식에서는 z를 이후 상태에서 작업 높이로 덮어쓴다.
+        6D 방식에서는 pose의 위치/자세를 기준으로 local z축 offset을 적용한다.
     """
     pose: np.ndarray
     object_id: int
@@ -66,9 +67,16 @@ class TaskContext:
     flat_tcp_rz_deg: float = 0.0
 
     # ===== 작업 z 파라미터 =====
+    # 기존 2D/yaw peg 방식에서 사용하는 base z 고정값.
     pick_down_target_z_mm: float = 69.83
     pick_approach_offset_z_mm: float = 30.0
     pick_up_target_z_mm: float = 110.0
+
+    # 6D peg 방식에서 사용하는 local z축 offset.
+    # peg/grasp pose의 local z축 방향으로 이동한다.
+    pick_approach_above_peg_z_mm: float = 160.0
+    pick_grasp_above_peg_z_mm: float = 150.0
+    pick_lift_above_peg_z_mm: float = 180.0
 
     place_approach_target_z_mm: float = 108.0
     place_down_target_z_mm: float = 98.0

@@ -1,13 +1,18 @@
 """
 cd ~/course/robot_manipulation-bin-picking
-
 rm -rf build/ install/ log/
-
 colcon build --symlink-install --packages-select sixd_pose_vision calib control bringup
-
 source install/setup.bash
 
 ros2 launch bringup 6d_peg_in_hole_bringup.launch.py
+
+source install/setup.bash
+python3 src/robot_ex_2026/robot_ex_2026/grip_current.py 
+
+
+source install/setup.bash
+ros2 launch bringup new_peg_in_hole_bringup.launch.py
+
 """
 
 from launch import LaunchDescription
@@ -68,7 +73,7 @@ def generate_launch_description():
 
     sixd_pose_transform_node = Node(
         package="calib",
-        executable="object_pose_transform_node",
+        executable="sixd_pose_transform_node",
         name="sixd_pose_transform_node",
         output="screen",
         parameters=[{
@@ -123,6 +128,9 @@ def generate_launch_description():
             "pick_down_target_z_mm": 69.83,
             "pick_approach_offset_z_mm": 30.0,
             "pick_up_target_z_mm": 110.0,
+            "pick_approach_above_peg_z_mm": 160.0,
+            "pick_grasp_above_peg_z_mm": 150.0,
+            "pick_lift_above_peg_z_mm": 180.0,
 
             "place_approach_target_z_mm": 108.0,
             "place_down_target_z_mm": 98.0,
@@ -143,6 +151,7 @@ def generate_launch_description():
             "trigger_hole_topic": "/manipulation/trigger_hole",
 
             "camera_settle_sec": 0.5,
+            "use_6d_peg_interface": True,
             "vision_wait_timeout_sec": 3.0,
             "grasp_wait_sec": 1.0,
             "release_wait_sec": 1.0,

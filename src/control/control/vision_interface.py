@@ -12,13 +12,24 @@ except ImportError:  # direct script/debug execution support
 
 class VisionInterface:
     """
-    비전 촬영 trigger publish, peg/hole target subscribe, [x,y,yaw,id] 파싱 담당.
+    비전 촬영 trigger publish, peg/hole target subscribe, target parsing 담당.
+
+    기본 2D/yaw 방식:
+        trigger_peg, trigger_hole = [x, y, z, rx, ry, rz]
+        peg_targets, hole_targets = [x, y, yaw, id, ...]
+
+    6D peg 방식(use_6d_peg_interface=True):
+        trigger_peg = [object_id, x, y, z, rx, ry, rz]
+        peg_targets success = [T00, T01, ... T33, object_id]  # len(data)==17
+        peg_targets failure = [visible_id0, visible_id1, ...] # len(data)!=17
+
+    hole은 기존 2D/yaw 방식 그대로 사용한다.
     """
 
     VALID_OBJECT_IDS = (0, 1, 2)
     OBJECT_ID_NAME = {
         0: "cylinder",
-        1: "rectangle",
+        1: "hole",
         2: "cross",
     }
 
@@ -32,6 +43,7 @@ class VisionInterface:
         trigger_peg_topic: str,
         trigger_hole_topic: str,
         camera_settle_sec: float,
+        use_6d_peg_interface: bool = False,
     ):
         self.node = node
         self.ctx = ctx
@@ -42,9 +54,12 @@ class VisionInterface:
         self.trigger_peg_topic = trigger_peg_topic
         self.trigger_hole_topic = trigger_hole_topic
         self.camera_settle_sec = float(camera_settle_sec)
+        self.use_6d_peg_interface = bool(use_6d_peg_interface)
 
         self.latest_peg_xyyawid: list[tuple[float, float, float, int]] = []
         self.latest_hole_xyyawid: list[tuple[float, float, float, int]] = []
+        self.latest_peg_targets_6d: list[VisionTarget] = []
+        self.latest_peg_visible_ids: list[int] = []
 
         self.peg_msg_received = False
         self.hole_msg_received = False
@@ -81,8 +96,50 @@ class VisionInterface:
         return self.OBJECT_ID_NAME.get(object_id, "unknown")
 
     # ------------------------------------------------------------------
+    # transform helper for 6D peg result
+    # ------------------------------------------------------------------
+    def _orthonormalize_R(self, R: np.ndarray) -> np.ndarray:
+        R = np.asarray(R, dtype=np.float64).reshape(3, 3)
+        U, _, Vt = np.linalg.svd(R)
+        Rn = U @ Vt
+        if np.linalg.det(Rn) < 0.0:
+            U[:, -1] *= -1.0
+            Rn = U @ Vt
+        return Rn
+
+    def _R_to_euler_zyx_deg(self, R: np.ndarray) -> np.ndarray:
+        """
+        R = Rz(rz) @ Ry(ry) @ Rx(rx) 기준으로 [rx, ry, rz] deg를 복원한다.
+        sixd_pose_transform_node.py의 T_mm_to_pose6_mm_deg와 같은 규칙이다.
+        """
+        R = self._orthonormalize_R(R)
+        sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
+
+        if sy >= 1e-9:
+            rx = np.arctan2(R[2, 1], R[2, 2])
+            ry = np.arctan2(-R[2, 0], sy)
+            rz = np.arctan2(R[1, 0], R[0, 0])
+        else:
+            rx = np.arctan2(-R[1, 2], R[1, 1])
+            ry = np.arctan2(-R[2, 0], sy)
+            rz = 0.0
+
+        return np.degrees([rx, ry, rz]).astype(float)
+
+    def _T_mm_to_pose6_mm_deg(self, T: np.ndarray) -> np.ndarray:
+        T = np.asarray(T, dtype=np.float64).reshape(4, 4)
+        rpy = self._R_to_euler_zyx_deg(T[:3, :3])
+        p = T[:3, 3]
+        return np.array([p[0], p[1], p[2], rpy[0], rpy[1], rpy[2]], dtype=float)
+
+    # ------------------------------------------------------------------
     # vision trigger helper
     # ------------------------------------------------------------------
+    def _get_ee_pose_after_settle(self) -> np.ndarray:
+        if self.camera_settle_sec > 0.0:
+            time.sleep(self.camera_settle_sec)
+        return self.robot_motion.get_current_tcp_pose()
+
     def publish_ee_pose_trigger(self, pub, label: str):
         """
         사진 촬영 trigger용으로 현재 TCP pose를 publish한다.
@@ -94,10 +151,7 @@ class VisionInterface:
             x, y, z = mm
             rx, ry, rz = deg
         """
-        if self.camera_settle_sec > 0.0:
-            time.sleep(self.camera_settle_sec)
-
-        ee_pose = self.robot_motion.get_current_tcp_pose()
+        ee_pose = self._get_ee_pose_after_settle()
 
         msg = Float64MultiArray()
         msg.data = [float(v) for v in ee_pose[:6]]
@@ -108,6 +162,28 @@ class VisionInterface:
         self.node.get_logger().info(
             f"[VISION TRIGGER] {label} trigger published. "
             f"ee_pose = {ee_pose}"
+        )
+
+    def publish_peg_6d_trigger(self, object_id: int):
+        """
+        6D peg trigger.
+
+        publish data:
+            [object_id, x, y, z, rx, ry, rz]
+        """
+        object_id = int(object_id)
+        ee_pose = self._get_ee_pose_after_settle()
+
+        msg = Float64MultiArray()
+        msg.data = [float(object_id)] + [float(v) for v in ee_pose[:6]]
+
+        self.trigger_peg_pub.publish(msg)
+        rclpy.spin_once(self.node, timeout_sec=0.05)
+
+        self.node.get_logger().info(
+            f"[VISION TRIGGER] PEG 6D trigger published. "
+            f"object_id = {object_id} ({self.shape_name(object_id)}), "
+            f"data = {msg.data}"
         )
 
     def trigger_peg_capture(self):
@@ -144,7 +220,7 @@ class VisionInterface:
             if object_id not in self.VALID_OBJECT_IDS:
                 self.node.get_logger().warn(
                     f"[VISION SUB] Unknown {label} id: {object_id}. "
-                    f"Expected 0=cylinder, 1=rectangle, 2=cross. "
+                    f"Expected 0=cylinder, 1=hole, 2=cross. "
                     f"This target will be ignored."
                 )
                 continue
@@ -153,13 +229,60 @@ class VisionInterface:
 
         return targets
 
+    def _parse_peg_6d_msg(self, msg: Float64MultiArray) -> tuple[list[VisionTarget], list[int]]:
+        data = list(msg.data)
+
+        if len(data) == 17:
+            T = np.asarray(data[:16], dtype=np.float64).reshape(4, 4)
+            object_id = int(round(float(data[16])))
+
+            if object_id not in self.VALID_OBJECT_IDS:
+                self.node.get_logger().warn(
+                    f"[VISION SUB] Unknown 6D peg id: {object_id}. "
+                    f"Expected 0=cylinder, 1=hole, 2=cross."
+                )
+                return [], []
+
+            pose6 = self._T_mm_to_pose6_mm_deg(T)
+            target = VisionTarget(pose=pose6, object_id=object_id)
+
+            self.node.get_logger().info(
+                f"[VISION SUB] 6D peg target received: "
+                f"id={object_id} ({self.shape_name(object_id)}), "
+                f"pose6={pose6}"
+            )
+            return [target], []
+
+        visible_ids: list[int] = []
+        for value in data:
+            object_id = int(round(float(value)))
+            if object_id in self.VALID_OBJECT_IDS and object_id not in visible_ids:
+                visible_ids.append(object_id)
+
+        self.node.get_logger().warn(
+            f"[VISION SUB] 6D peg pose unavailable. "
+            f"data_len={len(data)}, visible_ids={visible_ids}, raw_data={data}"
+        )
+        return [], visible_ids
+
     def peg_targets_callback(self, msg: Float64MultiArray):
-        self.latest_peg_xyyawid = self._parse_xyyawid_msg(msg, "peg")
+        if self.use_6d_peg_interface:
+            self.latest_peg_targets_6d, self.latest_peg_visible_ids = self._parse_peg_6d_msg(msg)
+        else:
+            self.latest_peg_xyyawid = self._parse_xyyawid_msg(msg, "peg")
+
         self.peg_msg_received = True
 
-        self.node.get_logger().info(
-            f"[VISION SUB] peg targets received: {len(self.latest_peg_xyyawid)}"
-        )
+        if self.use_6d_peg_interface:
+            self.node.get_logger().info(
+                f"[VISION SUB] peg 6D response received: "
+                f"target_count={len(self.latest_peg_targets_6d)}, "
+                f"visible_ids={self.latest_peg_visible_ids}"
+            )
+        else:
+            self.node.get_logger().info(
+                f"[VISION SUB] peg targets received: {len(self.latest_peg_xyyawid)}"
+            )
 
     def hole_targets_callback(self, msg: Float64MultiArray):
         self.latest_hole_xyyawid = self._parse_xyyawid_msg(msg, "hole")
@@ -173,6 +296,8 @@ class VisionInterface:
         if reset:
             self.peg_msg_received = False
             self.latest_peg_xyyawid = []
+            self.latest_peg_targets_6d = []
+            self.latest_peg_visible_ids = []
 
         start_time = time.monotonic()
 
@@ -244,8 +369,11 @@ class VisionInterface:
     # ------------------------------------------------------------------
     # vision inspect
     # ------------------------------------------------------------------
-    def inspect_pegs(self) -> list[VisionTarget]:
+    def inspect_pegs(self, preferred_object_ids: list[int] | None = None) -> list[VisionTarget]:
         self.node.get_logger().info("[VISION] Trigger peg capture and wait for peg targets...")
+
+        if self.use_6d_peg_interface:
+            return self.inspect_pegs_6d(preferred_object_ids)
 
         # 중요:
         # trigger 직후 빠르게 결과가 들어올 수 있으므로,
@@ -282,6 +410,59 @@ class VisionInterface:
 
         self.node.get_logger().info(f"[VISION] detected peg count = {len(peg_candidates)}")
         return peg_candidates
+
+    def inspect_pegs_6d(self, preferred_object_ids: list[int] | None = None) -> list[VisionTarget]:
+        """
+        6D peg 방식에서는 trigger 1회당 요청한 object_id 1개의 pose만 온다.
+        len(data)==17이면 성공 pose이고, len(data)!=17이면 현재 보이는 id 목록이다.
+        """
+        if preferred_object_ids is None or len(preferred_object_ids) == 0:
+            request_ids = list(self.VALID_OBJECT_IDS)
+        else:
+            request_ids = []
+            for object_id in preferred_object_ids:
+                object_id = int(object_id)
+                if object_id in self.VALID_OBJECT_IDS and object_id not in request_ids:
+                    request_ids.append(object_id)
+
+        if len(request_ids) == 0:
+            self.node.get_logger().warn("[VISION] No valid 6D peg request ids")
+            return []
+
+        for request_id in request_ids:
+            self.peg_msg_received = False
+            self.latest_peg_targets_6d = []
+            self.latest_peg_visible_ids = []
+
+            self.publish_peg_6d_trigger(request_id)
+
+            if not self._wait_for_peg_msg(reset=False):
+                self.node.get_logger().warn(
+                    f"[VISION] 6D peg target wait timeout. request_id={request_id}"
+                )
+                continue
+
+            if len(self.latest_peg_targets_6d) > 0:
+                self.node.get_logger().info(
+                    f"[VISION] 6D peg request success. request_id={request_id}"
+                )
+                return self.latest_peg_targets_6d
+
+            if len(self.latest_peg_visible_ids) > 0:
+                self.node.get_logger().warn(
+                    f"[VISION] Requested 6D peg id={request_id} unavailable. "
+                    f"visible_ids={self.latest_peg_visible_ids}"
+                )
+            else:
+                self.node.get_logger().warn(
+                    f"[VISION] Requested 6D peg id={request_id} unavailable. "
+                    "No visible object ids returned."
+                )
+
+        self.node.get_logger().warn(
+            f"[VISION] No 6D peg pose available for request_ids={request_ids}"
+        )
+        return []
 
     def inspect_holes(self) -> list[VisionTarget]:
         self.node.get_logger().info("[VISION] Trigger hole capture and wait for hole targets...")
@@ -339,7 +520,7 @@ class VisionInterface:
 
         id 의미:
             0: 원
-            1: 사각형
+            1: 사각형/insert hole class
             2: 십자가
 
         target_kind:

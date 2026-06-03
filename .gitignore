@@ -50,3 +50,16 @@ Thumbs.db
 
 cylinder/
 FoundationPose/
+# ROS 2 build artifacts
+build/
+install/
+log/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Large local installers
+*.deb

@@ -26,12 +26,19 @@ class PegInHoleController(Node):
     - 그리퍼 publish: GripperInterface
     - 비전 trigger/subscribe/parsing: VisionInterface
 
-    trigger 토픽 데이터:
+    기본 trigger 토픽 데이터:
         Float64MultiArray.data = [x, y, z, rx, ry, rz]
 
-    vision 결과 토픽 데이터:
+    6D peg trigger 토픽 데이터:
+        Float64MultiArray.data = [object_id, x, y, z, rx, ry, rz]
+
+    기본 vision 결과 토픽 데이터:
         Float64MultiArray.data = [x, y, yaw, id, x, y, yaw, id, ...]
-        id: 0=원통, 1=직사각형, 2=십자가
+        id: 0=cylinder, 1=hole, 2=cross
+
+    6D peg 결과 토픽 데이터:
+        success: len(data) == 17 -> [4x4 target transform row-major, object_id]
+        failure: len(data) != 17 -> [currently visible object ids]
     """
 
     def __init__(self):
@@ -60,6 +67,11 @@ class PegInHoleController(Node):
                 ("pick_down_target_z_mm", 69.83),
                 ("pick_approach_offset_z_mm", 30.0),
                 ("pick_up_target_z_mm", 110.0),
+
+                # 6D peg 방식: 비전에서 받은 peg/grasp pose의 local z축 기준 offset
+                ("pick_approach_above_peg_z_mm", 160.0),
+                ("pick_grasp_above_peg_z_mm", 150.0),
+                ("pick_lift_above_peg_z_mm", 180.0),
 
                 ("place_approach_target_z_mm", 108.0),
                 ("place_down_target_z_mm", 98.0),
@@ -99,6 +111,7 @@ class PegInHoleController(Node):
                 ("trigger_peg_topic", "/manipulation/trigger_peg"),
                 ("trigger_hole_topic", "/manipulation/trigger_hole"),
                 ("camera_settle_sec", 0.5),
+                ("use_6d_peg_interface", False),
                 ("pause_before_peg_inspect", True),
                 ("manual_continue_topic", "/manual_continue"),
 
@@ -122,6 +135,8 @@ class PegInHoleController(Node):
         trigger_peg_topic = self._get_str_param("trigger_peg_topic")
         trigger_hole_topic = self._get_str_param("trigger_hole_topic")
         camera_settle_sec = self._get_float_param("camera_settle_sec")
+        use_6d_peg_interface = self._get_bool_param("use_6d_peg_interface")
+        self.use_6d_peg_interface = use_6d_peg_interface
         manual_continue_topic = self._get_str_param("manual_continue_topic")
 
         self.ctx = TaskContext(
@@ -136,6 +151,10 @@ class PegInHoleController(Node):
             pick_down_target_z_mm=self._get_float_param("pick_down_target_z_mm"),
             pick_approach_offset_z_mm=self._get_float_param("pick_approach_offset_z_mm"),
             pick_up_target_z_mm=self._get_float_param("pick_up_target_z_mm"),
+
+            pick_approach_above_peg_z_mm=self._get_float_param("pick_approach_above_peg_z_mm"),
+            pick_grasp_above_peg_z_mm=self._get_float_param("pick_grasp_above_peg_z_mm"),
+            pick_lift_above_peg_z_mm=self._get_float_param("pick_lift_above_peg_z_mm"),
 
             place_approach_target_z_mm=self._get_float_param("place_approach_target_z_mm"),
             place_down_target_z_mm=self._get_float_param("place_down_target_z_mm"),
@@ -208,6 +227,7 @@ class PegInHoleController(Node):
             trigger_peg_topic=trigger_peg_topic,
             trigger_hole_topic=trigger_hole_topic,
             camera_settle_sec=camera_settle_sec,
+            use_6d_peg_interface=use_6d_peg_interface,
         )
 
         self.get_logger().info(f"Robot IP: {robot_ip}")
@@ -218,6 +238,7 @@ class PegInHoleController(Node):
         self.get_logger().info(f"Trigger hole topic: {trigger_hole_topic}")
         self.get_logger().info(f"Manual continue topic: {manual_continue_topic}")
         self.get_logger().info(f"Camera settle sec: {camera_settle_sec}")
+        self.get_logger().info(f"Use 6D peg interface: {use_6d_peg_interface}")
         self.get_logger().info(f"Use simulation mode: {self.use_simulation_mode}")
         self.get_logger().info(
             f"Flat TCP RPY: "
@@ -342,6 +363,36 @@ class PegInHoleController(Node):
             f"({self.vision.shape_name(self.ctx.current_target_id)}), "
             f"remaining_jig_counts = {dict(self.ctx.remaining_jig_counts)}"
         )
+
+
+    def get_preferred_peg_request_ids(self) -> list[int]:
+        """
+        6D peg 비전은 trigger 1회당 object_id 1개의 pose만 반환한다.
+
+        - 아직 jig layout을 모르면 어떤 peg든 잡아도 되므로 0, 1, 2 순서로 요청한다.
+        - jig layout을 이미 알고 있으면 남은 jig id만 요청한다.
+        - skip_once id는 가능한 한 이번 요청 후보에서 제외한다.
+        """
+        if len(self.ctx.active_jig_targets) == 0:
+            request_ids = [0, 1, 2]
+        else:
+            request_ids = [
+                int(object_id)
+                for object_id, count in self.ctx.remaining_jig_counts.items()
+                if count > 0
+            ]
+
+        if self.ctx.skip_once_pick_id is not None and len(request_ids) > 1:
+            request_ids = [
+                object_id
+                for object_id in request_ids
+                if object_id != self.ctx.skip_once_pick_id
+            ]
+
+        if len(request_ids) == 0:
+            request_ids = [0, 1, 2]
+
+        return request_ids
 
     def select_next_peg(self) -> bool:
         if len(self.ctx.peg_targets) == 0:
@@ -542,15 +593,77 @@ class PegInHoleController(Node):
             f"remaining_jig_counts = {dict(self.ctx.remaining_jig_counts)}"
         )
 
+    def _pose_with_local_z_offset(self, pose: np.ndarray, offset_mm: float) -> np.ndarray:
+        """
+        pose = [x, y, z, rx, ry, rz] 기준에서 TCP/local z축 방향으로 offset을 적용한다.
+
+        6D peg 결과의 회전은 R = Rz(rz) @ Ry(ry) @ Rx(rx) 기준이다.
+        local z축은 R[:, 2]이고, 위치는 p + R[:, 2] * offset_mm로 계산한다.
+        """
+        pose = np.array(pose, dtype=float).copy()
+        rx, ry, rz = np.radians(pose[3:6])
+
+        cx, sx = np.cos(rx), np.sin(rx)
+        cy, sy = np.cos(ry), np.sin(ry)
+        cz, sz = np.cos(rz), np.sin(rz)
+
+        Rx = np.array(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, cx, -sx],
+                [0.0, sx, cx],
+            ],
+            dtype=float,
+        )
+        Ry = np.array(
+            [
+                [cy, 0.0, sy],
+                [0.0, 1.0, 0.0],
+                [-sy, 0.0, cy],
+            ],
+            dtype=float,
+        )
+        Rz = np.array(
+            [
+                [cz, -sz, 0.0],
+                [sz, cz, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=float,
+        )
+
+        R = Rz @ Ry @ Rx
+        local_z_axis = R[:, 2]
+        pose[:3] = pose[:3] + local_z_axis * float(offset_mm)
+        return pose
+
+    def make_pick_pose(self, offset_mm: float) -> np.ndarray:
+        if self.ctx.current_peg_pick_pose is None:
+            raise RuntimeError("No selected peg target")
+
+        if self.use_6d_peg_interface:
+            return self._pose_with_local_z_offset(
+                self.ctx.current_peg_pick_pose,
+                offset_mm,
+            )
+
+        pose = self.ctx.current_peg_pick_pose.copy()
+        if offset_mm == self.ctx.pick_approach_above_peg_z_mm:
+            pose[2] = self.ctx.pick_down_target_z_mm + self.ctx.pick_approach_offset_z_mm
+        elif offset_mm == self.ctx.pick_grasp_above_peg_z_mm:
+            pose[2] = self.ctx.pick_down_target_z_mm
+        elif offset_mm == self.ctx.pick_lift_above_peg_z_mm:
+            pose[2] = self.ctx.pick_up_target_z_mm
+        else:
+            pose[2] = self.ctx.pick_down_target_z_mm + float(offset_mm)
+        return pose
+
     def save_last_pick_pose(self):
         if self.ctx.current_peg_pick_pose is None:
             raise RuntimeError("No selected peg target")
 
-        up_pose = self.ctx.current_peg_pick_pose.copy()
-        up_pose[2] = self.ctx.pick_up_target_z_mm
-
-        down_pose = self.ctx.current_peg_pick_pose.copy()
-        down_pose[2] = self.ctx.pick_down_target_z_mm
+        up_pose = self.make_pick_pose(self.ctx.pick_lift_above_peg_z_mm)
+        down_pose = self.make_pick_pose(self.ctx.pick_grasp_above_peg_z_mm)
 
         self.ctx.last_pick_up_pose = up_pose.copy()
         self.ctx.last_pick_down_pose = down_pose.copy()
@@ -649,7 +762,9 @@ class PegInHoleController(Node):
 
         elif self.state == TaskState.INSPECT_PEGS:
             self.wait_for_space_before_peg_inspect()
-            self.ctx.peg_targets = self.vision.inspect_pegs()
+            self.ctx.peg_targets = self.vision.inspect_pegs(
+                preferred_object_ids=self.get_preferred_peg_request_ids()
+            )
 
             if len(self.ctx.peg_targets) == 0:
                 self.get_logger().info("[INFO] No peg remaining")
@@ -667,11 +782,7 @@ class PegInHoleController(Node):
             if self.ctx.current_peg_pick_pose is None:
                 raise RuntimeError("No selected peg target")
 
-            target_pose = self.ctx.current_peg_pick_pose.copy()
-            target_pose[2] = (
-                self.ctx.pick_down_target_z_mm
-                + self.ctx.pick_approach_offset_z_mm
-            )
+            target_pose = self.make_pick_pose(self.ctx.pick_approach_above_peg_z_mm)
 
             # matching hole이 없을 때 원래 위치로 되돌리기 위해 저장한다.
             # 복구 시에는 pick_up_target_z_mm 높이로 먼저 돌아온 뒤,
@@ -683,6 +794,7 @@ class PegInHoleController(Node):
                 target_pose,
                 speed=self.ctx.approach_move_l_speed,
                 acc=self.ctx.approach_move_l_acc,
+                preserve_orientation=self.use_6d_peg_interface,
             )
             self.state = TaskState.DESCEND_TO_PEG
 
@@ -690,14 +802,14 @@ class PegInHoleController(Node):
             if self.ctx.current_peg_pick_pose is None:
                 raise RuntimeError("No selected peg target")
 
-            target_pose = self.ctx.current_peg_pick_pose.copy()
-            target_pose[2] = self.ctx.pick_down_target_z_mm
+            target_pose = self.make_pick_pose(self.ctx.pick_grasp_above_peg_z_mm)
 
             # 그리퍼 닫기 직전, peg 잡는 높이로 하강
             self.motion.move_l_and_wait(
                 target_pose,
                 speed=self.ctx.descend_move_l_speed,
                 acc=self.ctx.descend_move_l_acc,
+                preserve_orientation=self.use_6d_peg_interface,
             )
             self.state = TaskState.GRASP_PEG
 
@@ -710,10 +822,12 @@ class PegInHoleController(Node):
             if self.ctx.current_peg_pick_pose is None:
                 raise RuntimeError("No selected peg target")
 
-            target_pose = self.ctx.current_peg_pick_pose.copy()
-            target_pose[2] = self.ctx.pick_up_target_z_mm
+            target_pose = self.make_pick_pose(self.ctx.pick_lift_above_peg_z_mm)
 
-            self.motion.move_l_and_wait(target_pose)
+            self.motion.move_l_and_wait(
+                target_pose,
+                preserve_orientation=self.use_6d_peg_interface,
+            )
             self.state = TaskState.MOVE_TO_HOLE_CAMERA_POSE
 
         elif self.state == TaskState.MOVE_TO_HOLE_CAMERA_POSE:
@@ -847,6 +961,7 @@ class PegInHoleController(Node):
                 self.ctx.last_pick_up_pose,
                 speed=self.ctx.approach_move_l_speed,
                 acc=self.ctx.approach_move_l_acc,
+                preserve_orientation=self.use_6d_peg_interface,
             )
             self.state = TaskState.DESCEND_TO_PICK_PLACE
 
@@ -863,6 +978,7 @@ class PegInHoleController(Node):
                 self.ctx.last_pick_down_pose,
                 speed=self.ctx.descend_move_l_speed,
                 acc=self.ctx.descend_move_l_acc,
+                preserve_orientation=self.use_6d_peg_interface,
             )
             self.state = TaskState.RELEASE_BACK_TO_PICK_PLACE
 
@@ -889,6 +1005,7 @@ class PegInHoleController(Node):
                 self.ctx.last_pick_up_pose,
                 speed=self.ctx.approach_move_l_speed,
                 acc=self.ctx.approach_move_l_acc,
+                preserve_orientation=self.use_6d_peg_interface,
             )
 
             self.clear_current_task()
