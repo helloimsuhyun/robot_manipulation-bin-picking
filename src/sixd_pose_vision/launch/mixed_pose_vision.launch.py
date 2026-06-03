@@ -5,13 +5,31 @@ from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
+"""
+
+cd ~/course/robot_manipulation-bin-picking
+
+rm -rf build/sixd_pose_vision install/sixd_pose_vision
+
+source /opt/ros/humble/setup.bash
+conda activate cource
+
+export CUDA_HOME="$CONDA_PREFIX"
+export PATH="$CONDA_PREFIX/bin:$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib:$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+export PYTHONPATH="/home/choisuhyun/course/robot_manipulation-bin-picking/FoundationPose:${PYTHONPATH:-}"
+
+python -m colcon build --packages-select sixd_pose_vision
+source install/setup.bash
+"""
+
 
 def generate_launch_description():
     pkg_share = FindPackageShare("sixd_pose_vision")
 
     # 하위 launch 단독 실행 시 사용할 기본값
     default_foundationpose_repo_path = (
-        "/home/chu/FoundationPose"
+        "/home/choisuhyun/course/robot_manipulation-bin-picking/FoundationPose"
     )
 
     return LaunchDescription([
@@ -56,10 +74,10 @@ def generate_launch_description():
         DeclareLaunchArgument("conf_thresh", default_value="0.4"),
 
         # FoundationPose
-        DeclareLaunchArgument("fp_register_iter", default_value="2"),
+        DeclareLaunchArgument("fp_register_iter", default_value="10"),
         DeclareLaunchArgument("fp_track_iter", default_value="2"),
         DeclareLaunchArgument("fp_track_loss_thr", default_value="0.2"),
-        DeclareLaunchArgument("fp_debug", default_value="0"),
+        DeclareLaunchArgument("fp_debug", default_value="1"),
 
         # foundationpose_repo_path 기준으로 debug_ros 자동 구성
         DeclareLaunchArgument(

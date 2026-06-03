@@ -1,24 +1,42 @@
 """
 object / peg output:
-Success, len(data) == 17:
+Success, len(data) == 6:
 [
-  target_T_00, target_T_01, target_T_02, target_T_03,
-  target_T_10, target_T_11, target_T_12, target_T_13,
-  target_T_20, target_T_21, target_T_22, target_T_23,
-  target_T_30, target_T_31, target_T_32, target_T_33,
-  requested_object_id
+  tcp_x_mm,
+  tcp_y_mm,
+  tcp_z_mm,
+  tcp_rx_deg,
+  tcp_ry_deg,
+  tcp_rz_deg
 ]
 
-Failure / requested object pose not available, len(data) != 17:
+Failure / requested object pose not available, len(data) != 6:
 [
   currently_visible_object_id_0,
   currently_visible_object_id_1,
   ...
 ]
 
-- target_T is base_T_object by default.
-- Later, set peg_target_pose_mode := "grasp" and provide object_grasp_yaml_path
-  to publish base_T_grasp instead.
+- Object output is now a final robot moveL target pose6.
+- The legacy YAML key object_to_grasp is treated as raw_object_T_centered_object,
+  not as a direct grasp/TCP frame.
+- Optional centered_object_to_tcp can be used when the TCP grasp pose is offset
+  from the centered object frame.
+- Final object pose:
+      base_T_centered_object =
+          base_T_raw_object
+          @ raw_object_T_centered_object
+      base_T_centered_object_safe =
+          defend_centered_object_z_up(base_T_centered_object)
+      base_T_tcp_goal =
+          base_T_centered_object_safe
+          @ centered_object_T_tcp_goal
+  output pose6 = [x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg]
+
+- When visualize_pose6_target is true, a matplotlib 3D preview is shown
+  every time a final pose6 target is published. The preview uses the same
+  convention as the old hand-eye sampler: TCP local -Y is the look/approach
+  direction.
 
 insert / hole output:
 [
@@ -310,6 +328,80 @@ def canonicalize_object_axes_z_up_xy_order(
     return T, info
 
 
+
+def defend_centered_object_z_up(
+    T_base_obj_center: np.ndarray,
+    up_axis_base: np.ndarray = np.array([0.0, 0.0, 1.0], dtype=np.float64),
+    z_flip_margin: float = 0.05,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    Z-up defense for the centered/new object frame.
+
+    Purpose:
+        After raw_object_T_centered_object is applied from YAML, make sure
+        the centered object +Z does not point into the floor.
+
+    Rule:
+        If dot(object +Z, world/base +Z) < -z_flip_margin:
+            x <- -x
+            y <-  y
+            z <- -z
+
+        This preserves a right-handed frame because two axes are flipped
+        (+X and +Z). It does NOT swap X/Y, so object +X remains the
+        gripper alignment axis up to sign.
+
+    Translation is not changed.
+    """
+    T = np.asarray(T_base_obj_center, dtype=np.float64).reshape(4, 4).copy()
+    validate_T(T, name="z_defense input")
+
+    up = normalize_vec(up_axis_base, name="up_axis_base")
+    R = orthonormalize_R(T[:3, :3])
+
+    x = R[:, 0].copy()
+    y = R[:, 1].copy()
+    z = R[:, 2].copy()
+
+    before = {
+        "x": float(np.dot(x, up)),
+        "y": float(np.dot(y, up)),
+        "z": float(np.dot(z, up)),
+    }
+
+    z_flipped = False
+    if before["z"] < -float(z_flip_margin):
+        # [x, y, z] -> [-x, y, -z]
+        # det stays +1 and +Z becomes upward.
+        x = -x
+        z = -z
+        z_flipped = True
+
+    # Rebuild clean SO(3) while preserving the selected x/z directions.
+    z = normalize_vec(z, name="z_defense z")
+    x = x - z * float(np.dot(x, z))
+    x = normalize_vec(x, name="z_defense x")
+    y = np.cross(z, x)
+    y = normalize_vec(y, name="z_defense y")
+
+    R_new = np.column_stack([x, y, z])
+    R_new = orthonormalize_R(R_new)
+
+    T[:3, :3] = R_new
+    validate_T(T, name="z_defense output")
+
+    info: Dict[str, Any] = {
+        "z_flipped": bool(z_flipped),
+        "xy_swapped": False,
+        "before_dot_up": before,
+        "after_dot_up": {
+            "x": float(np.dot(T[:3, 0], up)),
+            "y": float(np.dot(T[:3, 1], up)),
+            "z": float(np.dot(T[:3, 2], up)),
+        },
+    }
+    return T, info
+
 def object_json_to_cam_T_obj_mm(obj: Dict[str, Any]) -> np.ndarray:
     """
     Convert object pose JSON from FoundationPose / detector node to camera_T_object in mm.
@@ -418,19 +510,17 @@ class ObjectPoseTransformNode(Node):
 
     Output:
         /vision/peg_targets:
-            Success: 17 floats:
-                [base_T_target row-major 16 values, requested_object_id]
+            Success: 6 floats:
+                [tcp_x_mm, tcp_y_mm, tcp_z_mm, tcp_rx_deg, tcp_ry_deg, tcp_rz_deg]
 
             Failure / requested object pose not available: variable-length id list:
                 [currently_visible_object_id_0, currently_visible_object_id_1, ...]
 
             Therefore the controller can branch by len(data):
-                len(data) == 17 -> success matrix response
-                len(data) != 17 -> failure/fallback visible-id response
+                len(data) == 6 -> success moveL pose6 response
+                len(data) != 6 -> failure/fallback visible-id response
 
-            base_T_target is base_T_object by default.
-            For future grasp output, set peg_target_pose_mode="grasp"
-            and provide object_grasp_yaml_path with object_to_grasp transforms.
+            The published pose6 is intended to be sent directly to robot moveL.
 
         /vision/hole_targets:
             insert target, legacy format. 4 floats per target:
@@ -445,24 +535,20 @@ class ObjectPoseTransformNode(Node):
         # ----------------------------
         self.declare_parameter("handeye_result_path", "")
 
-        # Optional future extension:
-        # - peg_target_pose_mode="object" publishes base_T_object.
-        # - peg_target_pose_mode="grasp" publishes base_T_object @ object_T_grasp.
+        # YAML meaning after the final spec change:
+        #   object_to_grasp      : legacy alias for raw_object_T_centered_object
+        #   object_to_center     : preferred key for raw_object_T_centered_object
+        #   centered_object_to_tcp / center_to_tcp:
+        #       transform from the centered object frame to the final robot TCP frame.
         self.declare_parameter("object_grasp_yaml_path", "")
-        self.declare_parameter("peg_target_pose_mode", "object")  # object | grasp
+        self.declare_parameter("peg_target_pose_mode", "moveL_pose6")  # fixed output meaning
 
-        # Axis canonicalization is applied to the final target frame, not to the raw
-        # object frame before object_T_grasp. This preserves the meaning of
-        # object_T_grasp as a transform defined in the raw/CAD object frame.
-        #
-        # object mode:
-        #     base_T_obj_raw -> optional canonicalized base_T_object
-        # grasp mode:
-        #     base_T_obj_raw @ object_T_grasp -> optional canonicalized base_T_grasp
+        # Final spec:
+        #   raw object -> YAML centered object -> Z-up defense -> TCP grasp -> pose6.
+        # Z defense only flips +Z/+X when centered object +Z points toward world -Z.
+        # It does NOT swap X/Y because object X is used as the gripper alignment axis.
         self.declare_parameter("canonicalize_object_axes", True)
-        self.declare_parameter("canonicalize_grasp_axes", True)
         self.declare_parameter("canonicalize_z_flip_margin", 0.05)
-        self.declare_parameter("canonicalize_xy_down_margin", 0.05)
 
         self.declare_parameter("min_confidence", 0.3)
         self.declare_parameter("object_topic", "/object_poses")
@@ -484,6 +570,18 @@ class ObjectPoseTransformNode(Node):
         # sends the object 6D trigger or starts accepting insert results.
         # Do NOT drop callbacks using this value; delay the request/accept state instead.
         self.declare_parameter("detect_mode_settle_sec", 0.5)
+
+        # Debug visualization. This opens/updates one matplotlib 3D window
+        # whenever a final moveL pose6 is published. The convention matches
+        # the old hand-eye sampler: local -Y is the look/approach direction.
+        self.declare_parameter("visualize_pose6_target", True)
+        self.declare_parameter("visualize_axes_length_mm", 50.0)
+        self.declare_parameter("visualize_approach_length_mm", 80.0)
+        self.declare_parameter("visualize_blocking", False)
+        self.declare_parameter("visualize_save_dir", "")
+
+        self._viz_fig = None
+        self._viz_ax = None
 
         self.class_to_id = {
             "cylinder": 0,
@@ -561,7 +659,7 @@ class ObjectPoseTransformNode(Node):
         self.get_logger().info(
             "ObjectPoseTransformNode ready. "
             "peg trigger=/manipulation/trigger_peg: [object_id, tcp_pose6]; "
-            "object output=/vision/peg_targets: success len=17 [target_T_row_major_16, id], failure len!=17 [visible_ids]; "
+            "object output=/vision/peg_targets: success len=6 [tcp_moveL_pose6], failure len!=6 [visible_ids]; "
             "insert output=/vision/hole_targets: [x_mm, y_mm, yaw_deg, id]."
         )
 
@@ -655,12 +753,16 @@ class ObjectPoseTransformNode(Node):
 
     def load_object_grasp_config(self) -> Dict[str, Dict[str, Any]]:
         """
-        Optional YAML format for future grasp output:
+        Load object-frame YAML.
+
+        Preferred YAML format after final spec change:
 
         unit: mm
         objects:
           cylinder:
-            object_to_grasp:
+            # RAW/CAD object frame -> centered/canonical object frame.
+            # Legacy key object_to_grasp is accepted as the same meaning.
+            object_to_center:
               unit: mm
               matrix:
                 - [1, 0, 0, 0]
@@ -668,8 +770,16 @@ class ObjectPoseTransformNode(Node):
                 - [0, 0, 1, 0]
                 - [0, 0, 0, 1]
 
-        This node currently publishes object pose by default.
-        To publish grasp pose later, set peg_target_pose_mode="grasp".
+            # Centered object frame -> final robot TCP frame for moveL.
+            # If omitted, identity is used, meaning object_to_center already
+            # defines the final TCP frame.
+            centered_object_to_tcp:
+              unit: mm
+              matrix:
+                - [1, 0, 0, 0]
+                - [0, 1, 0, 0]
+                - [0, 0, 1, 0]
+                - [0, 0, 0, 1]
         """
         yaml_path_str = str(self.get_parameter("object_grasp_yaml_path").value)
         cfg: Dict[str, Dict[str, Any]] = {}
@@ -677,7 +787,7 @@ class ObjectPoseTransformNode(Node):
         if not yaml_path_str:
             self.get_logger().warn(
                 "object_grasp_yaml_path is empty. "
-                "Using identity object_to_grasp if peg_target_pose_mode='grasp'."
+                "Using identity raw_object_T_centered_object and centered_object_T_tcp_goal."
             )
             return cfg
 
@@ -693,28 +803,51 @@ class ObjectPoseTransformNode(Node):
         if not isinstance(objects, dict):
             raise ValueError("object_grasp_yaml: 'objects' must be a dict.")
 
+        def _load_T_from_keys(obj_data: Dict[str, Any], keys: List[str], default_T: np.ndarray) -> np.ndarray:
+            for key in keys:
+                block = obj_data.get(key, None)
+                if isinstance(block, dict):
+                    unit = block.get("unit", obj_data.get("unit", global_unit))
+                    if "matrix" in block:
+                        return matrix_from_data(block["matrix"], unit=unit)
+                elif block is not None:
+                    # Allow direct 4x4 matrix under the key.
+                    unit = obj_data.get("unit", global_unit)
+                    return matrix_from_data(block, unit=unit)
+
+            return default_T.copy()
+
         for name, obj_data in objects.items():
             if obj_data is None:
                 obj_data = {}
+            if not isinstance(obj_data, dict):
+                raise ValueError(f"object_grasp_yaml: objects.{name} must be a dict.")
 
-            grasp_data = obj_data.get("object_to_grasp", {})
-            unit = grasp_data.get("unit", obj_data.get("unit", global_unit))
+            # Backward compatibility:
+            #   object_to_grasp no longer means direct grasp pose.
+            #   It is treated as RAW/CAD object -> centered/canonical object frame.
+            raw_object_T_centered_object = _load_T_from_keys(
+                obj_data,
+                keys=["object_to_center", "object_to_canonical", "object_to_grasp"],
+                default_T=np.eye(4, dtype=np.float64),
+            )
 
-            if "matrix" in grasp_data:
-                T_obj_grasp = matrix_from_data(grasp_data["matrix"], unit=unit)
-            elif "matrix" in obj_data:
-                T_obj_grasp = matrix_from_data(obj_data["matrix"], unit=unit)
-            else:
-                T_obj_grasp = np.eye(4, dtype=np.float64)
+            # Final optional TCP offset from the centered object frame.
+            centered_object_T_tcp_goal = _load_T_from_keys(
+                obj_data,
+                keys=["centered_object_to_tcp", "center_to_tcp", "canonical_to_tcp", "object_center_to_tcp"],
+                default_T=np.eye(4, dtype=np.float64),
+            )
 
             cfg[str(name)] = {
-                "object_to_grasp": T_obj_grasp,
+                "raw_object_T_centered_object": raw_object_T_centered_object,
+                "centered_object_T_tcp_goal": centered_object_T_tcp_goal,
             }
 
-        self.get_logger().info(f"loaded object grasp YAML: {path}")
+        self.get_logger().info(f"loaded object target YAML: {path}")
         return cfg
 
-    def get_object_to_grasp_for_class(self, cls: str) -> np.ndarray:
+    def get_object_target_transforms_for_class(self, cls: str) -> Tuple[np.ndarray, np.ndarray]:
         base_name = canonical_object_name(cls)
 
         if cls in self.grasp_cfg:
@@ -723,12 +856,21 @@ class ObjectPoseTransformNode(Node):
             item = self.grasp_cfg[base_name]
         else:
             item = {
-                "object_to_grasp": np.eye(4, dtype=np.float64),
+                "raw_object_T_centered_object": np.eye(4, dtype=np.float64),
+                "centered_object_T_tcp_goal": np.eye(4, dtype=np.float64),
             }
 
-        T_obj_grasp = np.asarray(item["object_to_grasp"], dtype=np.float64).reshape(4, 4)
-        validate_T(T_obj_grasp, name=f"object_T_grasp[{cls}]")
-        return T_obj_grasp.copy()
+        raw_object_T_centered_object = np.asarray(
+            item["raw_object_T_centered_object"], dtype=np.float64
+        ).reshape(4, 4)
+        centered_object_T_tcp_goal = np.asarray(
+            item["centered_object_T_tcp_goal"], dtype=np.float64
+        ).reshape(4, 4)
+
+        validate_T(raw_object_T_centered_object, name=f"raw_object_T_centered_object[{cls}]")
+        validate_T(centered_object_T_tcp_goal, name=f"centered_object_T_tcp_goal[{cls}]")
+
+        return raw_object_T_centered_object.copy(), centered_object_T_tcp_goal.copy()
 
     # ============================================================
     # Input callbacks
@@ -824,10 +966,10 @@ class ObjectPoseTransformNode(Node):
         return ids
 
     # ============================================================
-    # Transform core - object output: matrix + id
+    # Transform core - object output: final moveL pose6
     # ============================================================
 
-    def object_to_matrix_target_dict(
+    def object_to_pose6_target_dict(
         self,
         obj: Dict[str, Any],
         base_T_ee: np.ndarray,
@@ -847,69 +989,48 @@ class ObjectPoseTransformNode(Node):
             return None
 
         try:
+            # FoundationPose/CAD raw object pose in camera frame.
             cam_T_obj = object_json_to_cam_T_obj_mm(obj)
+
+            # Current robot TCP/EE pose + hand-eye + camera object pose.
             base_T_obj_raw = base_T_ee @ self.ee_T_cam @ cam_T_obj
             validate_T(base_T_obj_raw, name=f"base_T_obj_raw[{cls}]")
 
-            target_mode = str(self.get_parameter("peg_target_pose_mode").value).strip().lower()
+            # New meaning:
+            #   object_to_grasp in the legacy YAML is NOT a final grasp frame.
+            #   It is treated as raw object -> centered/canonical object.
+            raw_object_T_centered_object, centered_object_T_tcp_goal = (
+                self.get_object_target_transforms_for_class(cls)
+            )
 
-            if target_mode == "object":
-                # Object output: canonicalization is applied directly to the object frame.
-                if bool(self.get_parameter("canonicalize_object_axes").value):
-                    base_T_target, axis_info = canonicalize_object_axes_z_up_xy_order(
-                        base_T_obj_raw,
-                        z_flip_margin=float(self.get_parameter("canonicalize_z_flip_margin").value),
-                        xy_down_margin=float(self.get_parameter("canonicalize_xy_down_margin").value),
+            base_T_centered_object = base_T_obj_raw @ raw_object_T_centered_object
+            validate_T(base_T_centered_object, name=f"base_T_centered_object[{cls}]")
+
+            # Z-up defense after YAML-centered object frame is created.
+            # This happens BEFORE TCP/grasp conversion so the TCP transform is applied
+            # to the safe centered object frame.
+            axis_info = None
+            if bool(self.get_parameter("canonicalize_object_axes").value):
+                base_T_centered_object, axis_info = defend_centered_object_z_up(
+                    base_T_centered_object,
+                    z_flip_margin=float(self.get_parameter("canonicalize_z_flip_margin").value),
+                )
+                if axis_info["z_flipped"]:
+                    self.get_logger().info(
+                        f"z-defense centered object axes class={cls} "
+                        f"z_flipped={axis_info['z_flipped']} "
+                        f"before_dot_up={axis_info['before_dot_up']} "
+                        f"after_dot_up={axis_info['after_dot_up']}"
                     )
-                    if axis_info["z_flipped"] or axis_info["xy_swapped"]:
-                        self.get_logger().info(
-                            f"canonicalized object target axes class={cls} "
-                            f"z_flipped={axis_info['z_flipped']} "
-                            f"xy_swapped={axis_info['xy_swapped']} "
-                            f"before_dot_up={axis_info['before_dot_up']} "
-                            f"down_score={axis_info.get('down_score', {})} "
-                            f"after_dot_up={axis_info['after_dot_up']}"
-                        )
-                else:
-                    base_T_target = base_T_obj_raw
 
-                validate_T(base_T_target, name=f"base_T_object_target[{cls}]")
-                target_frame = "object"
+            # Final moveL target. If centered_object_T_tcp_goal is identity,
+            # the safe centered object frame itself is the moveL TCP frame.
+            base_T_tcp_goal = base_T_centered_object @ centered_object_T_tcp_goal
+            validate_T(base_T_tcp_goal, name=f"base_T_tcp_goal[{cls}]")
 
-            elif target_mode == "grasp":
-                # Grasp output: first apply object_T_grasp in the raw/CAD object frame,
-                # then canonicalize the resulting grasp frame in base/world coordinates.
-                # This is the intended pipeline:
-                #     RAW object -> 1st grasp -> final axis-canonical grasp
-                object_T_grasp = self.get_object_to_grasp_for_class(cls)
-                base_T_grasp_raw = base_T_obj_raw @ object_T_grasp
-                validate_T(base_T_grasp_raw, name=f"base_T_grasp_raw[{cls}]")
+            target_pose6 = T_mm_to_pose6_mm_deg(base_T_tcp_goal)
+            p = base_T_tcp_goal[:3, 3]
 
-                if bool(self.get_parameter("canonicalize_grasp_axes").value):
-                    base_T_target, axis_info = canonicalize_object_axes_z_up_xy_order(
-                        base_T_grasp_raw,
-                        z_flip_margin=float(self.get_parameter("canonicalize_z_flip_margin").value),
-                        xy_down_margin=float(self.get_parameter("canonicalize_xy_down_margin").value),
-                    )
-                    if axis_info["z_flipped"] or axis_info["xy_swapped"]:
-                        self.get_logger().info(
-                            f"canonicalized grasp target axes class={cls} "
-                            f"z_flipped={axis_info['z_flipped']} "
-                            f"xy_swapped={axis_info['xy_swapped']} "
-                            f"before_dot_up={axis_info['before_dot_up']} "
-                            f"down_score={axis_info.get('down_score', {})} "
-                            f"after_dot_up={axis_info['after_dot_up']}"
-                        )
-                else:
-                    base_T_target = base_T_grasp_raw
-
-                validate_T(base_T_target, name=f"base_T_grasp_target[{cls}]")
-                target_frame = "grasp"
-
-            else:
-                raise ValueError("peg_target_pose_mode must be 'object' or 'grasp'.")
-
-            p = base_T_target[:3, 3]
             return {
                 "class": cls,
                 "id": obj_id,
@@ -917,9 +1038,13 @@ class ObjectPoseTransformNode(Node):
                 "x": float(p[0]),
                 "y": float(p[1]),
                 "z": float(p[2]),
-                "target_T": base_T_target,
-                "target_frame": target_frame,
-                "output_format": "matrix16_id_17",
+                "target_T": base_T_tcp_goal,
+                "target_pose6": target_pose6,
+                "base_T_obj_raw": base_T_obj_raw,
+                "base_T_centered_object_safe": base_T_centered_object,
+                "target_frame": "tcp_goal",
+                "axis_info": axis_info,
+                "output_format": "moveL_pose6_6",
             }
 
         except Exception as e:
@@ -982,10 +1107,10 @@ class ObjectPoseTransformNode(Node):
         yaw_deg = np.degrees(yaw_rad)
         return float((yaw_deg + 180.0) % 360.0 - 180.0)
 
-    def make_matrix_targets_from_objects(self, objects, base_T_ee, requested_object_idx=None):
+    def make_pose6_targets_from_objects(self, objects, base_T_ee, requested_object_idx=None):
         targets = []
         for obj in objects:
-            target = self.object_to_matrix_target_dict(
+            target = self.object_to_pose6_target_dict(
                 obj,
                 base_T_ee,
                 requested_object_idx=requested_object_idx,
@@ -1006,15 +1131,14 @@ class ObjectPoseTransformNode(Node):
     def object_targets_to_msg_data(targets):
         """
         Object target format:
-            target_T row-major 16 values + id
-        Total 17 floats per target.
+            [tcp_x_mm, tcp_y_mm, tcp_z_mm, tcp_rx_deg, tcp_ry_deg, tcp_rz_deg]
+        Total 6 floats per target. This is intended to be sent directly to moveL.
         """
         data = []
 
         for t in targets:
-            target_T = np.asarray(t["target_T"], dtype=np.float64).reshape(4, 4)
-            data.extend(target_T.reshape(-1).tolist())
-            data.append(float(t["id"]))
+            pose6 = np.asarray(t["target_pose6"], dtype=np.float64).reshape(6)
+            data.extend(pose6.tolist())
 
         return data
 
@@ -1025,8 +1149,8 @@ class ObjectPoseTransformNode(Node):
             [currently_visible_object_id_0, currently_visible_object_id_1, ...]
 
         The controller distinguishes this from success by length:
-            len(data) == 17 -> success matrix response
-            len(data) != 17 -> fallback visible-id response
+            len(data) == 6 -> success moveL pose6 response
+            len(data) != 6 -> fallback visible-id response
         """
         ids = []
         for v in visible_ids:
@@ -1167,7 +1291,7 @@ class ObjectPoseTransformNode(Node):
         if self.pending_object_idx is not None:
             object_idx = int(self.pending_object_idx)
 
-        targets = self.make_matrix_targets_from_objects(
+        targets = self.make_pose6_targets_from_objects(
             self.latest_objects,
             base_T_ee,
             requested_object_idx=object_idx,
@@ -1227,6 +1351,198 @@ class ObjectPoseTransformNode(Node):
             label="HOLE-INSERT",
         )
 
+    # ============================================================
+    # Visualization - final moveL pose6 target
+    # ============================================================
+
+    @staticmethod
+    def set_axes_equal_3d(ax):
+        """
+        Make 3D axis scales equal so pose directions are not visually distorted.
+        """
+        x_limits = ax.get_xlim3d()
+        y_limits = ax.get_ylim3d()
+        z_limits = ax.get_zlim3d()
+
+        x_range = abs(x_limits[1] - x_limits[0])
+        y_range = abs(y_limits[1] - y_limits[0])
+        z_range = abs(z_limits[1] - z_limits[0])
+
+        x_middle = np.mean(x_limits)
+        y_middle = np.mean(y_limits)
+        z_middle = np.mean(z_limits)
+
+        plot_radius = 0.5 * max([x_range, y_range, z_range, 1.0])
+
+        ax.set_xlim3d([x_middle - plot_radius, x_middle + plot_radius])
+        ax.set_ylim3d([y_middle - plot_radius, y_middle + plot_radius])
+        ax.set_zlim3d([z_middle - plot_radius, z_middle + plot_radius])
+
+    @staticmethod
+    def draw_frame_3d(ax, T: np.ndarray, name: str, axis_len: float, alpha: float = 1.0):
+        """
+        Draw a coordinate frame in base/world coordinates.
+        Columns of R are the frame X/Y/Z axes expressed in base/world.
+        """
+        T = np.asarray(T, dtype=np.float64).reshape(4, 4)
+        p = T[:3, 3]
+        R = orthonormalize_R(T[:3, :3])
+
+        # X/Y/Z axis colors are conventional for debug visualization.
+        colors = ["r", "g", "b"]
+        labels = [f"{name} +X", f"{name} +Y", f"{name} +Z"]
+
+        for i in range(3):
+            v = R[:, i] * float(axis_len)
+            ax.quiver(
+                p[0], p[1], p[2],
+                v[0], v[1], v[2],
+                color=colors[i], alpha=alpha,
+                arrow_length_ratio=0.18,
+                linewidth=1.6,
+            )
+
+        ax.text(p[0], p[1], p[2], f" {name}")
+
+    def visualize_pose6_target_once(self, target: Dict[str, Any]):
+        """
+        Show one 3D preview for the final moveL pose6 target.
+
+        Important convention from the old hand-eye sampler:
+            TCP/local -Y is the look/approach direction.
+
+        Therefore this preview draws:
+            - TCP frame axes
+            - a thick magenta arrow along TCP -Y: where the TCP target is looking
+            - a dashed pregrasp segment from +TCP_Y toward the target
+        """
+        if not bool(self.get_parameter("visualize_pose6_target").value):
+            return
+
+        try:
+            import matplotlib.pyplot as plt
+        except Exception as e:
+            self.get_logger().warn(f"visualize_pose6_target disabled: matplotlib import failed: {e}")
+            return
+
+        try:
+            axis_len = float(self.get_parameter("visualize_axes_length_mm").value)
+            approach_len = float(self.get_parameter("visualize_approach_length_mm").value)
+            blocking = bool(self.get_parameter("visualize_blocking").value)
+            save_dir = str(self.get_parameter("visualize_save_dir").value).strip()
+
+            T_tcp = np.asarray(target["target_T"], dtype=np.float64).reshape(4, 4)
+            pose6 = np.asarray(target["target_pose6"], dtype=np.float64).reshape(6)
+            T_center = np.asarray(target.get("base_T_centered_object_safe", T_tcp), dtype=np.float64).reshape(4, 4)
+            T_raw = np.asarray(target.get("base_T_obj_raw", T_center), dtype=np.float64).reshape(4, 4)
+
+            validate_T(T_tcp, name="viz T_tcp")
+            validate_T(T_center, name="viz T_center")
+            validate_T(T_raw, name="viz T_raw")
+
+            p_tcp = T_tcp[:3, 3]
+            p_center = T_center[:3, 3]
+            p_raw = T_raw[:3, 3]
+            R_tcp = orthonormalize_R(T_tcp[:3, :3])
+
+            # Same convention as old hand-eye code:
+            #     camera/tool forward = local -Y
+            tcp_look_dir = -R_tcp[:, 1]
+            tcp_plus_y = R_tcp[:, 1]
+            p_pre = p_tcp + tcp_plus_y * approach_len
+
+            plt.ion()
+            if self._viz_fig is None or self._viz_ax is None:
+                self._viz_fig = plt.figure("moveL pose6 target preview")
+                self._viz_ax = self._viz_fig.add_subplot(111, projection="3d")
+            else:
+                self._viz_ax.clear()
+
+            ax = self._viz_ax
+            ax.set_title(
+                f"moveL pose6 target | class={target.get('class')} id={target.get('id')}\n"
+                f"TCP -Y is look/approach direction | pose6={np.round(pose6, 2).tolist()}"
+            )
+            ax.set_xlabel("Base X [mm]")
+            ax.set_ylabel("Base Y [mm]")
+            ax.set_zlabel("Base Z [mm]")
+
+            # World/base frame near the target area for orientation reference.
+            T_base_ref = np.eye(4, dtype=np.float64)
+            T_base_ref[:3, 3] = p_center
+            self.draw_frame_3d(ax, T_base_ref, "base ref", axis_len * 0.8, alpha=0.35)
+
+            self.draw_frame_3d(ax, T_raw, "raw obj", axis_len * 0.75, alpha=0.35)
+            self.draw_frame_3d(ax, T_center, "center obj", axis_len, alpha=0.75)
+            self.draw_frame_3d(ax, T_tcp, "TCP goal", axis_len * 1.2, alpha=1.0)
+
+            # Points and relation lines.
+            ax.scatter([p_raw[0]], [p_raw[1]], [p_raw[2]], marker="o", s=35, label="raw object origin")
+            ax.scatter([p_center[0]], [p_center[1]], [p_center[2]], marker="^", s=55, label="centered object origin")
+            ax.scatter([p_tcp[0]], [p_tcp[1]], [p_tcp[2]], marker="*", s=120, label="TCP goal origin")
+
+            ax.plot(
+                [p_center[0], p_tcp[0]],
+                [p_center[1], p_tcp[1]],
+                [p_center[2], p_tcp[2]],
+                linestyle="--", linewidth=1.2, label="center -> TCP offset"
+            )
+
+            # TCP look/approach direction: local -Y.
+            v = tcp_look_dir * approach_len
+            ax.quiver(
+                p_tcp[0], p_tcp[1], p_tcp[2],
+                v[0], v[1], v[2],
+                color="m", linewidth=3.0,
+                arrow_length_ratio=0.20,
+            )
+            ax.text(
+                p_tcp[0] + v[0], p_tcp[1] + v[1], p_tcp[2] + v[2],
+                " TCP look/approach (-Y)",
+                color="m",
+            )
+
+            # Pregrasp position if controller approaches along -TCP_Y.
+            ax.scatter([p_pre[0]], [p_pre[1]], [p_pre[2]], marker="x", s=80, label="pregrasp = TCP +Y")
+            ax.plot(
+                [p_pre[0], p_tcp[0]],
+                [p_pre[1], p_tcp[1]],
+                [p_pre[2], p_tcp[2]],
+                linestyle=":", linewidth=2.0, label="pregrasp move direction"
+            )
+
+            # Make bounds around all relevant points.
+            pts = np.vstack([
+                p_raw.reshape(1, 3),
+                p_center.reshape(1, 3),
+                p_tcp.reshape(1, 3),
+                p_pre.reshape(1, 3),
+                (p_tcp + tcp_look_dir * approach_len).reshape(1, 3),
+            ])
+            margin = max(axis_len, approach_len) * 1.4
+            mins = pts.min(axis=0) - margin
+            maxs = pts.max(axis=0) + margin
+            ax.set_xlim(mins[0], maxs[0])
+            ax.set_ylim(mins[1], maxs[1])
+            ax.set_zlim(mins[2], maxs[2])
+            self.set_axes_equal_3d(ax)
+            ax.legend(loc="upper left", fontsize=8)
+
+            self._viz_fig.tight_layout()
+
+            if save_dir:
+                out_dir = Path(save_dir)
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_path = out_dir / f"pose6_target_{target.get('class')}_{target.get('id')}.png"
+                self._viz_fig.savefig(str(out_path), dpi=150)
+                self.get_logger().info(f"saved pose6 target preview: {out_path}")
+
+            plt.show(block=blocking)
+            plt.pause(0.001)
+
+        except Exception as e:
+            self.get_logger().warn(f"failed to visualize pose6 target: {e}")
+
     def publish_object_visible_ids_response(
         self,
         publisher,
@@ -1241,7 +1557,7 @@ class ObjectPoseTransformNode(Node):
         self.get_logger().warn(
             f"[PUBLISH] topic={topic_name} type={label} format=visible_ids_fallback "
             f"requested_id={requested_id} visible_ids={msg.data} data_len={len(msg.data)} "
-            f"rule='len(data)!=17 means requested pose unavailable'"
+            f"rule='len(data)!=6 means requested pose unavailable'"
         )
 
         self.publish_repeated(publisher, msg, count=10)
@@ -1256,13 +1572,16 @@ class ObjectPoseTransformNode(Node):
             "id": target["id"],
             "confidence": round(float(target["confidence"]), 3),
             "target_frame": target["target_frame"],
+            "target_pose6": np.asarray(target["target_pose6"]).round(3).tolist(),
             "target_T": np.asarray(target["target_T"]).round(3).tolist(),
         }
 
         self.get_logger().info(
-            f"[PUBLISH] topic={topic_name} type={label} format=matrix16_id_17_success "
+            f"[PUBLISH] topic={topic_name} type={label} format=moveL_pose6_6_success "
             f"target={debug_target} data_len={len(msg.data)}"
         )
+
+        self.visualize_pose6_target_once(target)
 
         self.publish_repeated(publisher, msg, count=10)
         self.reset_pending()

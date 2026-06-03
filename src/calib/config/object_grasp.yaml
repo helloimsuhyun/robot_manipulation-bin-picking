@@ -1,89 +1,94 @@
 unit: mm
+
+# convention:
+# - object_to_center:
+#     FoundationPose/CAD raw object frame -> centered/new object frame
+#
+# - centered_object_to_tcp:
+#     centered/new object frame -> robot TCP grasp frame
+#
+# robot TCP convention used here:
+# - TCP x-axis  = object x-axis
+# - TCP -y-axis = object -z-axis  # approach direction, top -> down
+# - TCP +y-axis = object +z-axis  # pregrasp offset direction
+#
+# Therefore:
+#   x_tcp_in_obj = [1, 0, 0]
+#   y_tcp_in_obj = [0, 0, 1]
+#   z_tcp_in_obj = [0, -1, 0]
+#
+# R = Rx(+90deg)
+# matrix:
+#   [1, 0,  0]
+#   [0, 0, -1]
+#   [0, 1,  0]
+
 objects:
   cylinder:
-    object_to_grasp:
+    object_to_center:
       unit: mm
-      translation_mm:
-      - 0.0
-      - 0.0
-      - 15.0
-      rotation_rpy_deg:
-      - 0.0
-      - -0.0
-      - 0.0
-      rotation_convention: R = Rz(rz) @ Ry(ry) @ Rx(rx), column-vector convention
+      translation_mm: [0.0, 0.0, 15.0]
+      rotation_rpy_deg: [0.0, 0.0, 0.0]
+      rotation_convention: "R = Rz(rz) @ Ry(ry) @ Rx(rx), column-vector convention"
       matrix:
-      - - 1.0
-        - 0.0
-        - 0.0
-        - 0.0
-      - - 0.0
-        - 1.0
-        - 0.0
-        - 0.0
-      - - 0.0
-        - 0.0
-        - 1.0
-        - 15.0
-      - - 0.0
-        - 0.0
-        - 0.0
-        - 1.0
+        - [1.0, 0.0, 0.0, 0.0]
+        - [0.0, 1.0, 0.0, 0.0]
+        - [0.0, 0.0, 1.0, 15.0]
+        - [0.0, 0.0, 0.0, 1.0]
+
+    centered_object_to_tcp:
+      unit: mm
+      translation_mm: [0.0, 0.0, 0.0]
+      rotation_rpy_deg: [90.0, 0.0, 0.0]
+      rotation_convention: "R = Rz(rz) @ Ry(ry) @ Rx(rx), column-vector convention"
+      matrix:
+        - [1.0, 0.0,  0.0, 0.0]
+        - [0.0, 0.0, -1.0, 0.0]
+        - [0.0, 1.0,  0.0, 0.0]
+        - [0.0, 0.0,  0.0, 1.0]
+
   hole:
-    object_to_grasp:
+    object_to_center:
       unit: mm
-      translation_mm:
-      - 0.0
-      - 0.0
-      - 15.0
-      rotation_rpy_deg:
-      - 0.0
-      - -0.0
-      - -45.0
-      rotation_convention: R = Rz(rz) @ Ry(ry) @ Rx(rx), column-vector convention
+      translation_mm: [0.0, 0.0, 15.0]
+      rotation_rpy_deg: [0.0, 0.0, -45.0]
+      rotation_convention: "R = Rz(rz) @ Ry(ry) @ Rx(rx), column-vector convention"
       matrix:
-      - - 0.707107
-        - 0.707107
-        - 0.0
-        - 0.0
-      - - -0.707107
-        - 0.707107
-        - 0.0
-        - 0.0
-      - - 0.0
-        - 0.0
-        - 1.0
-        - 15.0
-      - - 0.0
-        - 0.0
-        - 0.0
-        - 1.0
+        - [ 0.707107, 0.707107, 0.0, 0.0]
+        - [-0.707107, 0.707107, 0.0, 0.0]
+        - [ 0.0,      0.0,      1.0, 15.0]
+        - [ 0.0,      0.0,      0.0, 1.0]
+
+    centered_object_to_tcp:
+      unit: mm
+      translation_mm: [0.0, 0.0, 0.0]
+      rotation_rpy_deg: [90.0, 0.0, 0.0]
+      rotation_convention: "R = Rz(rz) @ Ry(ry) @ Rx(rx), column-vector convention"
+      matrix:
+        - [1.0, 0.0,  0.0, 0.0]
+        - [0.0, 0.0, -1.0, 0.0]
+        - [0.0, 1.0,  0.0, 0.0]
+        - [0.0, 0.0,  0.0, 1.0]
+
   cross:
-    object_to_grasp:
+    object_to_center:
       unit: mm
-      translation_mm:
-      - 0.0
-      - 0.0
-      - 15.0
-      rotation_rpy_deg:
-      - 0.0
-      - -0.0
-      - 0.0
-      rotation_convention: R = Rz(rz) @ Ry(ry) @ Rx(rx), column-vector convention
+      translation_mm: [0.0, 0.0, 15.0]
+      rotation_rpy_deg: [0.0, 0.0, 0.0]
+      rotation_convention: "R = Rz(rz) @ Ry(ry) @ Rx(rx), column-vector convention"
       matrix:
-      - - 1.0
-        - 0.0
-        - 0.0
-        - 0.0
-      - - 0.0
-        - 1.0
-        - 0.0
-        - 0.0
-      - - 0.0
-        - 0.0
-        - 1.0
-        - 15.0
-      - - 0.0
-        - 0.0
-        - 0.0
-        - 1.0
+        - [1.0, 0.0, 0.0, 0.0]
+        - [0.0, 1.0, 0.0, 0.0]
+        - [0.0, 0.0, 1.0, 15.0]
+        - [0.0, 0.0, 0.0, 1.0]
+
+    centered_object_to_tcp:
+      unit: mm
+      translation_mm: [0.0, 0.0, 0.0]
+      rotation_rpy_deg: [90.0, 0.0, 0.0]
+      rotation_convention: "R = Rz(rz) @ Ry(ry) @ Rx(rx), column-vector convention"
+      matrix:
+        - [1.0, 0.0,  0.0, 0.0]
+        - [0.0, 0.0, -1.0, 0.0]
+        - [0.0, 1.0,  0.0, 0.0]
+        - [0.0, 0.0,  0.0, 1.0]

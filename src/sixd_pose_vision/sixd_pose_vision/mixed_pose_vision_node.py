@@ -388,12 +388,12 @@ class MixedPoseVisionNode(Node):
         self.declare_parameter("conf_thresh", 0.4)
         self.declare_parameter("angle_step_deg", 1)
         self.declare_parameter("match_size", 160)
-        self.declare_parameter("color_width", 640)
+        self.declare_parameter("color_width", 848)
         self.declare_parameter("color_height", 480)
         self.declare_parameter("fps", 30)
 
         # FoundationPose parameters
-        self.declare_parameter("fp_register_iter", 5)
+        self.declare_parameter("fp_register_iter", 10)
         self.declare_parameter("fp_track_iter", 2)
         self.declare_parameter("fp_track_loss_thr", 0.2)
         self.declare_parameter("fp_use_tracking", True)
