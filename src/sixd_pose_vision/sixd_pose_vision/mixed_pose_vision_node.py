@@ -19,7 +19,7 @@ conda activate cource
 export CUDA_HOME="$CONDA_PREFIX"
 export PATH="$CONDA_PREFIX/bin:$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib:$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
-export PYTHONPATH="/home/choisuhyun/course/robot_manipulation-bin-picking/FoundationPose:${PYTHONPATH:-}"
+export PYTHONPATH="/home/choisuhyun/course/robot_manipulation-bin-picking/sFoundationPose:${PYTHONPATH:-}"
 
 python -m colcon build --packages-select sixd_pose_vision
 source install/setup.bash
