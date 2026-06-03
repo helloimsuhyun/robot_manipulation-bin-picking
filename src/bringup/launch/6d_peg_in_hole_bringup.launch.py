@@ -8,9 +8,7 @@ colcon build --symlink-install --packages-select sixd_pose_vision calib control 
 source install/setup.bash
 
 ros2 launch bringup 6d_peg_in_hole_bringup.launch.py
-
 """
-
 
 from launch import LaunchDescription
 from launch.actions import IncludeLaunchDescription, TimerAction
@@ -21,6 +19,22 @@ from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
+
+    # ============================================================
+    # 핸드아이 , 물체 파지좌표 , FD pose repo 절대경로 PC 변경시 같이 확인 필요 **************************
+    foundationpose_repo_path = (
+        "/home/choisuhyun/course/robot_manipulation-bin-picking/FoundationPose"
+    )
+
+    handeye_result_path = (
+        "/home/choisuhyun/course/robot_manipulation-bin-picking/"
+        "src/calib/config/handeye_capture_rs/handeye_result.json"
+    )
+
+    object_grasp_yaml_path = (
+        "/home/choisuhyun/course/robot_manipulation-bin-picking/"
+        "src/sixd_pose_vision/config/object_grasp.yaml"
+    )
     sixd_pose_share = FindPackageShare("sixd_pose_vision")
 
     mixed_pose_vision_launch = IncludeLaunchDescription(
@@ -30,7 +44,26 @@ def generate_launch_description():
                 "launch",
                 "mixed_pose_vision.launch.py",
             ])
-        )
+        ),
+        launch_arguments={
+            "foundationpose_repo_path": foundationpose_repo_path,
+
+            "default_mode": "object",
+            "enable_visualization": "true",
+            "conf_thresh": "0.4",
+
+            "fp_register_iter": "2",
+            "fp_track_iter": "2",
+            "fp_track_loss_thr": "0.2",
+            "fp_debug": "0",
+            "fp_use_tracking": "false",
+
+            "object_topic": "/object_poses",
+            "insert_topic": "/insert_poses",
+            "detect_mode_topic": "/detect_mode",
+            "object_trigger_topic": "/object_6d_trigger",
+            "frame_id": "camera_color_optical_frame",
+        }.items(),
     )
 
     sixd_pose_transform_node = Node(
@@ -39,15 +72,17 @@ def generate_launch_description():
         name="sixd_pose_transform_node",
         output="screen",
         parameters=[{
-            "handeye_result_path": (
-                "/home/choisuhyun/course/robot_manipulation-bin-picking/"
-                "src/calib/config/handeye_capture_rs/handeye_result.json"
-            ),
-            "object_grasp_yaml_path": (
-                "/home/choisuhyun/course/robot_manipulation-bin-picking/"
-                "src/sixd_pose_vision/config/object_grasp.yaml"
-            ),
-            "peg_target_pose_mode": "object",
+            "handeye_result_path": handeye_result_path,
+            "object_grasp_yaml_path": object_grasp_yaml_path,
+
+            "peg_target_pose_mode": "grasp",
+
+            # RAW object -> object_T_grasp -> grasp axis canonicalization -> final grasp
+            "canonicalize_object_axes": False,
+            "canonicalize_grasp_axes": True,
+            "canonicalize_z_flip_margin": 0.05,
+            "canonicalize_xy_down_margin": 0.05,
+
             "min_confidence": 0.3,
 
             "object_topic": "/object_poses",
@@ -62,10 +97,7 @@ def generate_launch_description():
             "peg_output_topic": "/vision/peg_targets",
             "hole_output_topic": "/vision/hole_targets",
 
-            "duplicate_dist_mm": 12.0,
-            "collect_frames": 5,
             "detect_mode_settle_sec": 0.5,
-            "publish_best_only": True,
         }],
     )
 
