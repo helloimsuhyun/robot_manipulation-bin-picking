@@ -53,7 +53,7 @@ def generate_launch_description():
             "fp_register_iter": "5",
             "fp_track_iter": "2",
             "fp_track_loss_thr": "0.2",
-            "fp_debug": "0",
+            "fp_debug": "1",
             "fp_use_tracking": "false",
 
             "object_topic": "/object_poses",
@@ -79,7 +79,7 @@ def generate_launch_description():
 
             # object frame 축을 제어부에서 그대로 사용해야 하므로 자동 z-flip/xy-swap을 끈다.
             "canonicalize_object_axes": False,
-            "canonicalize_grasp_axes": True,
+            "canonicalize_grasp_axes": False,
             "canonicalize_z_flip_margin": 0.05,
             "canonicalize_xy_down_margin": 0.05,
 

@@ -673,7 +673,7 @@ class PegInHoleController(Node):
             corrected_yaw = 135.0
 
         elif object_id == 1:
-            corrected_yaw = (yaw % 90.0) + 90.0
+            corrected_yaw = (yaw % 90.0) + 135.0
 
         elif object_id == 2:
             corrected_yaw = (yaw % 90.0) + 135.0
