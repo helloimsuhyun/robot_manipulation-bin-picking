@@ -1,37 +1,13 @@
 unit: mm
 
-# convention:
-# - object_to_center:
-#     FoundationPose/CAD raw object frame -> centered/new object frame
-#
-# - centered_object_to_tcp:
-#     centered/new object frame -> robot TCP grasp frame
-#
-# Goal:
-# - gripper tip reaches the object center.
-#
-# Assumption:
-# - object_to_center z = +15 mm means raw CAD/object origin -> object center.
-# - gripper tip is 150 mm along TCP local -Y from TCP origin.
-#
-# robot TCP convention:
-# - TCP +X = object +X
-# - TCP -Y = object -Z   # approach direction, top -> down
-# - TCP +Y = object +Z   # pregrasp / TCP retreat direction
-#
-# Therefore:
-# - TCP origin must be object +Z direction 150 mm above the gripper tip.
-# - gripper tip = TCP origin + TCP(-Y)*150 mm
-# - Since TCP +Y = object +Z, TCP(-Y) = object -Z.
-# - So TCP origin at object +Z 150 mm makes tip arrive at object center.
-
 objects:
   cylinder:
+    symmetry:
+      axis: "+z"
+      yaw_candidates_deg: [0.0, 180.0]
+
     object_to_center:
       unit: mm
-      translation_mm: [0.0, 0.0, 15.0]
-      rotation_rpy_deg: [0.0, 0.0, 0.0]
-      rotation_convention: "R = Rz(rz) @ Ry(ry) @ Rx(rx), column-vector convention"
       matrix:
         - [1.0, 0.0, 0.0,  0.0]
         - [0.0, 1.0, 0.0,  0.0]
@@ -40,21 +16,19 @@ objects:
 
     centered_object_to_tcp:
       unit: mm
-      translation_mm: [0.0, 0.0, 40.0]
-      rotation_rpy_deg: [90.0, 0.0, 0.0]
-      rotation_convention: "R = Rz(rz) @ Ry(ry) @ Rx(rx), column-vector convention"
       matrix:
-        - [1.0, 0.0,  0.0,   0.0]
-        - [0.0, 0.0, -1.0,   0.0]
-        - [0.0, 1.0,  0.0, 40.0]
-        - [0.0, 0.0,  0.0,   1.0]
+        - [0.707107, 0.0,  0.707107,   0.0]
+        - [0.707107, 0.0, -0.707107,   0.0]
+        - [0.0,      1.0,  0.0,       40.0]
+        - [0.0,      0.0,  0.0,        1.0]
 
   hole:
+    symmetry:
+      axis: "+z"
+      yaw_candidates_deg: [0.0, 180.0]
+
     object_to_center:
       unit: mm
-      translation_mm: [0.0, 0.0, 15.0]
-      rotation_rpy_deg: [0.0, 0.0, -45.0]
-      rotation_convention: "R = Rz(rz) @ Ry(ry) @ Rx(rx), column-vector convention"
       matrix:
         - [ 0.707107, 0.707107, 0.0,  0.0]
         - [-0.707107, 0.707107, 0.0,  0.0]
@@ -63,21 +37,19 @@ objects:
 
     centered_object_to_tcp:
       unit: mm
-      translation_mm: [0.0, 0.0, 40.0]
-      rotation_rpy_deg: [90.0, 0.0, 0.0]
-      rotation_convention: "R = Rz(rz) @ Ry(ry) @ Rx(rx), column-vector convention"
       matrix:
-        - [1.0, 0.0,  0.0,   0.0]
-        - [0.0, 0.0, -1.0,   0.0]
-        - [0.0, 1.0,  0.0, 40.0]
-        - [0.0, 0.0,  0.0,   1.0]
+        - [0.707107, 0.0,  0.707107,   0.0]
+        - [0.707107, 0.0, -0.707107,   0.0]
+        - [0.0,      1.0,  0.0,       40.0]
+        - [0.0,      0.0,  0.0,        1.0]
 
   cross:
+    symmetry:
+      axis: "+z"
+      yaw_candidates_deg: [0.0, 180.0]
+
     object_to_center:
       unit: mm
-      translation_mm: [0.0, 0.0, 15.0]
-      rotation_rpy_deg: [0.0, 0.0, 0.0]
-      rotation_convention: "R = Rz(rz) @ Ry(ry) @ Rx(rx), column-vector convention"
       matrix:
         - [1.0, 0.0, 0.0,  0.0]
         - [0.0, 1.0, 0.0,  0.0]
@@ -86,11 +58,8 @@ objects:
 
     centered_object_to_tcp:
       unit: mm
-      translation_mm: [0.0, 0.0, 40.0]
-      rotation_rpy_deg: [90.0, 0.0, 0.0]
-      rotation_convention: "R = Rz(rz) @ Ry(ry) @ Rx(rx), column-vector convention"
       matrix:
-        - [1.0, 0.0,  0.0,   0.0]
-        - [0.0, 0.0, -1.0,   0.0]
-        - [0.0, 1.0,  0.0, 40.0]
-        - [0.0, 0.0,  0.0,   1.0]
+        - [0.707107, 0.0,  0.707107,   0.0]
+        - [0.707107, 0.0, -0.707107,   0.0]
+        - [0.0,      1.0,  0.0,       40.0]
+        - [0.0,      0.0,  0.0,        1.0]

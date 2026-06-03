@@ -1,4 +1,6 @@
 """
+Build / run example:
+
 cd ~/course/robot_manipulation-bin-picking
 
 rm -rf build/ install/ log/
@@ -19,12 +21,10 @@ from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
-
     # ============================================================
-    # 핸드아이 , 물체 파지좌표 , FD pose repo 절대경로 PC 변경시 같이 확인 필요 **************************
-    foundationpose_repo_path = (
-        "/home/chu/FoundationPose"
-    )
+    # PC 변경 시 여기 3개 경로만 먼저 확인
+    # ============================================================
+    foundationpose_repo_path = "/home/chu/FoundationPose"
 
     handeye_result_path = (
         "/home/chu/robot_manipulation-bin-picking/src/calib/config/handeye_capture_rs/handeye_result.json"
@@ -33,6 +33,21 @@ def generate_launch_description():
     object_grasp_yaml_path = (
         "/home/chu/robot_manipulation-bin-picking/src/calib/config/object_grasp.yaml"
     )
+
+    # ============================================================
+    # Topic names
+
+    object_topic = "/object_poses"
+    insert_topic = "/insert_poses"
+    detect_mode_topic = "/detect_mode"
+
+    peg_trigger_topic = "/manipulation/trigger_peg"
+    hole_trigger_topic = "/manipulation/trigger_hole"
+    object_6d_trigger_topic = "/manipulation/object_6d_trigger"
+
+    peg_output_topic = "/vision/peg_targets"
+    hole_output_topic = "/vision/hole_targets"
+
     sixd_pose_share = FindPackageShare("sixd_pose_vision")
 
     mixed_pose_vision_launch = IncludeLaunchDescription(
@@ -56,10 +71,11 @@ def generate_launch_description():
             "fp_debug": "0",
             "fp_use_tracking": "false",
 
-            "object_topic": "/object_poses",
-            "insert_topic": "/insert_poses",
-            "detect_mode_topic": "/detect_mode",
-            "object_trigger_topic": "/object_6d_trigger",
+            "object_topic": object_topic,
+            "insert_topic": insert_topic,
+            "detect_mode_topic": detect_mode_topic,
+            "object_trigger_topic": object_6d_trigger_topic,
+
             "frame_id": "camera_color_optical_frame",
         }.items(),
     )
@@ -74,33 +90,37 @@ def generate_launch_description():
             "object_grasp_yaml_path": object_grasp_yaml_path,
 
             # 최종 출력은 제어부 moveL에 바로 넣는 TCP target pose6
-            # /vision/peg_targets 성공 응답:
-            # [tcp_x_mm, tcp_y_mm, tcp_z_mm, tcp_rx_deg, tcp_ry_deg, tcp_rz_deg]
             "peg_target_pose_mode": "moveL_pose6",
 
-            # object_to_center 적용 후 centered object +Z가 바닥을 향하면 보정
-            # 실제 파지 안정성 생각하면 True 추천
+            # object_to_center 적용 후 centered object +Z가 world +Z에 더 가깝도록 보정
             "canonicalize_object_axes": True,
             "canonicalize_z_flip_margin": 0.05,
+            #    X/Y 중 world XY 평면에 더 평행한 축을 centered object +X로 선택
+            "canonicalize_xy_flatter_as_x": True,
+            "canonicalize_xy_swap_margin": 0.03,
+            "canonicalize_xy_max_flatness": 0.85,
+
+            # 3) YAML symmetry.yaw_candidates_deg 후보 중 RB5 마지막 joint 기준으로 선택
+            #    peg_camera_joint 마지막 joint J5=34.16 deg 기준
+            "reference_last_joint_deg": 34.16,
+            "last_joint_limit_delta_deg": 95.0,
 
             "min_confidence": 0.3,
 
-            "object_topic": "/object_poses",
-            "insert_topic": "/insert_poses",
-            "detect_mode_topic": "/detect_mode",
+            "object_topic": object_topic,
+            "insert_topic": insert_topic,
+            "detect_mode_topic": detect_mode_topic,
 
-            "peg_trigger_topic": "/manipulation/trigger_peg",
-            "hole_trigger_topic": "/manipulation/trigger_hole",
+            "peg_trigger_topic": peg_trigger_topic,
+            "hole_trigger_topic": hole_trigger_topic,
+            "object_6d_trigger_topic": object_6d_trigger_topic,
 
-            # 코드 기본값과 맞추는 걸 추천
-            "object_6d_trigger_topic": "/manipulation/object_6d_trigger",
-
-            "peg_output_topic": "/vision/peg_targets",
-            "hole_output_topic": "/vision/hole_targets",
+            "peg_output_topic": peg_output_topic,
+            "hole_output_topic": hole_output_topic,
 
             "detect_mode_settle_sec": 0.5,
 
-            # 필요 없으면 False
+            # 실제 제어 노드 구조는 유지하고, publish 직후 preview만 띄움
             "visualize_pose6_target": True,
             "visualize_axes_length_mm": 50.0,
             "visualize_approach_length_mm": 80.0,
@@ -148,10 +168,10 @@ def generate_launch_description():
             "descend_move_l_speed": 20.0,
             "descend_move_l_acc": 40.0,
 
-            "peg_targets_topic": "/vision/peg_targets",
-            "hole_targets_topic": "/vision/hole_targets",
-            "trigger_peg_topic": "/manipulation/trigger_peg",
-            "trigger_hole_topic": "/manipulation/trigger_hole",
+            "peg_targets_topic": peg_output_topic,
+            "hole_targets_topic": hole_output_topic,
+            "trigger_peg_topic": peg_trigger_topic,
+            "trigger_hole_topic": hole_trigger_topic,
 
             "camera_settle_sec": 0.5,
             "use_6d_peg_interface": True,

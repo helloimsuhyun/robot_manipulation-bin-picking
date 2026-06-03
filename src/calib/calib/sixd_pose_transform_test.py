@@ -174,32 +174,158 @@ def defend_centered_object_z_up(
     up: np.ndarray = np.array([0, 0, 1], dtype=np.float64),
     z_flip_margin: float = 0.05,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    object +Z가 world +Z에 더 가깝도록 보정한다.
+
+    방식:
+      1. 원본 keep 후보 생성
+      2. X/Z를 동시에 뒤집은 flip 후보 생성
+      3. dot(object +Z, world +Z)가 더 큰 후보 선택
+      4. 단, flip 후보가 margin 이상 더 좋을 때만 flip
+    """
     T = np.asarray(T, dtype=np.float64).reshape(4, 4).copy()
     validate_T(T, name="z_defense_in")
-    up = normalize_vec(up)
+
+    up = normalize_vec(up, name="z_defense_up")
     R = orthonormalize_R(T[:3, :3])
-    x, y, z = R[:, 0].copy(), R[:, 1].copy(), R[:, 2].copy()
-    before = {"x": float(np.dot(x, up)), "y": float(np.dot(y, up)), "z": float(np.dot(z, up))}
-    z_flipped = False
-    if before["z"] < -float(z_flip_margin):
-        x, z = -x, -z
-        z_flipped = True
-    z = normalize_vec(z)
-    x = normalize_vec(x - z * float(np.dot(x, z)))
-    y = normalize_vec(np.cross(z, x))
-    T[:3, :3] = orthonormalize_R(np.column_stack([x, y, z]))
+
+    def _make_right_handed_from_xz(x_raw: np.ndarray, z_raw: np.ndarray, tag: str) -> np.ndarray:
+        z = normalize_vec(z_raw, name=f"{tag}_z")
+
+        # x를 z에 수직인 평면으로 투영
+        x = np.asarray(x_raw, dtype=np.float64).reshape(3)
+        x = x - z * float(np.dot(x, z))
+        x = normalize_vec(x, name=f"{tag}_x_proj")
+
+        # 오른손 좌표계 유지: x × y = z 가 되려면 y = z × x
+        y = normalize_vec(np.cross(z, x), name=f"{tag}_y")
+
+        return orthonormalize_R(np.column_stack([x, y, z]))
+
+    # 1. 원본 후보
+    R_keep = _make_right_handed_from_xz(
+        R[:, 0],
+        R[:, 2],
+        tag="keep",
+    )
+    keep_dot = float(np.dot(R_keep[:, 2], up))
+
+    # 2. flip 후보
+    # Z만 뒤집으면 det가 깨질 수 있으므로 X/Z를 같이 뒤집음
+    R_flip = _make_right_handed_from_xz(
+        -R[:, 0],
+        -R[:, 2],
+        tag="flip",
+    )
+    flip_dot = float(np.dot(R_flip[:, 2], up))
+
+    # 3. flip이 충분히 더 위를 보면 flip
+    z_flipped = flip_dot > keep_dot + float(z_flip_margin)
+
+    if z_flipped:
+        T[:3, :3] = R_flip
+    else:
+        T[:3, :3] = R_keep
+
     validate_T(T, name="z_defense_out")
+
     info = {
-        "z_flipped": z_flipped,
-        "before_dot_up": before,
+        "z_flipped": bool(z_flipped),
+
+        # 기존 로그 호환용
+        "before_dot_up": {
+            "x": float(np.dot(R_keep[:, 0], up)),
+            "y": float(np.dot(R_keep[:, 1], up)),
+            "z": float(keep_dot),
+        },
+
+        # 추가 디버깅용
+        "keep_dot_up": {
+            "x": float(np.dot(R_keep[:, 0], up)),
+            "y": float(np.dot(R_keep[:, 1], up)),
+            "z": float(keep_dot),
+        },
+        "flip_dot_up": {
+            "x": float(np.dot(R_flip[:, 0], up)),
+            "y": float(np.dot(R_flip[:, 1], up)),
+            "z": float(flip_dot),
+        },
+
         "after_dot_up": {
             "x": float(np.dot(T[:3, 0], up)),
             "y": float(np.dot(T[:3, 1], up)),
             "z": float(np.dot(T[:3, 2], up)),
         },
     }
+
     return T, info
 
+
+
+def canonicalize_xy_flatter_as_x(
+    T: np.ndarray,
+    up: np.ndarray = np.array([0, 0, 1], dtype=np.float64),
+    swap_margin: float = 0.03,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    center/object frame의 X/Y 축 중 월드 XY 평면에 더 평행한 축을 새 object +X로 선택한다.
+
+    목적:
+      - 패러럴 그리퍼 닫힘축을 object X 계열에 맞출 때,
+        object X가 바닥 쪽으로 가파르게 박히는 것을 줄인다.
+      - 90도 대칭 물체에서 X/Y는 교환 가능하므로, 더 완만한 축을 canonical X로 둔다.
+
+    기준:
+      flatness = abs(dot(axis, world_up))
+      flatness가 작을수록 월드 XY 평면에 더 평행함.
+        0.0 → 완전 수평
+        1.0 → 완전 수직
+
+    동작:
+      - abs(y_z) + margin < abs(x_z) 이면 X/Y를 90도 회전 교환
+      - 아니면 원본 유지
+    """
+    T = np.asarray(T, dtype=np.float64).reshape(4, 4).copy()
+    validate_T(T, name="xy_flatten_in")
+
+    up = normalize_vec(up, name="xy_flatten_up")
+    R = orthonormalize_R(T[:3, :3])
+
+    x_old = normalize_vec(R[:, 0], "xy_x_old")
+    y_old = normalize_vec(R[:, 1], "xy_y_old")
+    z = normalize_vec(R[:, 2], "xy_z")
+
+    x_flatness = abs(float(np.dot(x_old, up)))
+    y_flatness = abs(float(np.dot(y_old, up)))
+
+    # y축이 x축보다 충분히 더 수평이면 y를 새 x로 채택
+    swapped_xy = y_flatness + float(swap_margin) < x_flatness
+
+    if swapped_xy:
+        x_new = y_old.copy()
+        # 오른손 좌표계 유지: y = z × x
+        y_new = normalize_vec(np.cross(z, x_new), "xy_y_new")
+    else:
+        x_new = x_old.copy()
+        y_new = normalize_vec(np.cross(z, x_new), "xy_y_keep")
+
+    # 수치오차 방지: x를 z에 수직으로 재투영 후 y 재계산
+    x_new = normalize_vec(x_new - z * float(np.dot(x_new, z)), "xy_x_proj")
+    y_new = normalize_vec(np.cross(z, x_new), "xy_y_final")
+
+    T[:3, :3] = orthonormalize_R(np.column_stack([x_new, y_new, z]))
+    validate_T(T, name="xy_flatten_out")
+
+    info = {
+        "xy_swapped": bool(swapped_xy),
+        "x_flatness_before": float(x_flatness),
+        "y_flatness_before": float(y_flatness),
+        "selected_x_from": "old_y" if swapped_xy else "old_x",
+        "x_flatness_after": abs(float(np.dot(T[:3, 0], up))),
+        "y_flatness_after": abs(float(np.dot(T[:3, 1], up))),
+        "z_dot_up_after": float(np.dot(T[:3, 2], up)),
+    }
+    return T, info
 
 def object_json_to_cam_T_obj_mm(obj: Dict[str, Any]) -> np.ndarray:
     if "pose_matrix" in obj:
@@ -227,6 +353,82 @@ def object_json_to_cam_T_obj_mm(obj: Dict[str, Any]) -> np.ndarray:
 
 def canonical_object_name(cls: str) -> str:
     return {"cross_insert": "cross", "cylinder_insert": "cylinder", "hole_insert": "hole"}.get(cls, cls)
+
+
+def wrap_deg(a: float) -> float:
+    """각도를 [-180, 180) 범위로 정규화."""
+    return float((float(a) + 180.0) % 360.0 - 180.0)
+
+
+def T_rot_z_deg(deg: float) -> np.ndarray:
+    """object/center local +Z 기준 yaw 회전 4x4."""
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = euler_zyx_deg_to_R(0.0, 0.0, float(deg))
+    return T
+
+
+def trans_mm(x: float, y: float, z: float) -> np.ndarray:
+    T = np.eye(4, dtype=np.float64)
+    T[:3, 3] = [float(x), float(y), float(z)]
+    return T
+
+
+def rot_y_deg(deg: float) -> np.ndarray:
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = euler_zyx_deg_to_R(0.0, float(deg), 0.0)
+    return T
+
+
+def rot_z_deg(deg: float) -> np.ndarray:
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = euler_zyx_deg_to_R(0.0, 0.0, float(deg))
+    return T
+
+
+def rb5_urdf_fk_T_tcp_mm(q_deg: np.ndarray) -> np.ndarray:
+    """
+    RB5 공식 URDF/joint.yaml 기준 간단 FK.
+    q_deg = [J0, J1, J2, J3, J4, J5] in deg.
+    반환 translation 단위는 mm.
+
+    chain:
+      Tz(169.2) Rz(q0)
+      Ry(q1)
+      Tz(425.0) Ry(q2)
+      Tz(392.0) Ry(q3)
+      T(0,-110.7,110.7) Rz(q4)
+      Ry(q5)
+      T(0,-96.7,0)
+    """
+    q = np.asarray(q_deg, dtype=np.float64).reshape(6)
+    T = np.eye(4, dtype=np.float64)
+    T = T @ trans_mm(0.0, 0.0, 169.2) @ rot_z_deg(q[0])
+    T = T @ trans_mm(0.0, 0.0,   0.0) @ rot_y_deg(q[1])
+    T = T @ trans_mm(0.0, 0.0, 425.0) @ rot_y_deg(q[2])
+    T = T @ trans_mm(0.0, 0.0, 392.0) @ rot_y_deg(q[3])
+    T = T @ trans_mm(0.0, -110.7, 110.7) @ rot_z_deg(q[4])
+    T = T @ trans_mm(0.0, 0.0,   0.0) @ rot_y_deg(q[5])
+    T = T @ trans_mm(0.0, -96.7, 0.0)
+    T[:3, :3] = orthonormalize_R(T[:3, :3])
+    validate_T(T, name="rb5_urdf_fk_T_tcp_mm")
+    return T
+
+
+def signed_angle_about_axis_deg(v_from: np.ndarray, v_to: np.ndarray, axis: np.ndarray) -> float:
+    """axis 기준 v_from -> v_to signed angle [deg]."""
+    axis = normalize_vec(axis, name="signed_angle_axis")
+    a = np.asarray(v_from, dtype=np.float64).reshape(3)
+    b = np.asarray(v_to, dtype=np.float64).reshape(3)
+
+    # axis에 수직인 평면으로 projection
+    a = a - axis * float(np.dot(a, axis))
+    b = b - axis * float(np.dot(b, axis))
+    a = normalize_vec(a, name="signed_angle_from_proj")
+    b = normalize_vec(b, name="signed_angle_to_proj")
+
+    s = float(np.dot(axis, np.cross(a, b)))
+    c = float(np.clip(np.dot(a, b), -1.0, 1.0))
+    return float(np.degrees(np.arctan2(s, c)))
 
 
 # ============================================================
@@ -447,13 +649,26 @@ class SixDPoseTransformTestNode(Node):
         self.declare_parameter("min_confidence",            0.3)
         self.declare_parameter("canonicalize_object_axes",  True)
         self.declare_parameter("canonicalize_z_flip_margin", 0.05)
+        # X/Y canonicalization: X/Y 중 더 수평인 축을 object +X로 선택
+        self.declare_parameter("canonicalize_xy_flatter_as_x", True)
+        self.declare_parameter("canonicalize_xy_swap_margin", 0.03)
+        self.declare_parameter("canonicalize_xy_max_flatness", 0.85)
         self.declare_parameter("visualize_axes_length_mm",  50.0)
         self.declare_parameter("visualize_approach_length_mm", 80.0)
         self.declare_parameter("visualize_save_dir",        "")
 
+        # RB5 마지막 joint 후보 필터 기준
+        # peg_camera_joint의 마지막 joint J5 = 34.16 deg 기준, 허용 범위 = 기준 ±90 deg
+        # 전체 joint 리스트는 쓰지 않고, 마지막 joint 기준값만 사용한다.
+        self.declare_parameter("reference_last_joint_deg", 34.16)
+        self.declare_parameter("last_joint_limit_delta_deg", 95.0)
+
         self.min_confidence = float(self.get_parameter("min_confidence").value)
         self.use_robot      = bool(self.get_parameter("use_robot").value)
         self.robot_ip       = str(self.get_parameter("robot_ip").value)
+
+        self.reference_last_joint_deg = float(self.get_parameter("reference_last_joint_deg").value)
+        self.last_joint_limit_delta_deg = float(self.get_parameter("last_joint_limit_delta_deg").value)
 
         # ── class maps ──────────────────────────────
         self.class_to_id = {
@@ -569,32 +784,96 @@ class SixDPoseTransformTestNode(Node):
             obj_data = obj_data or {}
             raw_T_center = _pick(
                 obj_data,
-                ["object_to_center", "object_to_canonical", "object_to_grasp"],
+                ["object_to_center"],
                 np.eye(4, dtype=np.float64),
             )
+
             center_T_tcp = _pick(
                 obj_data,
-                ["centered_object_to_tcp", "center_to_tcp", "canonical_to_tcp"],
+                ["centered_object_to_tcp"],
                 np.eye(4, dtype=np.float64),
             )
             cfg[str(name)] = {
                 "raw_object_T_centered_object": raw_T_center,
                 "centered_object_T_tcp_goal":   center_T_tcp,
+                "symmetry": obj_data.get("symmetry", {}) or {},
             }
         self.get_logger().info(f"[YAML] loaded: {path}")
         return cfg
 
-    def _get_transforms(self, cls: str) -> Tuple[np.ndarray, np.ndarray]:
+    def _get_transforms(self, cls: str) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
         base = canonical_object_name(cls)
         item = self.grasp_cfg.get(cls) or self.grasp_cfg.get(base) or {
             "raw_object_T_centered_object": np.eye(4, dtype=np.float64),
             "centered_object_T_tcp_goal":   np.eye(4, dtype=np.float64),
+            "symmetry": {},
         }
         raw_T_c   = np.asarray(item["raw_object_T_centered_object"], dtype=np.float64).reshape(4, 4)
         center_T_tcp = np.asarray(item["centered_object_T_tcp_goal"],    dtype=np.float64).reshape(4, 4)
+        symmetry = item.get("symmetry", {}) or {}
         validate_T(raw_T_c,      name=f"raw_T_center[{cls}]")
         validate_T(center_T_tcp, name=f"center_T_tcp[{cls}]")
-        return raw_T_c.copy(), center_T_tcp.copy()
+        return raw_T_c.copy(), center_T_tcp.copy(), dict(symmetry)
+
+    def _make_symmetric_grasp_candidates(
+        self,
+        center_T_tcp_nominal: np.ndarray,
+        symmetry: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """
+        centered_object_to_tcp 기본 grasp를 object +Z 기준으로 0/90/180/270... 회전시켜 후보 생성.
+        """
+        yaw_candidates = symmetry.get("yaw_candidates_deg", [0.0])
+        candidates: List[Dict[str, Any]] = []
+
+        for yaw in yaw_candidates:
+            yaw = float(yaw)
+            center_T_tcp = T_rot_z_deg(yaw) @ center_T_tcp_nominal
+            validate_T(center_T_tcp, name=f"center_T_tcp_candidate[yaw={yaw}]")
+            candidates.append({
+                "name": f"yaw_{yaw:.0f}",
+                "yaw_deg": yaw,
+                "center_T_tcp": center_T_tcp,
+            })
+
+        if not candidates:
+            candidates.append({
+                "name": "yaw_0",
+                "yaw_deg": 0.0,
+                "center_T_tcp": center_T_tcp_nominal.copy(),
+            })
+
+        return candidates
+
+    def _estimate_last_joint_for_goal(
+        self,
+        base_T_goal: np.ndarray,
+        reference_T_tcp: np.ndarray,
+    ) -> Tuple[float, float, float]:
+        """
+        peg_camera_joint의 마지막 joint J5=reference_last_joint_deg 기준으로,
+        목표 TCP 자세가 J5를 얼마나 더 돌려야 하는지 근사 추정한다.
+
+        핵심 단순화:
+          - 전체 peg_camera_joint 리스트는 쓰지 않는다.
+          - 현재 카메라 자세의 TCP 방향(reference_T_tcp)을 기준 자세로 사용한다.
+          - 목표 TCP +X가 기준 TCP +X에서 얼마나 회전했는지를 TCP +Y축 기준 signed angle로 본다.
+          - 그 회전량을 J5 변화량으로 근사한다.
+
+        return:
+          estimated_j5_deg, delta_from_reference_abs_deg, signed_delta_deg
+        """
+        R_ref = orthonormalize_R(reference_T_tcp[:3, :3])
+        R_goal = orthonormalize_R(base_T_goal[:3, :3])
+
+        ref_x = R_ref[:, 0]
+        goal_x = R_goal[:, 0]
+        goal_y = R_goal[:, 1]  # TCP +Y, 즉 pregrasp/retreat 축
+
+        signed_delta = signed_angle_about_axis_deg(ref_x, goal_x, goal_y)
+        estimated_j5 = wrap_deg(self.reference_last_joint_deg + signed_delta)
+        delta_abs = abs(wrap_deg(estimated_j5 - self.reference_last_joint_deg))
+        return estimated_j5, delta_abs, signed_delta
 
     # ── main callback ────────────────────────────────
 
@@ -630,6 +909,10 @@ class SixDPoseTransformTestNode(Node):
                 f"[RESULT] class={target['class']} "
                 f"conf={target['confidence']:.3f} "
                 f"z_flipped={target.get('axis_info', {}).get('z_flipped', '?')} "
+                f"grasp={target.get('selected_grasp_name', '?')} "
+                f"yaw={target.get('selected_grasp_yaw_deg', '?')} "
+                f"est_J5={target.get('estimated_last_joint_deg', 0.0):.2f} "
+                f"dJ5={target.get('last_joint_delta_deg', 0.0):.2f} "
                 f"pose6={np.round(target['target_pose6'], 2).tolist()}"
             )
 
@@ -667,7 +950,7 @@ class SixDPoseTransformTestNode(Node):
             validate_T(base_T_raw, name=f"base_T_raw[{cls}]")
 
             # YAML 오프셋
-            raw_T_center, center_T_tcp = self._get_transforms(cls)
+            raw_T_center, center_T_tcp_nominal, symmetry = self._get_transforms(cls)
             base_T_center = base_T_raw @ raw_T_center
             validate_T(base_T_center, name=f"base_T_center[{cls}]")
 
@@ -685,10 +968,86 @@ class SixDPoseTransformTestNode(Node):
                         f"after={axis_info['after_dot_up']}"
                     )
 
-            # 최종 TCP goal
-            base_T_goal = base_T_center @ center_T_tcp
-            validate_T(base_T_goal, name=f"base_T_goal[{cls}]")
+            # X/Y 평면 방어:
+            # object X/Y 중 월드 XY 평면에 더 평행한 축을 object +X로 선택한다.
+            # 패러럴 그리퍼가 바닥 쪽으로 가파르게 박히는 방향을 피하기 위한 canonicalization.
+            xy_info = None
+            if bool(self.get_parameter("canonicalize_xy_flatter_as_x").value):
+                base_T_center, xy_info = canonicalize_xy_flatter_as_x(
+                    base_T_center,
+                    swap_margin=float(self.get_parameter("canonicalize_xy_swap_margin").value),
+                )
+                self.get_logger().info(
+                    f"[XY_FLAT] cls={cls} "
+                    f"swapped={xy_info['xy_swapped']} "
+                    f"selected_x={xy_info['selected_x_from']} "
+                    f"x_flat_before={xy_info['x_flatness_before']:.3f} "
+                    f"y_flat_before={xy_info['y_flatness_before']:.3f} "
+                    f"x_flat_after={xy_info['x_flatness_after']:.3f}"
+                )
 
+                # 선택된 X축도 너무 수직이면 pose 자체가 불안정하다고 보고 skip
+                max_flat = float(self.get_parameter("canonicalize_xy_max_flatness").value)
+                if xy_info["x_flatness_after"] > max_flat:
+                    self.get_logger().warn(
+                        f"[SKIP] cls={cls}: selected object +X is still too steep. "
+                        f"x_flatness_after={xy_info['x_flatness_after']:.3f} > {max_flat:.3f}"
+                    )
+                    return None
+
+            # 90도 회전 대칭 grasp 후보 생성 후, RB5 마지막 joint 제약으로 필터링
+            grasp_candidates = self._make_symmetric_grasp_candidates(center_T_tcp_nominal, symmetry)
+
+            best = None
+            for cand in grasp_candidates:
+                base_T_goal_cand = base_T_center @ cand["center_T_tcp"]
+                validate_T(base_T_goal_cand, name=f"base_T_goal[{cls}:{cand['name']}]")
+
+                estimated_j5, delta_j5, signed_delta_j5 = self._estimate_last_joint_for_goal(base_T_goal_cand, base_T_ee)
+
+                # peg_camera_joint J5 기준 ±last_joint_limit_delta_deg 밖이면 제외
+                if delta_j5 > self.last_joint_limit_delta_deg + 1e-9:
+                    self.get_logger().info(
+                        f"[J5_SKIP] cls={cls} cand={cand['name']} "
+                        f"yaw={cand['yaw_deg']:.1f} "
+                        f"est_J5={estimated_j5:.2f} "
+                        f"signed_delta={signed_delta_j5:.2f} "
+                        f"delta={delta_j5:.2f} "
+                        f"limit=±{self.last_joint_limit_delta_deg:.1f}"
+                    )
+                    continue
+
+                # 제약 안쪽 후보 중 reference J5=34.16에 가장 가까운 후보 선택
+                score = delta_j5
+                if best is None or score < best["score"]:
+                    best = {
+                        "candidate": cand,
+                        "base_T_goal": base_T_goal_cand,
+                        "estimated_j5": estimated_j5,
+                        "delta_j5": delta_j5,
+                        "signed_delta_j5": signed_delta_j5,
+                        "score": score,
+                    }
+
+                self.get_logger().info(
+                    f"[J5_CAND] cls={cls} cand={cand['name']} "
+                    f"yaw={cand['yaw_deg']:.1f} "
+                    f"est_J5={estimated_j5:.2f} "
+                    f"signed_delta={signed_delta_j5:.2f} "
+                    f"delta={delta_j5:.2f} "
+                    f"score={score:.2f}"
+                )
+
+            if best is None:
+                self.get_logger().warn(
+                    f"[NO_VALID_GRASP] cls={cls}: "
+                    f"all candidates exceed J5 reference {self.reference_last_joint_deg:.2f} "
+                    f"±{self.last_joint_limit_delta_deg:.1f} deg"
+                )
+                return None
+
+            selected = best["candidate"]
+            base_T_goal = best["base_T_goal"]
             pose6 = T_mm_to_pose6_mm_deg(base_T_goal)
 
             return {
@@ -700,6 +1059,12 @@ class SixDPoseTransformTestNode(Node):
                 "base_T_obj_raw":             base_T_raw,
                 "base_T_centered_object_safe": base_T_center,
                 "axis_info":                  axis_info,
+                "xy_info":                    xy_info,
+                "selected_grasp_name":        selected["name"],
+                "selected_grasp_yaw_deg":     float(selected["yaw_deg"]),
+                "estimated_last_joint_deg":   float(best["estimated_j5"]),
+                "last_joint_delta_deg":       float(best["delta_j5"]),
+                "last_joint_signed_delta_deg": float(best["signed_delta_j5"]),
             }
 
         except Exception as e:
