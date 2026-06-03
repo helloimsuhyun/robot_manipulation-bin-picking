@@ -2,11 +2,8 @@
 Build / run example:
 
 cd ~/course/robot_manipulation-bin-picking
-
 rm -rf build/ install/ log/
-
 colcon build --symlink-install --packages-select sixd_pose_vision calib control bringup
-
 source install/setup.bash
 
 ros2 launch bringup 6d_peg_in_hole_bringup.launch.py
@@ -22,8 +19,8 @@ from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description():
     # ============================================================
-    # PC 변경 시 여기 3개 경로만 먼저 확인
-    # ============================================================
+    # PC 변경 시 여기 3개 경로만 먼저 확인 **********************************************************
+
     foundationpose_repo_path = "/home/chu/FoundationPose"
 
     handeye_result_path = (
@@ -65,7 +62,7 @@ def generate_launch_description():
             "enable_visualization": "true",
             "conf_thresh": "0.4",
 
-            "fp_register_iter": "10",
+            "fp_register_iter": "7",
             "fp_track_iter": "2",
             "fp_track_loss_thr": "0.2",
             "fp_debug": "0",

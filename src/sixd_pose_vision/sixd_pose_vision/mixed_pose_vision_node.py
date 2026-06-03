@@ -336,9 +336,25 @@ class FPEstimator:
         self.registered = False
         self.last_score = 1.0
 
-    def estimate(self, rgb_bgr, depth_uint16, mask_uint8, K, register_iter, track_iter, track_loss_thr, use_tracking):
+    def estimate(
+        self,
+        rgb_bgr,
+        depth_uint16,
+        mask_uint8,
+        K,
+        register_iter,
+        track_iter,
+        track_loss_thr,
+        use_tracking,
+        depth_scale: float = 0.001,
+    ):
         rgb = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2RGB).astype(np.uint8)
-        depth = depth_uint16.astype(np.float32) * 0.001  # RealSense z16 mm -> m
+
+        depth_scale = float(depth_scale)
+        if depth_scale <= 0.0:
+            raise ValueError(f"Invalid depth_scale={depth_scale}. It must be positive.")
+
+        depth = depth_uint16.astype(np.float32) * depth_scale
         need_register = (not use_tracking) or (not self.registered) or (self.last_score < track_loss_thr)
         if need_register:
             pose = self.estimator.register(K=K, rgb=rgb, depth=depth, ob_mask=(mask_uint8 > 0), iteration=int(register_iter))
@@ -827,6 +843,7 @@ class MixedPoseVisionNode(Node):
                     track_iter=int(self.get_parameter("fp_track_iter").value),
                     track_loss_thr=float(self.get_parameter("fp_track_loss_thr").value),
                     use_tracking=False,
+                    depth_scale=self.depth_scale,
                 )
                 est.reset()
         except Exception as e:
