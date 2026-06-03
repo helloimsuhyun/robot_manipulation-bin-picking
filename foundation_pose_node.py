@@ -211,6 +211,15 @@ class FPEstimator:
 
     def __init__(self, class_name: str, mesh: trimesh.Trimesh, glctx, scorer, refiner):
         self.class_name = class_name
+
+        debug_dir = os.path.join(
+            os.path.expanduser("~"),
+            ".cache",
+            "foundationpose_debug",
+            str(class_name),
+        )
+        os.makedirs(debug_dir, exist_ok=True)
+
         self.estimator = FoundationPose(
             model_pts=mesh.vertices,
             model_normals=mesh.vertex_normals,
@@ -218,8 +227,10 @@ class FPEstimator:
             scorer=scorer,
             refiner=refiner,
             glctx=glctx,
+            debug_dir=debug_dir,
             debug=0,
         )
+
         self.registered = False
         self.last_score  = 1.0
 
