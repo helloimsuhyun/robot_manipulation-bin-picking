@@ -50,10 +50,10 @@ def generate_launch_description():
             "enable_visualization": "true",
             "conf_thresh": "0.4",
 
-            "fp_register_iter": "5",
+            "fp_register_iter": "10",
             "fp_track_iter": "2",
             "fp_track_loss_thr": "0.2",
-            "fp_debug": "1",
+            "fp_debug": "0",
             "fp_use_tracking": "false",
 
             "object_topic": "/object_poses",
@@ -73,15 +73,15 @@ def generate_launch_description():
             "handeye_result_path": handeye_result_path,
             "object_grasp_yaml_path": object_grasp_yaml_path,
 
-            # 제어부가 base_T_object를 받아서 직접 TCP target frame을 만든다.
-            # 따라서 여기서는 grasp frame이 아니라 object frame을 publish한다.
-            "peg_target_pose_mode": "grasp",
+            # 최종 출력은 제어부 moveL에 바로 넣는 TCP target pose6
+            # /vision/peg_targets 성공 응답:
+            # [tcp_x_mm, tcp_y_mm, tcp_z_mm, tcp_rx_deg, tcp_ry_deg, tcp_rz_deg]
+            "peg_target_pose_mode": "moveL_pose6",
 
-            # object frame 축을 제어부에서 그대로 사용해야 하므로 자동 z-flip/xy-swap을 끈다.
-            "canonicalize_object_axes": False,
-            "canonicalize_grasp_axes": False,
+            # object_to_center 적용 후 centered object +Z가 바닥을 향하면 보정
+            # 실제 파지 안정성 생각하면 True 추천
+            "canonicalize_object_axes": True,
             "canonicalize_z_flip_margin": 0.05,
-            "canonicalize_xy_down_margin": 0.05,
 
             "min_confidence": 0.3,
 
@@ -92,12 +92,20 @@ def generate_launch_description():
             "peg_trigger_topic": "/manipulation/trigger_peg",
             "hole_trigger_topic": "/manipulation/trigger_hole",
 
-            "object_6d_trigger_topic": "/object_6d_trigger",
+            # 코드 기본값과 맞추는 걸 추천
+            "object_6d_trigger_topic": "/manipulation/object_6d_trigger",
 
             "peg_output_topic": "/vision/peg_targets",
             "hole_output_topic": "/vision/hole_targets",
 
             "detect_mode_settle_sec": 0.5,
+
+            # 필요 없으면 False
+            "visualize_pose6_target": True,
+            "visualize_axes_length_mm": 50.0,
+            "visualize_approach_length_mm": 80.0,
+            "visualize_blocking": False,
+            "visualize_save_dir": "",
         }],
     )
 
