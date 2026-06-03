@@ -355,6 +355,11 @@ class PegInHoleController(Node):
 
         self.ctx.current_peg_index = peg_index
         self.ctx.current_peg_pick_pose = selected_peg.pose.copy()
+        self.ctx.current_peg_object_T = (
+            selected_peg.transform.copy()
+            if selected_peg.transform is not None
+            else None
+        )
         self.ctx.current_target_id = selected_peg.object_id
 
         self.get_logger().info(
@@ -398,6 +403,7 @@ class PegInHoleController(Node):
         if len(self.ctx.peg_targets) == 0:
             self.ctx.current_peg_index = -1
             self.ctx.current_peg_pick_pose = None
+            self.ctx.current_peg_object_T = None
             self.ctx.current_target_id = None
             return False
 
@@ -474,6 +480,7 @@ class PegInHoleController(Node):
         # 기존처럼 jig 정보를 지우고 아무 peg나 잡으면 같은 jig 세트를 끝까지 채우지 못하므로 멈춘다.
         self.ctx.current_peg_index = -1
         self.ctx.current_peg_pick_pose = None
+        self.ctx.current_peg_object_T = None
         self.ctx.current_target_id = None
 
         self.get_logger().warn(
@@ -593,59 +600,221 @@ class PegInHoleController(Node):
             f"remaining_jig_counts = {dict(self.ctx.remaining_jig_counts)}"
         )
 
-    def _pose_with_local_z_offset(self, pose: np.ndarray, offset_mm: float) -> np.ndarray:
+    @staticmethod
+    def _normalize_vec(v: np.ndarray, name: str) -> np.ndarray:
+        v = np.asarray(v, dtype=float).reshape(3)
+        n = float(np.linalg.norm(v))
+        if n < 1e-9:
+            raise ValueError(f"{name} norm is too small: {n}")
+        return v / n
+
+    @staticmethod
+    def _orthonormalize_R(R: np.ndarray) -> np.ndarray:
+        R = np.asarray(R, dtype=float).reshape(3, 3)
+        U, _, Vt = np.linalg.svd(R)
+        Rn = U @ Vt
+        if np.linalg.det(Rn) < 0.0:
+            U[:, -1] *= -1.0
+            Rn = U @ Vt
+        return Rn
+
+    def _R_to_euler_zyx_deg(self, R: np.ndarray) -> np.ndarray:
         """
-        pose = [x, y, z, rx, ry, rz] 기준에서 TCP/local z축 방향으로 offset을 적용한다.
-
-        6D peg 결과의 회전은 R = Rz(rz) @ Ry(ry) @ Rx(rx) 기준이다.
-        local z축은 R[:, 2]이고, 위치는 p + R[:, 2] * offset_mm로 계산한다.
+        R = Rz(rz) @ Ry(ry) @ Rx(rx) 기준으로 [rx, ry, rz] deg를 복원한다.
+        vision_interface.py 및 sixd_pose_transform_node.py와 같은 규칙이다.
         """
-        pose = np.array(pose, dtype=float).copy()
-        rx, ry, rz = np.radians(pose[3:6])
+        R = self._orthonormalize_R(R)
+        sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
 
-        cx, sx = np.cos(rx), np.sin(rx)
-        cy, sy = np.cos(ry), np.sin(ry)
-        cz, sz = np.cos(rz), np.sin(rz)
+        if sy >= 1e-9:
+            rx = np.arctan2(R[2, 1], R[2, 2])
+            ry = np.arctan2(-R[2, 0], sy)
+            rz = np.arctan2(R[1, 0], R[0, 0])
+        else:
+            rx = np.arctan2(-R[1, 2], R[1, 1])
+            ry = np.arctan2(-R[2, 0], sy)
+            rz = 0.0
 
-        Rx = np.array(
+        return np.degrees([rx, ry, rz]).astype(float)
+    
+    def _rot_x_deg(self, deg: float) -> np.ndarray:
+        a = np.deg2rad(float(deg))
+        c = np.cos(a)
+        s = np.sin(a)
+        return np.array(
             [
                 [1.0, 0.0, 0.0],
-                [0.0, cx, -sx],
-                [0.0, sx, cx],
-            ],
-            dtype=float,
-        )
-        Ry = np.array(
-            [
-                [cy, 0.0, sy],
-                [0.0, 1.0, 0.0],
-                [-sy, 0.0, cy],
-            ],
-            dtype=float,
-        )
-        Rz = np.array(
-            [
-                [cz, -sz, 0.0],
-                [sz, cz, 0.0],
-                [0.0, 0.0, 1.0],
+                [0.0, c, -s],
+                [0.0, s, c],
             ],
             dtype=float,
         )
 
-        R = Rz @ Ry @ Rx
-        local_z_axis = R[:, 2]
-        pose[:3] = pose[:3] + local_z_axis * float(offset_mm)
-        return pose
+    def _normalize_yaw_deg(self, yaw: float) -> float:
+        """
+        yaw를 -180 ~ 180 deg 범위로 정규화한다.
+        """
+        return (float(yaw) + 180.0) % 360.0 - 180.0
+
+    def _correct_pick_yaw_6d(self, yaw: float, object_id: int) -> float:
+        """
+        6D peg pick에서 object frame -> TCP pose 변환 후 나온 rz(yaw)를
+        object_id 기준으로 후처리한다.
+
+        id 의미:
+            0: 원
+            1: 사각형
+            2: 십자가
+        """
+        yaw = float(yaw)
+        object_id = int(object_id)
+
+        if object_id == 0:
+            corrected_yaw = 135.0
+
+        elif object_id == 1:
+            corrected_yaw = (yaw % 90.0) + 90.0
+
+        elif object_id == 2:
+            corrected_yaw = (yaw % 90.0) + 135.0
+
+        else:
+            self.get_logger().warn(
+                f"[6D PICK YAW] Unknown object_id={object_id}. "
+                f"Use raw yaw={yaw:.3f}"
+            )
+            corrected_yaw = yaw
+
+        corrected_yaw = self._normalize_yaw_deg(corrected_yaw)
+
+        self.get_logger().info(
+            f"[6D PICK YAW] id={object_id}, "
+            f"raw_yaw={yaw:.3f}, "
+            f"corrected_yaw={corrected_yaw:.3f}"
+        )
+
+        return corrected_yaw
+
+    def _make_tcp_pick_pose_from_object_T(
+        self,
+        base_T_object: np.ndarray,
+        offset_mm: float,
+        object_id: int,
+    ) -> np.ndarray:
+        """
+        6D vision에서 받은 base_T_object/grasp를 기준으로 pick용 TCP pose를 만든다.
+
+        의도:
+            - object local +Z 방향으로 offset 위치를 만든다.
+              따라서 offset 160 -> 150으로 이동하면 실제 접근 방향은 object local -Z.
+            - object local X축 방향을 그리퍼 정렬 방향으로 사용한다.
+            - rbpodo move_l TCP convention에 맞추기 위해 Rx(90deg) 보정을 적용한다.
+            - 마지막으로 object_id 기준 yaw 후처리를 적용한다.
+
+        반환:
+            pose6 = [x, y, z, rx, ry, rz]
+        """
+        base_T_object = np.asarray(base_T_object, dtype=np.float64).reshape(4, 4)
+
+        R_obj = base_T_object[:3, :3]
+        p_obj = base_T_object[:3, 3]
+
+        R_obj = self._orthonormalize_R(R_obj)
+
+        object_x = R_obj[:, 0]
+        object_z = R_obj[:, 2]
+
+        # object X축을 gripper 정렬축으로 사용
+        tcp_x = object_x / np.linalg.norm(object_x)
+
+        # object Z축을 접근 기준축으로 사용
+        tcp_z = object_z / np.linalg.norm(object_z)
+
+        # 수치 오차 때문에 x/z가 완전히 직교하지 않을 수 있으므로 재직교화
+        tcp_y = np.cross(tcp_z, tcp_x)
+        tcp_y_norm = np.linalg.norm(tcp_y)
+
+        if tcp_y_norm < 1e-9:
+            self.get_logger().warn(
+                "[6D PICK POSE] object_x and object_z are nearly parallel. "
+                "Use object rotation directly."
+            )
+            R_aligned = R_obj.copy()
+            tcp_z = R_aligned[:, 2]
+        else:
+            tcp_y = tcp_y / tcp_y_norm
+            tcp_x = np.cross(tcp_y, tcp_z)
+            tcp_x = tcp_x / np.linalg.norm(tcp_x)
+
+            R_aligned = np.column_stack((tcp_x, tcp_y, tcp_z))
+
+        R_aligned = self._orthonormalize_R(R_aligned)
+
+        # rbpodo move_l TCP RPY convention 보정
+        # 평평한 top-down 자세가 rx ~= 90deg 계열이므로,
+        # object/grasp frame을 그대로 Euler로 바꾸지 않고 local X축 +90deg 보정.
+        R_tcp = R_aligned @ self._rot_x_deg(90.0)
+        R_tcp = self._orthonormalize_R(R_tcp)
+
+        # object/grasp local +Z 방향으로 offset을 둔다.
+        # offset 160 -> 150으로 이동하면 실제 이동 방향은 local -Z.
+        p_tcp = p_obj + tcp_z * float(offset_mm)
+
+        rpy = self._R_to_euler_zyx_deg(R_tcp)
+
+        raw_yaw = float(rpy[2])
+        rpy[2] = self._correct_pick_yaw_6d(
+            yaw=raw_yaw,
+            object_id=int(object_id),
+        )
+
+        pose6 = np.array(
+            [
+                float(p_tcp[0]),
+                float(p_tcp[1]),
+                float(p_tcp[2]),
+                float(rpy[0]),
+                float(rpy[1]),
+                float(rpy[2]),
+            ],
+            dtype=float,
+        )
+
+        self.get_logger().info(
+            f"[6D PICK POSE] offset={float(offset_mm):.1f}mm, "
+            f"id={int(object_id)}, "
+            f"object_p={np.round(p_obj, 3)}, "
+            f"object_x={np.round(object_x, 4)}, "
+            f"object_z={np.round(object_z, 4)}, "
+            f"raw_yaw={raw_yaw:.3f}, "
+            f"corrected_yaw={rpy[2]:.3f}, "
+            f"tcp_pose={np.round(pose6, 3)}"
+        )
+
+        return pose6
 
     def make_pick_pose(self, offset_mm: float) -> np.ndarray:
         if self.ctx.current_peg_pick_pose is None:
             raise RuntimeError("No selected peg target")
 
         if self.use_6d_peg_interface:
-            return self._pose_with_local_z_offset(
-                self.ctx.current_peg_pick_pose,
-                offset_mm,
+            if self.ctx.current_peg_object_T is not None:
+                if self.ctx.current_target_id is None:
+                    raise RuntimeError("No selected peg object id")
+
+                return self._make_tcp_pick_pose_from_object_T(
+                    self.ctx.current_peg_object_T,
+                    offset_mm,
+                    self.ctx.current_target_id,
+                )
+
+            self.get_logger().warn(
+                "[6D PICK POSE] current_peg_object_T is None. "
+                "Fallback to received pose offset."
             )
+            pose = self.ctx.current_peg_pick_pose.copy()
+            pose[2] = pose[2] + float(offset_mm)
+            return pose
 
         pose = self.ctx.current_peg_pick_pose.copy()
         if offset_mm == self.ctx.pick_approach_above_peg_z_mm:
@@ -695,6 +864,7 @@ class PegInHoleController(Node):
         self.ctx.current_peg_index = -1
         self.ctx.current_hole_index = -1
         self.ctx.current_peg_pick_pose = None
+        self.ctx.current_peg_object_T = None
         self.ctx.current_hole_place_pose = None
         self.ctx.current_target_id = None
 

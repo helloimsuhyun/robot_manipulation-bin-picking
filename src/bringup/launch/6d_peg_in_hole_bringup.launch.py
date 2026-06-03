@@ -1,18 +1,13 @@
 """
 cd ~/course/robot_manipulation-bin-picking
+
 rm -rf build/ install/ log/
+
 colcon build --symlink-install --packages-select sixd_pose_vision calib control bringup
+
 source install/setup.bash
 
 ros2 launch bringup 6d_peg_in_hole_bringup.launch.py
-
-source install/setup.bash
-python3 src/robot_ex_2026/robot_ex_2026/grip_current.py 
-
-
-source install/setup.bash
-ros2 launch bringup new_peg_in_hole_bringup.launch.py
-
 """
 
 from launch import LaunchDescription
@@ -28,17 +23,15 @@ def generate_launch_description():
     # ============================================================
     # 핸드아이 , 물체 파지좌표 , FD pose repo 절대경로 PC 변경시 같이 확인 필요 **************************
     foundationpose_repo_path = (
-        "/home/choisuhyun/course/robot_manipulation-bin-picking/FoundationPose"
+        "/home/chu/FoundationPose"
     )
 
     handeye_result_path = (
-        "/home/choisuhyun/course/robot_manipulation-bin-picking/"
-        "src/calib/config/handeye_capture_rs/handeye_result.json"
+        "/home/chu/robot_manipulation-bin-picking/src/calib/config/handeye_capture_rs/handeye_result.json"
     )
 
     object_grasp_yaml_path = (
-        "/home/choisuhyun/course/robot_manipulation-bin-picking/"
-        "src/sixd_pose_vision/config/object_grasp.yaml"
+        "/home/chu/robot_manipulation-bin-picking/src/calib/config/object_grasp.yaml"
     )
     sixd_pose_share = FindPackageShare("sixd_pose_vision")
 
@@ -57,7 +50,7 @@ def generate_launch_description():
             "enable_visualization": "true",
             "conf_thresh": "0.4",
 
-            "fp_register_iter": "2",
+            "fp_register_iter": "5",
             "fp_track_iter": "2",
             "fp_track_loss_thr": "0.2",
             "fp_debug": "0",
@@ -80,9 +73,11 @@ def generate_launch_description():
             "handeye_result_path": handeye_result_path,
             "object_grasp_yaml_path": object_grasp_yaml_path,
 
+            # 제어부가 base_T_object를 받아서 직접 TCP target frame을 만든다.
+            # 따라서 여기서는 grasp frame이 아니라 object frame을 publish한다.
             "peg_target_pose_mode": "grasp",
 
-            # RAW object -> object_T_grasp -> grasp axis canonicalization -> final grasp
+            # object frame 축을 제어부에서 그대로 사용해야 하므로 자동 z-flip/xy-swap을 끈다.
             "canonicalize_object_axes": False,
             "canonicalize_grasp_axes": True,
             "canonicalize_z_flip_margin": 0.05,
@@ -128,9 +123,9 @@ def generate_launch_description():
             "pick_down_target_z_mm": 69.83,
             "pick_approach_offset_z_mm": 30.0,
             "pick_up_target_z_mm": 110.0,
-            "pick_approach_above_peg_z_mm": 160.0,
-            "pick_grasp_above_peg_z_mm": 150.0,
-            "pick_lift_above_peg_z_mm": 180.0,
+            "pick_approach_above_peg_z_mm": 40.0,
+            "pick_grasp_above_peg_z_mm": 30.0,
+            "pick_lift_above_peg_z_mm": 80.0,
 
             "place_approach_target_z_mm": 108.0,
             "place_down_target_z_mm": 98.0,

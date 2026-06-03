@@ -1,7 +1,7 @@
 import time
 import traceback
 import cv2
-cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+#cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
 import numpy as np
 import rbpodo as rb
 from pathlib import Path

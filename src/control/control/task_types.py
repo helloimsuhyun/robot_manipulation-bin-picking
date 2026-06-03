@@ -45,12 +45,17 @@ class VisionTarget:
 
     pose:
         [x, y, z, rx, ry, rz]
-        x, y는 vision에서 받은 base 좌표계 물체 위치.
-        2D/yaw 방식에서는 z를 이후 상태에서 작업 높이로 덮어쓴다.
-        6D 방식에서는 pose의 위치/자세를 기준으로 local z축 offset을 적용한다.
+        - 2D/yaw 방식: vision 결과를 move_l 형식으로 변환한 pose.
+        - 6D 방식: transform이 없을 때를 위한 fallback pose.
+
+    transform:
+        6D peg 방식에서만 사용한다.
+        비전에서 받은 4x4 행렬이며, 의미는 base_T_object이다.
+        제어부는 이 object frame에서 TCP target frame을 새로 만든다.
     """
     pose: np.ndarray
     object_id: int
+    transform: np.ndarray | None = None
 
 
 @dataclass
@@ -132,6 +137,7 @@ class TaskContext:
     current_hole_index: int = -1
 
     current_peg_pick_pose: np.ndarray | None = None
+    current_peg_object_T: np.ndarray | None = None
     current_hole_place_pose: np.ndarray | None = None
     current_target_id: int | None = None
 
