@@ -80,7 +80,7 @@ class PegInHoleController(Node):
                 ("place_up_target_z_mm", 110.0),
 
                 # place tilt / servo_t sequence
-                ("place_tilt_deg", 20.0),
+                ("place_tilt_deg", 12.0),
                 ("place_lift_current_tcp_z_mm", 30.0),
 
                 ("servo_t_t1_sec", 0.01),
@@ -91,7 +91,7 @@ class PegInHoleController(Node):
                 # 약한 삽입 힘은 현재 joint torque vector로 지정한다.
                 # Cartesian -Z force가 아니라 servo_t 외부 joint torque이므로 반드시 작게 시작한다.
                 ("servo_insert_duration_sec", 2.0),
-                ("servo_insert_down_torque", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                ("servo_insert_down_torque", [0.0, 0.0, 0.5, 0.0, 0.0, 0.0]),
 
                 # 4/5번 조인트 자세 복귀 servo_t
                 ("servo_level_max_duration_sec", 5.0),
@@ -99,12 +99,12 @@ class PegInHoleController(Node):
                 ("servo_level_j4_tol_deg", 1.0),
                 ("servo_level_j5_tol_deg", 1.0),
                 ("servo_level_q5_des_deg", 90.0),
-                ("servo_level_kp_j4", 0.7),
-                ("servo_level_kd_j4", 0.12),
-                ("servo_level_kp_j5", 0.6),
-                ("servo_level_kd_j5", 0.10),
-                ("servo_level_max_j4_torque", 8.0),
-                ("servo_level_max_j5_torque", 8.0),
+                ("servo_level_kp_j4", 1.5),
+                ("servo_level_kd_j4", 0.25),
+                ("servo_level_kp_j5", 1.1),
+                ("servo_level_kd_j5", 0.16),
+                ("servo_level_max_j4_torque", 15.0),
+                ("servo_level_max_j5_torque", 12.0),
                 ("servo_level_j4_sign", 1.0),
                 ("servo_level_j5_sign", 1.0),
                 ("servo_level_j4_deadband_deg", 0.3),
@@ -1080,7 +1080,7 @@ class PegInHoleController(Node):
         base_rx = float(target_pose[3])
         base_ry = float(target_pose[4])
         raw_yaw_deg = float(target_pose[5])
-        tilt_yaw_deg = raw_yaw_deg + 45.0
+        tilt_yaw_deg = raw_yaw_deg
         tilt_yaw_rad = np.deg2rad(tilt_yaw_deg)
         tilt_deg = float(self.ctx.place_tilt_deg)
 
