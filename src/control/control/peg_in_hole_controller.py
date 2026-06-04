@@ -37,8 +37,10 @@ class PegInHoleController(Node):
         id: 0=cylinder, 1=hole, 2=cross
 
     6D peg 결과 토픽 데이터:
-        success: len(data) == 17 -> [4x4 target transform row-major, object_id]
-        failure: len(data) != 17 -> [currently visible object ids]
+        success: len(data) == 6  -> [x, y, z, rx, ry, rz]
+            - 비전 노드에서 이미 move_l용 최종 grasp pose를 계산해서 보낸다.
+        legacy:  len(data) == 17 -> [4x4 target transform row-major, object_id]
+        failure: 그 외 길이 -> [currently visible object ids]
     """
 
     def __init__(self):
@@ -76,6 +78,40 @@ class PegInHoleController(Node):
                 ("place_approach_target_z_mm", 108.0),
                 ("place_down_target_z_mm", 98.0),
                 ("place_up_target_z_mm", 110.0),
+
+                # place tilt / servo_t sequence
+                ("place_tilt_deg", 20.0),
+                ("place_lift_current_tcp_z_mm", 30.0),
+
+                ("servo_t_t1_sec", 0.01),
+                ("servo_t_t2_sec", 0.05),
+                ("servo_t_sleep_sec", 0.01),
+                ("servo_t_compensation", 3),
+
+                # 약한 삽입 힘은 현재 joint torque vector로 지정한다.
+                # Cartesian -Z force가 아니라 servo_t 외부 joint torque이므로 반드시 작게 시작한다.
+                ("servo_insert_duration_sec", 2.0),
+                ("servo_insert_down_torque", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+
+                # 4/5번 조인트 자세 복귀 servo_t
+                ("servo_level_max_duration_sec", 5.0),
+                ("servo_level_target_stable_count", 10),
+                ("servo_level_j4_tol_deg", 1.0),
+                ("servo_level_j5_tol_deg", 1.0),
+                ("servo_level_q5_des_deg", 90.0),
+                ("servo_level_kp_j4", 0.7),
+                ("servo_level_kd_j4", 0.12),
+                ("servo_level_kp_j5", 0.6),
+                ("servo_level_kd_j5", 0.10),
+                ("servo_level_max_j4_torque", 8.0),
+                ("servo_level_max_j5_torque", 8.0),
+                ("servo_level_j4_sign", 1.0),
+                ("servo_level_j5_sign", 1.0),
+                ("servo_level_j4_deadband_deg", 0.3),
+                ("servo_level_j5_deadband_deg", 0.3),
+                ("servo_jvel_lpf_alpha", 0.1),
+                ("servo_torque_rate_limit", 0.08),
+                ("servo_torque_lpf_alpha", 0.20),
 
                 ("move_j_speed", 60.0),
                 ("move_j_acc", 80.0),
@@ -159,6 +195,36 @@ class PegInHoleController(Node):
             place_approach_target_z_mm=self._get_float_param("place_approach_target_z_mm"),
             place_down_target_z_mm=self._get_float_param("place_down_target_z_mm"),
             place_up_target_z_mm=self._get_float_param("place_up_target_z_mm"),
+
+            place_tilt_deg=self._get_float_param("place_tilt_deg"),
+            place_lift_current_tcp_z_mm=self._get_float_param("place_lift_current_tcp_z_mm"),
+
+            servo_t_t1_sec=self._get_float_param("servo_t_t1_sec"),
+            servo_t_t2_sec=self._get_float_param("servo_t_t2_sec"),
+            servo_t_sleep_sec=self._get_float_param("servo_t_sleep_sec"),
+            servo_t_compensation=self._get_int_param("servo_t_compensation"),
+
+            servo_insert_duration_sec=self._get_float_param("servo_insert_duration_sec"),
+            servo_insert_down_torque=self._get_array_param("servo_insert_down_torque", 6),
+
+            servo_level_max_duration_sec=self._get_float_param("servo_level_max_duration_sec"),
+            servo_level_target_stable_count=self._get_int_param("servo_level_target_stable_count"),
+            servo_level_j4_tol_deg=self._get_float_param("servo_level_j4_tol_deg"),
+            servo_level_j5_tol_deg=self._get_float_param("servo_level_j5_tol_deg"),
+            servo_level_q5_des_deg=self._get_float_param("servo_level_q5_des_deg"),
+            servo_level_kp_j4=self._get_float_param("servo_level_kp_j4"),
+            servo_level_kd_j4=self._get_float_param("servo_level_kd_j4"),
+            servo_level_kp_j5=self._get_float_param("servo_level_kp_j5"),
+            servo_level_kd_j5=self._get_float_param("servo_level_kd_j5"),
+            servo_level_max_j4_torque=self._get_float_param("servo_level_max_j4_torque"),
+            servo_level_max_j5_torque=self._get_float_param("servo_level_max_j5_torque"),
+            servo_level_j4_sign=self._get_float_param("servo_level_j4_sign"),
+            servo_level_j5_sign=self._get_float_param("servo_level_j5_sign"),
+            servo_level_j4_deadband_deg=self._get_float_param("servo_level_j4_deadband_deg"),
+            servo_level_j5_deadband_deg=self._get_float_param("servo_level_j5_deadband_deg"),
+            servo_jvel_lpf_alpha=self._get_float_param("servo_jvel_lpf_alpha"),
+            servo_torque_rate_limit=self._get_float_param("servo_torque_rate_limit"),
+            servo_torque_lpf_alpha=self._get_float_param("servo_torque_lpf_alpha"),
 
             move_j_speed=self._get_float_param("move_j_speed"),
             move_j_acc=self._get_float_param("move_j_acc"),
@@ -255,6 +321,12 @@ class PegInHoleController(Node):
             f"Descend MoveL speed/acc: "
             f"{self.ctx.descend_move_l_speed}, "
             f"{self.ctx.descend_move_l_acc}"
+        )
+        self.get_logger().info(
+            f"Place tilt/servo: tilt={self.ctx.place_tilt_deg} deg, "
+            f"insert_duration={self.ctx.servo_insert_duration_sec} sec, "
+            f"insert_torque={np.round(self.ctx.servo_insert_down_torque, 4).tolist()}, "
+            f"level_tol=[{self.ctx.servo_level_j4_tol_deg}, {self.ctx.servo_level_j5_tol_deg}] deg"
         )
 
     # ------------------------------------------------------------------
@@ -793,28 +865,139 @@ class PegInHoleController(Node):
 
         return pose6
 
+
+    def _pose6_to_R_zyx(self, pose6: np.ndarray) -> np.ndarray:
+        """
+        pose6 = [x, y, z, rx, ry, rz]를 회전행렬로 변환한다.
+
+        규칙:
+            R = Rz(rz) @ Ry(ry) @ Rx(rx)
+
+        주의:
+            이 함수는 비전에서 받은 grasp pose의 local Z축을 구하기 위해서만 쓴다.
+            rx, ry, rz 자체는 제어부에서 보정하지 않고 그대로 move_l에 넘긴다.
+        """
+        pose6 = np.asarray(pose6, dtype=float).reshape(6)
+        rx, ry, rz = np.deg2rad(pose6[3:6])
+
+        cx, sx = np.cos(rx), np.sin(rx)
+        cy, sy = np.cos(ry), np.sin(ry)
+        cz, sz = np.cos(rz), np.sin(rz)
+
+        Rx = np.array(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, cx, -sx],
+                [0.0, sx, cx],
+            ],
+            dtype=float,
+        )
+
+        Ry = np.array(
+            [
+                [cy, 0.0, sy],
+                [0.0, 1.0, 0.0],
+                [-sy, 0.0, cy],
+            ],
+            dtype=float,
+        )
+
+        Rz = np.array(
+            [
+                [cz, -sz, 0.0],
+                [sz, cz, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=float,
+        )
+
+        return Rz @ Ry @ Rx
+
+    def _make_pose_offset_along_local_z(
+        self,
+        grasp_pose: np.ndarray,
+        offset_mm: float,
+    ) -> np.ndarray:
+        """
+        비전에서 받은 최종 grasp pose 기준 local +Z 방향으로 offset pose를 만든다.
+
+        grasp_pose:
+            비전이 보낸 move_l용 최종 잡는 pose.
+            [x, y, z, rx, ry, rz]
+
+        offset_mm:
+            grasp pose에서 local +Z 방향으로 떨어질 거리.
+            예: 20.0이면 잡기 전 접근 위치, 50.0이면 잡은 후 상승 위치.
+
+        반환:
+            [x', y', z', rx, ry, rz]
+            자세 rx, ry, rz는 비전값을 그대로 유지한다.
+        """
+        grasp_pose = np.asarray(grasp_pose, dtype=float).reshape(6).copy()
+
+        R = self._pose6_to_R_zyx(grasp_pose)
+        local_z_in_base = R[:, 2]
+
+        target_pose = grasp_pose.copy()
+        target_pose[:3] = grasp_pose[:3] + float(offset_mm) * local_z_in_base
+
+        self.get_logger().info(
+            f"[6D DIRECT PICK POSE] local_z_offset={float(offset_mm):.1f}mm, "
+            f"local_z={np.round(local_z_in_base, 4)}, "
+            f"pose={np.round(target_pose, 3)}"
+        )
+
+        return target_pose
+
     def make_pick_pose(self, offset_mm: float) -> np.ndarray:
         if self.ctx.current_peg_pick_pose is None:
             raise RuntimeError("No selected peg target")
 
         if self.use_6d_peg_interface:
-            if self.ctx.current_peg_object_T is not None:
-                if self.ctx.current_target_id is None:
-                    raise RuntimeError("No selected peg object id")
+            grasp_pose = self.ctx.current_peg_pick_pose.copy()
 
-                return self._make_tcp_pick_pose_from_object_T(
-                    self.ctx.current_peg_object_T,
-                    offset_mm,
-                    self.ctx.current_target_id,
+            # 새 6D 방식:
+            # 비전에서 받은 pose는 이미 move_l에 넣을 최종 grasp pose이다.
+            # 따라서 제어부에서는 yaw 보정, object frame 재구성, TCP 자세 보정을 하지 않는다.
+            if self.ctx.current_peg_object_T is None:
+                if offset_mm == self.ctx.pick_approach_above_peg_z_mm:
+                    # 잡기 전 접근 위치: grasp pose 기준 local +Z 방향 20mm
+                    return self._make_pose_offset_along_local_z(
+                        grasp_pose,
+                        offset_mm=20.0,
+                    )
+
+                if offset_mm == self.ctx.pick_grasp_above_peg_z_mm:
+                    # 실제 잡는 위치: 비전에서 받은 move_l pose 그대로 사용
+                    self.get_logger().info(
+                        f"[6D DIRECT PICK POSE] grasp pose direct = "
+                        f"{np.round(grasp_pose, 3)}"
+                    )
+                    return grasp_pose
+
+                if offset_mm == self.ctx.pick_lift_above_peg_z_mm:
+                    # 잡고 들어올리는 위치: grasp pose 기준 local +Z 방향 50mm
+                    return self._make_pose_offset_along_local_z(
+                        grasp_pose,
+                        offset_mm=50.0,
+                    )
+
+                # 예외적으로 다른 offset이 들어오면 local +Z offset으로 처리한다.
+                return self._make_pose_offset_along_local_z(
+                    grasp_pose,
+                    offset_mm=float(offset_mm),
                 )
 
-            self.get_logger().warn(
-                "[6D PICK POSE] current_peg_object_T is None. "
-                "Fallback to received pose offset."
+            # 이전 4x4 matrix 방식 호환용.
+            # 새 카메라 노드가 [x, y, z, rx, ry, rz]를 보내는 경우에는 이 분기로 들어오지 않는다.
+            if self.ctx.current_target_id is None:
+                raise RuntimeError("No selected peg object id")
+
+            return self._make_tcp_pick_pose_from_object_T(
+                self.ctx.current_peg_object_T,
+                offset_mm,
+                self.ctx.current_target_id,
             )
-            pose = self.ctx.current_peg_pick_pose.copy()
-            pose[2] = pose[2] + float(offset_mm)
-            return pose
 
         pose = self.ctx.current_peg_pick_pose.copy()
         if offset_mm == self.ctx.pick_approach_above_peg_z_mm:
@@ -826,6 +1009,70 @@ class PegInHoleController(Node):
         else:
             pose[2] = self.ctx.pick_down_target_z_mm + float(offset_mm)
         return pose
+
+
+    def make_tilted_place_pose(self) -> np.ndarray:
+        """
+        hole place pose를 기준으로 삽입 직전 tilt pose를 만든다.
+
+        - 접근 MOVE_L은 기존처럼 tilt 없이 수행한다.
+        - 이 함수는 place_down_target_z_mm까지 내려갈 때만 사용한다.
+        - yaw 방향으로 place_tilt_deg만큼 tilt를 주기 위해 rx/ry에 분배한다.
+
+        식:
+            rx = base_rx - tilt * sin(yaw)
+            ry = base_ry + tilt * cos(yaw)
+
+        yaw는 target_pose[5] = rz 기준이다.
+        """
+        if self.ctx.current_hole_place_pose is None:
+            raise RuntimeError("No selected hole target")
+
+        target_pose = self.ctx.current_hole_place_pose.copy()
+
+        # 네모 peg/object_id=1 삽입 시 x 방향으로 +2 mm 보정
+        if self.ctx.current_target_id == 1:
+            target_pose[0] += 2.0
+            self.get_logger().info(
+                f"[PLACE OFFSET] square tilted. apply x offset +2.0 mm, "
+                f"target x = {target_pose[0]:.2f}"
+            )
+
+        target_pose[2] = self.ctx.place_down_target_z_mm
+
+        base_rx = float(target_pose[3])
+        base_ry = float(target_pose[4])
+        yaw_deg = float(target_pose[5])
+        yaw_rad = np.deg2rad(yaw_deg)
+        tilt_deg = float(self.ctx.place_tilt_deg)
+
+        target_pose[3] = base_rx - tilt_deg * np.sin(yaw_rad)
+        target_pose[4] = base_ry + tilt_deg * np.cos(yaw_rad)
+
+        self.get_logger().info(
+            f"[PLACE TILT] tilt={tilt_deg:.2f}deg, yaw={yaw_deg:.2f}deg, "
+            f"base_rpy=[{base_rx:.2f}, {base_ry:.2f}, {yaw_deg:.2f}], "
+            f"tilted_pose={np.round(target_pose, 3)}"
+        )
+
+        return target_pose
+
+    def make_lift_pose_from_current_tcp(self) -> np.ndarray:
+        """
+        servo_t와 release 이후 실제 TCP pose를 읽고,
+        현재 TCP의 world z만 place_lift_current_tcp_z_mm만큼 올린다.
+        """
+        current_tcp = self.motion.get_current_tcp_pose()
+        target_pose = current_tcp.copy()
+        target_pose[2] += float(self.ctx.place_lift_current_tcp_z_mm)
+
+        self.get_logger().info(
+            f"[PLACE LIFT CURRENT TCP] current_tcp={np.round(current_tcp, 3)}, "
+            f"lift_z={self.ctx.place_lift_current_tcp_z_mm:.1f}mm, "
+            f"target_pose={np.round(target_pose, 3)}"
+        )
+
+        return target_pose
 
     def save_last_pick_pose(self):
         if self.ctx.current_peg_pick_pose is None:
@@ -1048,21 +1295,58 @@ class PegInHoleController(Node):
 
             target_pose[2] = self.ctx.place_approach_target_z_mm
 
-            # hole 위 접근 위치로 이동
+            # hole 위 접근 위치로 이동: 기존 방식 유지, tilt 없음
             self.motion.move_l_and_wait(
                 target_pose,
                 speed=self.ctx.approach_move_l_speed,
                 acc=self.ctx.approach_move_l_acc,
             )
-            self.state = TaskState.DESCEND_TO_HOLE
+            self.state = TaskState.MOVE_TO_TILTED_HOLE
+
+        elif self.state == TaskState.MOVE_TO_TILTED_HOLE:
+            # 삽입 직전 위치로 이동하되, yaw 방향으로 place_tilt_deg만큼 tilt 적용
+            target_pose = self.make_tilted_place_pose()
+
+            self.motion.move_l_and_wait(
+                target_pose,
+                speed=self.ctx.descend_move_l_speed,
+                acc=self.ctx.descend_move_l_acc,
+                preserve_orientation=True,
+            )
+            self.state = TaskState.SERVO_INSERT_DOWN
+
+        elif self.state == TaskState.SERVO_INSERT_DOWN:
+            # 약 2초간 servo_t로 아주 약한 하방 삽입 토크를 적용한다.
+            # 실제 토크 방향/크기는 런치 파라미터 servo_insert_down_torque에서 조정한다.
+            self.motion.run_servo_t_constant_torque(
+                torque=self.ctx.servo_insert_down_torque,
+                duration_sec=self.ctx.servo_insert_duration_sec,
+                log_name="SERVO_INSERT_DOWN",
+            )
+            self.state = TaskState.SERVO_LEVEL_J4_J5
+
+        elif self.state == TaskState.SERVO_LEVEL_J4_J5:
+            # 업로드 코드 기반: q4_des = 90 - q2 - q3, q5_des = 90
+            # 종료 조건: q4/q5 오차가 허용 오차 이하로 연속 유지되면 다음 상태로 진행
+            reached = self.motion.run_servo_t_level_j4_j5_until_reached()
+
+            if reached:
+                self.get_logger().info("[SERVO_LEVEL_J4_J5] finished by target tolerance")
+            else:
+                self.get_logger().warn(
+                    "[SERVO_LEVEL_J4_J5] finished by timeout. Continue to release."
+                )
+
+            self.state = TaskState.RELEASE_PEG
 
         elif self.state == TaskState.DESCEND_TO_HOLE:
+            # 기존 place 방식 호환용 상태.
+            # 새 place sequence에서는 MOVE_TO_TILTED_HOLE/SERVO_* 상태를 사용한다.
             if self.ctx.current_hole_place_pose is None:
                 raise RuntimeError("No selected hole target")
 
             target_pose = self.ctx.current_hole_place_pose.copy()
 
-            # 네모 peg/object_id=1 삽입 시 x 방향으로 +2 mm 보정
             if self.ctx.current_target_id == 1:
                 target_pose[0] += 2.0
                 self.get_logger().info(
@@ -1072,7 +1356,6 @@ class PegInHoleController(Node):
 
             target_pose[2] = self.ctx.place_down_target_z_mm
 
-            # peg를 hole에 넣기 직전, 삽입 높이로 하강
             self.motion.move_l_and_wait(
                 target_pose,
                 speed=self.ctx.descend_move_l_speed,
@@ -1090,13 +1373,14 @@ class PegInHoleController(Node):
             self.state = TaskState.LIFT_FROM_HOLE
 
         elif self.state == TaskState.LIFT_FROM_HOLE:
-            if self.ctx.current_hole_place_pose is None:
-                raise RuntimeError("No selected hole target")
+            # servo_t 이후 실제 TCP 위치가 계획 pose와 달라질 수 있으므로
+            # 현재 TCP를 읽은 뒤 world z만 조금 올린다.
+            target_pose = self.make_lift_pose_from_current_tcp()
 
-            target_pose = self.ctx.current_hole_place_pose.copy()
-            target_pose[2] = self.ctx.place_up_target_z_mm
-
-            self.motion.move_l_and_wait(target_pose)
+            self.motion.move_l_and_wait(
+                target_pose,
+                preserve_orientation=True,
+            )
             self.state = TaskState.CHECK_REMAINING_TASK
 
         elif self.state == TaskState.CHECK_REMAINING_TASK:

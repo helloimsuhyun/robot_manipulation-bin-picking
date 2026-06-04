@@ -17,7 +17,10 @@ class TaskState(Enum):
     MOVE_TO_HOLE_CAMERA_POSE = auto()         # hole 보기 위한 자세로 이동
     INSPECT_HOLES = auto()                    # hole 인식
     MOVE_TO_TARGET_HOLE = auto()              # 목표 hole 위로 이동
-    DESCEND_TO_HOLE = auto()                  # hole 삽입 높이로 내려감
+    MOVE_TO_TILTED_HOLE = auto()              # tilt 자세로 hole 삽입 위치까지 이동
+    SERVO_INSERT_DOWN = auto()                # servo_t로 약한 하방 삽입 힘 적용
+    SERVO_LEVEL_J4_J5 = auto()                # servo_t로 4/5번 조인트 자세 복귀
+    DESCEND_TO_HOLE = auto()                  # hole 삽입 높이로 내려감(기존 방식 호환용)
     RELEASE_PEG = auto()                      # peg 놓기
     LIFT_FROM_HOLE = auto()                   # 놓고 상승
     CHECK_REMAINING_TASK = auto()             # 남은 작업 확인
@@ -86,6 +89,37 @@ class TaskContext:
     place_approach_target_z_mm: float = 108.0
     place_down_target_z_mm: float = 98.0
     place_up_target_z_mm: float = 110.0
+
+    # ===== place tilt / servo_t 파라미터 =====
+    place_tilt_deg: float = 20.0
+    place_lift_current_tcp_z_mm: float = 30.0
+
+    servo_t_t1_sec: float = 0.01
+    servo_t_t2_sec: float = 0.05
+    servo_t_sleep_sec: float = 0.01
+    servo_t_compensation: int = 3
+
+    servo_insert_duration_sec: float = 2.0
+    servo_insert_down_torque: np.ndarray = field(default_factory=lambda: np.zeros(6, dtype=float))
+
+    servo_level_max_duration_sec: float = 5.0
+    servo_level_target_stable_count: int = 10
+    servo_level_j4_tol_deg: float = 1.0
+    servo_level_j5_tol_deg: float = 1.0
+    servo_level_q5_des_deg: float = 90.0
+    servo_level_kp_j4: float = 0.7
+    servo_level_kd_j4: float = 0.12
+    servo_level_kp_j5: float = 0.6
+    servo_level_kd_j5: float = 0.10
+    servo_level_max_j4_torque: float = 8.0
+    servo_level_max_j5_torque: float = 8.0
+    servo_level_j4_sign: float = 1.0
+    servo_level_j5_sign: float = 1.0
+    servo_level_j4_deadband_deg: float = 0.3
+    servo_level_j5_deadband_deg: float = 0.3
+    servo_jvel_lpf_alpha: float = 0.1
+    servo_torque_rate_limit: float = 0.08
+    servo_torque_lpf_alpha: float = 0.20
 
     # ===== motion 파라미터 =====
     move_j_speed: float = 60.0

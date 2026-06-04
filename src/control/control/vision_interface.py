@@ -20,8 +20,11 @@ class VisionInterface:
 
     6D peg 방식(use_6d_peg_interface=True):
         trigger_peg = [object_id, x, y, z, rx, ry, rz]
-        peg_targets success = [T00, T01, ... T33, object_id]  # len(data)==17
-        peg_targets failure = [visible_id0, visible_id1, ...] # len(data)!=17
+        peg_targets success = [x, y, z, rx, ry, rz]            # len(data)==6
+            - 비전 노드에서 이미 move_l용 최종 grasp pose를 계산해서 보낸다.
+        peg_targets legacy = [T00, T01, ... T33, object_id]   # len(data)==17
+            - 이전 4x4 matrix 방식 호환용이다.
+        peg_targets failure = [visible_id0, visible_id1, ...] # 그 외 길이
 
     hole은 기존 2D/yaw 방식 그대로 사용한다.
     """
@@ -55,6 +58,11 @@ class VisionInterface:
         self.trigger_hole_topic = trigger_hole_topic
         self.camera_settle_sec = float(camera_settle_sec)
         self.use_6d_peg_interface = bool(use_6d_peg_interface)
+
+        # 6D peg 방식에서는 trigger에는 object_id가 포함되지만,
+        # 새 peg_targets 성공 메시지는 [x, y, z, rx, ry, rz]만 온다.
+        # 따라서 현재 어떤 object_id를 요청했는지 기억해야 한다.
+        self.pending_peg_request_id: int | None = None
 
         self.latest_peg_xyyawid: list[tuple[float, float, float, int]] = []
         self.latest_hole_xyyawid: list[tuple[float, float, float, int]] = []
@@ -176,6 +184,8 @@ class VisionInterface:
             [object_id, x, y, z, rx, ry, rz]
         """
         object_id = int(object_id)
+        self.pending_peg_request_id = object_id
+
         ee_pose = self._get_ee_pose_after_settle()
 
         msg = Float64MultiArray()
@@ -236,6 +246,43 @@ class VisionInterface:
     def _parse_peg_6d_msg(self, msg: Float64MultiArray) -> tuple[list[VisionTarget], list[int]]:
         data = list(msg.data)
 
+        # 새 방식:
+        # 비전 노드가 이미 move_l에 넣을 최종 grasp pose를 계산해서 보낸다.
+        # data = [x, y, z, rx, ry, rz]
+        if len(data) == 6:
+            if self.pending_peg_request_id is None:
+                self.node.get_logger().warn(
+                    "[VISION SUB] 6D peg grasp pose received, "
+                    "but pending request id is None. Ignore this message."
+                )
+                return [], []
+
+            object_id = int(self.pending_peg_request_id)
+
+            if object_id not in self.VALID_OBJECT_IDS:
+                self.node.get_logger().warn(
+                    f"[VISION SUB] Unknown pending 6D peg id: {object_id}. "
+                    f"Expected 0=cylinder, 1=hole, 2=cross."
+                )
+                return [], []
+
+            pose6 = np.asarray(data[:6], dtype=np.float64)
+
+            target = VisionTarget(
+                pose=pose6.copy(),
+                object_id=object_id,
+                transform=None,
+            )
+
+            self.node.get_logger().info(
+                f"[VISION SUB] 6D peg grasp pose received directly: "
+                f"id={object_id} ({self.shape_name(object_id)}), "
+                f"pose6={np.round(pose6, 3).tolist()}"
+            )
+            return [target], []
+
+        # 이전 방식 호환:
+        # data = [T00, T01, ... T33, object_id]
         if len(data) == 17:
             T = np.asarray(data[:16], dtype=np.float64).reshape(4, 4)
             object_id = int(round(float(data[16])))
@@ -247,9 +294,6 @@ class VisionInterface:
                 )
                 return [], []
 
-            # pose6는 디버그/fallback 용도다.
-            # 실제 6D pick pose는 controller에서 base_T_object로부터
-            # TCP frame을 새로 구성해서 만든다.
             pose6 = self._T_mm_to_pose6_mm_deg(T)
             target = VisionTarget(
                 pose=pose6,
@@ -258,13 +302,15 @@ class VisionInterface:
             )
 
             self.node.get_logger().info(
-                f"[VISION SUB] 6D peg object frame received: "
+                f"[VISION SUB] Legacy 6D peg object frame received: "
                 f"id={object_id} ({self.shape_name(object_id)}), "
                 f"object_pose6_debug={pose6}, "
                 f"base_T_object={np.round(T, 3).tolist()}"
             )
             return [target], []
 
+        # 실패 또는 fallback:
+        # 현재 보이는 object id 목록으로 해석한다.
         visible_ids: list[int] = []
         for value in data:
             object_id = int(round(float(value)))

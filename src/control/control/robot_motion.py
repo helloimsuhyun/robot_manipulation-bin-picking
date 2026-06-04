@@ -363,6 +363,317 @@ class RobotMotion:
 
         self.node.get_logger().info("[MOVE_L] finished by TCP polling")
 
+
+    @staticmethod
+    def wrap_deg_180(angle_deg: float) -> float:
+        return (float(angle_deg) + 180.0) % 360.0 - 180.0
+
+    @staticmethod
+    def soft_deadband(err: float, deadband: float) -> float:
+        err = float(err)
+        deadband = float(deadband)
+        if abs(err) <= deadband:
+            return 0.0
+        return float(np.sign(err) * (abs(err) - deadband))
+
+    def _send_servo_t(self, torque: np.ndarray):
+        torque = np.asarray(torque, dtype=float).reshape(6)
+
+        if self.use_simulation_mode:
+            self.node.get_logger().info(
+                f"[SERVO_T SIM] torque = {np.round(torque, 4).tolist()}"
+            )
+            return
+
+        rc = rb.ResponseCollector()
+        ret = self.robot.move_servo_t(
+            rc,
+            [float(v) for v in torque],
+            float(self.ctx.servo_t_t1_sec),
+            float(self.ctx.servo_t_t2_sec),
+            compensation=int(self.ctx.servo_t_compensation),
+        )
+
+        try:
+            rc.error().throw_if_not_empty()
+        except Exception as e:
+            self.node.get_logger().warn(f"[SERVO_T] response error: {e}")
+
+        if ret is not None and hasattr(ret, "is_success") and not ret.is_success():
+            self.node.get_logger().warn(f"[SERVO_T] move_servo_t failed: {ret}")
+
+    def send_servo_t_zero(self):
+        self._send_servo_t(np.zeros(6, dtype=float))
+
+    def run_servo_t_constant_torque(
+        self,
+        torque: np.ndarray,
+        duration_sec: float,
+        log_name: str = "SERVO_T_CONST",
+    ):
+        """
+        duration_sec 동안 지정한 외부 토크를 servo_t로 송신한다.
+
+        주의:
+            이 함수는 joint torque를 직접 넣는다.
+            Cartesian -Z force를 정확히 만들려면 Jacobian 기반 tau = J^T F가 필요하다.
+            현재는 사용자가 지정한 torque vector를 매우 작게 넣는 안전한 통합 형태다.
+        """
+        torque = np.asarray(torque, dtype=float).reshape(6)
+        duration_sec = float(duration_sec)
+
+        self.node.get_logger().info(
+            f"[{log_name}] start duration={duration_sec:.2f}s, "
+            f"torque={np.round(torque, 4).tolist()}, "
+            f"compensation={int(self.ctx.servo_t_compensation)}"
+        )
+
+        start_time = time.monotonic()
+        last_log_time = 0.0
+
+        try:
+            while rclpy.ok():
+                now = time.monotonic()
+                elapsed = now - start_time
+
+                if elapsed >= duration_sec:
+                    break
+
+                state = self.request_valid_state(retry=3, wait_sec=0.0)
+                sdata = state.sdata
+
+                if getattr(sdata, "op_stat_collision_occur", False):
+                    raise RuntimeError(f"[{log_name}] Robot collision detected")
+
+                if getattr(sdata, "op_stat_sos_flag", 0) == 4:
+                    raise RuntimeError(f"[{log_name}] Command input error")
+
+                self._send_servo_t(torque)
+
+                if now - last_log_time > 0.2:
+                    last_log_time = now
+                    self.node.get_logger().info(
+                        f"[{log_name}] remain={duration_sec - elapsed:.2f}s, "
+                        f"torque={np.round(torque, 4).tolist()}"
+                    )
+
+                rclpy.spin_once(self.node, timeout_sec=0.0)
+                time.sleep(float(self.ctx.servo_t_sleep_sec))
+
+        finally:
+            self.node.get_logger().info(f"[{log_name}] send zero external torque")
+            self.send_servo_t_zero()
+
+    def _smooth_servo_torque(
+        self,
+        raw_torque: np.ndarray,
+        prev_torque: np.ndarray,
+    ) -> np.ndarray:
+        raw_torque = np.asarray(raw_torque, dtype=float).reshape(6)
+        prev_torque = np.asarray(prev_torque, dtype=float).reshape(6)
+
+        delta = raw_torque - prev_torque
+        delta = np.clip(
+            delta,
+            -float(self.ctx.servo_torque_rate_limit),
+            float(self.ctx.servo_torque_rate_limit),
+        )
+
+        rate_limited = prev_torque + delta
+
+        alpha = float(self.ctx.servo_torque_lpf_alpha)
+        filtered = alpha * rate_limited + (1.0 - alpha) * prev_torque
+
+        return np.nan_to_num(filtered, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _make_level_j4_j5_torque(
+        self,
+        jpos: np.ndarray,
+        jvel: np.ndarray,
+    ):
+        """
+        업로드한 테스트 코드의 4/5번 조인트 자세복귀 토크를 상태머신용으로 이식.
+
+        목표:
+            q4_des = 90 - q2 - q3
+            q5_des = servo_level_q5_des_deg
+        """
+        jpos = np.asarray(jpos, dtype=float).reshape(6)
+        jvel = np.asarray(jvel, dtype=float).reshape(6)
+
+        q2 = float(jpos[1])
+        q3 = float(jpos[2])
+        q4 = float(jpos[3])
+        q5 = float(jpos[4])
+
+        qvel4 = float(jvel[3])
+        qvel5 = float(jvel[4])
+
+        q4_des = 90.0 - q2 - q3
+        q5_des = float(self.ctx.servo_level_q5_des_deg)
+
+        q4_err = self.wrap_deg_180(q4_des - q4)
+        q5_err = self.wrap_deg_180(q5_des - q5)
+
+        q4_err_cmd = self.soft_deadband(q4_err, self.ctx.servo_level_j4_deadband_deg)
+        q5_err_cmd = self.soft_deadband(q5_err, self.ctx.servo_level_j5_deadband_deg)
+
+        tau4_raw = (
+            float(self.ctx.servo_level_kp_j4) * q4_err_cmd
+            - float(self.ctx.servo_level_kd_j4) * qvel4
+        )
+        tau5_raw = (
+            float(self.ctx.servo_level_kp_j5) * q5_err_cmd
+            - float(self.ctx.servo_level_kd_j5) * qvel5
+        )
+
+        tau4 = float(self.ctx.servo_level_j4_sign) * tau4_raw
+        tau5 = float(self.ctx.servo_level_j5_sign) * tau5_raw
+
+        tau4 = np.clip(
+            tau4,
+            -float(self.ctx.servo_level_max_j4_torque),
+            float(self.ctx.servo_level_max_j4_torque),
+        )
+        tau5 = np.clip(
+            tau5,
+            -float(self.ctx.servo_level_max_j5_torque),
+            float(self.ctx.servo_level_max_j5_torque),
+        )
+
+        target_torque = np.zeros(6, dtype=float)
+        target_torque[3] = tau4
+        target_torque[4] = tau5
+
+        return target_torque, q4_des, q5_des, q4_err, q5_err, q4_err_cmd, q5_err_cmd
+
+    def run_servo_t_level_j4_j5_until_reached(self) -> bool:
+        """
+        4번/5번 조인트만 외부 토크로 자세 복귀한다.
+
+        종료 조건:
+            abs(q4_err) <= servo_level_j4_tol_deg
+            abs(q5_err) <= servo_level_j5_tol_deg
+            위 조건이 servo_level_target_stable_count번 연속 유지되면 성공 종료.
+
+        안전 조건:
+            servo_level_max_duration_sec를 넘으면 timeout 종료 후 다음 상태로 넘어갈 수 있도록 False 반환.
+        """
+        max_duration = float(self.ctx.servo_level_max_duration_sec)
+        stable_required = int(self.ctx.servo_level_target_stable_count)
+
+        self.node.get_logger().info(
+            f"[SERVO_LEVEL_J4_J5] start. "
+            f"tol_j4={self.ctx.servo_level_j4_tol_deg:.3f}deg, "
+            f"tol_j5={self.ctx.servo_level_j5_tol_deg:.3f}deg, "
+            f"stable_required={stable_required}, "
+            f"max_duration={max_duration:.2f}s"
+        )
+
+        state = self.request_valid_state()
+        prev_jpos = self.get_current_joint()
+        prev_time = time.monotonic()
+
+        filtered_jvel = np.zeros(6, dtype=float)
+        prev_target_torque = np.zeros(6, dtype=float)
+
+        start_time = time.monotonic()
+        last_log_time = 0.0
+        stable_count = 0
+        reached = False
+
+        try:
+            while rclpy.ok():
+                now = time.monotonic()
+                elapsed = now - start_time
+                loop_dt = now - prev_time
+                prev_time = now
+
+                if elapsed >= max_duration:
+                    self.node.get_logger().warn(
+                        f"[SERVO_LEVEL_J4_J5] timeout after {elapsed:.2f}s"
+                    )
+                    break
+
+                if loop_dt <= 1e-9:
+                    time.sleep(float(self.ctx.servo_t_sleep_sec))
+                    continue
+
+                state = self.request_valid_state(retry=3, wait_sec=0.0)
+                sdata = state.sdata
+
+                if getattr(sdata, "op_stat_collision_occur", False):
+                    raise RuntimeError("[SERVO_LEVEL_J4_J5] Robot collision detected")
+
+                if getattr(sdata, "op_stat_sos_flag", 0) == 4:
+                    raise RuntimeError("[SERVO_LEVEL_J4_J5] Command input error")
+
+                jpos = self.get_current_joint()
+
+                jvel_raw = np.array(
+                    [self.wrap_deg_180(jpos[i] - prev_jpos[i]) for i in range(6)],
+                    dtype=float,
+                ) / loop_dt
+                prev_jpos = jpos.copy()
+
+                alpha_v = float(self.ctx.servo_jvel_lpf_alpha)
+                filtered_jvel = alpha_v * jvel_raw + (1.0 - alpha_v) * filtered_jvel
+                jvel = filtered_jvel.copy()
+
+                (
+                    raw_torque,
+                    q4_des,
+                    q5_des,
+                    q4_err,
+                    q5_err,
+                    q4_err_cmd,
+                    q5_err_cmd,
+                ) = self._make_level_j4_j5_torque(jpos, jvel)
+
+                target_torque = self._smooth_servo_torque(raw_torque, prev_target_torque)
+                prev_target_torque = target_torque.copy()
+
+                q4_ok = abs(q4_err) <= float(self.ctx.servo_level_j4_tol_deg)
+                q5_ok = abs(q5_err) <= float(self.ctx.servo_level_j5_tol_deg)
+
+                if q4_ok and q5_ok:
+                    stable_count += 1
+                    if stable_count >= stable_required:
+                        reached = True
+                        self.node.get_logger().info(
+                            f"[SERVO_LEVEL_J4_J5] target reached. "
+                            f"q4_err={q4_err:.3f}, q5_err={q5_err:.3f}, "
+                            f"stable={stable_count}/{stable_required}"
+                        )
+                        break
+                else:
+                    stable_count = 0
+
+                self._send_servo_t(target_torque)
+
+                if now - last_log_time > 0.2:
+                    last_log_time = now
+                    self.node.get_logger().info(
+                        "[SERVO_LEVEL_J4_J5] "
+                        f"remain={max_duration - elapsed:.2f}s, "
+                        f"q2={jpos[1]:.2f}, q3={jpos[2]:.2f}, "
+                        f"q4={jpos[3]:.2f}, q5={jpos[4]:.2f}, "
+                        f"q4_des={q4_des:.2f}, q5_des={q5_des:.2f}, "
+                        f"q4_err={q4_err:.2f}, q5_err={q5_err:.2f}, "
+                        f"q4_err_cmd={q4_err_cmd:.2f}, q5_err_cmd={q5_err_cmd:.2f}, "
+                        f"tau4={target_torque[3]:.3f}, tau5={target_torque[4]:.3f}, "
+                        f"stable={stable_count}/{stable_required}"
+                    )
+
+                rclpy.spin_once(self.node, timeout_sec=0.0)
+                time.sleep(float(self.ctx.servo_t_sleep_sec))
+
+        finally:
+            self.node.get_logger().info("[SERVO_LEVEL_J4_J5] send zero external torque")
+            self.send_servo_t_zero()
+
+        return reached
+
     def move_j1_only_and_wait(
         self,
         target_j1_deg: float,
