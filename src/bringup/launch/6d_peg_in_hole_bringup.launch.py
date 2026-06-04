@@ -21,14 +21,14 @@ def generate_launch_description():
     # ============================================================
     # PC 변경 시 여기 3개 경로만 먼저 확인 **********************************************************
 
-    foundationpose_repo_path = "/home/chu/FoundationPose"
+    foundationpose_repo_path = "/home/chan/FoundationPose"
 
     handeye_result_path = (
-        "/home/chu/robot_manipulation-bin-picking/src/calib/config/handeye_capture_rs/handeye_result.json"
+        "/home/chan/robot_manipulation-bin-picking/src/calib/config/handeye_capture_rs/handeye_result.json"
     )
 
     object_grasp_yaml_path = (
-        "/home/chu/robot_manipulation-bin-picking/src/calib/config/object_grasp.yaml"
+        "/home/chan/robot_manipulation-bin-picking/src/calib/config/object_grasp.yaml"
     )
 
     # ============================================================

@@ -29,7 +29,7 @@ def generate_launch_description():
 
     # 하위 launch 단독 실행 시 사용할 기본값
     default_foundationpose_repo_path = (
-        "/home/choisuhyun/course/robot_manipulation-bin-picking/FoundationPose"
+        "/home/chan/FoundationPose"
     )
 
     return LaunchDescription([
