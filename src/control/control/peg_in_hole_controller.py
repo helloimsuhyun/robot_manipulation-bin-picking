@@ -913,6 +913,42 @@ class PegInHoleController(Node):
 
         return Rz @ Ry @ Rx
 
+    def _make_pose_offset_along_local_y(
+        self,
+        grasp_pose: np.ndarray,
+        offset_mm: float,
+    ) -> np.ndarray:
+        """
+        비전에서 받은 최종 grasp pose 기준 local +Y 방향으로 offset pose를 만든다.
+
+        grasp_pose:
+            비전이 보낸 move_l용 최종 잡는 pose.
+            [x, y, z, rx, ry, rz]
+
+        offset_mm:
+            grasp pose에서 local +Y 방향으로 떨어질 거리.
+            예: 20.0이면 잡기 전 pregrasp 위치.
+
+        반환:
+            [x', y', z', rx, ry, rz]
+            자세 rx, ry, rz는 비전값을 그대로 유지한다.
+        """
+        grasp_pose = np.asarray(grasp_pose, dtype=float).reshape(6).copy()
+
+        R = self._pose6_to_R_zyx(grasp_pose)
+        local_y_in_base = R[:, 1]
+
+        target_pose = grasp_pose.copy()
+        target_pose[:3] = grasp_pose[:3] + float(offset_mm) * local_y_in_base
+
+        self.get_logger().info(
+            f"[6D DIRECT PICK POSE] local_y_offset={float(offset_mm):.1f}mm, "
+            f"local_y={np.round(local_y_in_base, 4)}, "
+            f"pose={np.round(target_pose, 3)}"
+        )
+
+        return target_pose
+
     def _make_pose_offset_along_local_z(
         self,
         grasp_pose: np.ndarray,
@@ -927,7 +963,7 @@ class PegInHoleController(Node):
 
         offset_mm:
             grasp pose에서 local +Z 방향으로 떨어질 거리.
-            예: 20.0이면 잡기 전 접근 위치, 50.0이면 잡은 후 상승 위치.
+            예: 50.0이면 잡은 후 상승 위치.
 
         반환:
             [x', y', z', rx, ry, rz]
@@ -961,8 +997,8 @@ class PegInHoleController(Node):
             # 따라서 제어부에서는 yaw 보정, object frame 재구성, TCP 자세 보정을 하지 않는다.
             if self.ctx.current_peg_object_T is None:
                 if offset_mm == self.ctx.pick_approach_above_peg_z_mm:
-                    # 잡기 전 접근 위치: grasp pose 기준 local +Z 방향 20mm
-                    return self._make_pose_offset_along_local_z(
+                    # 잡기 전 pregrasp 위치: grasp pose 기준 local +Y 방향 20mm
+                    return self._make_pose_offset_along_local_y(
                         grasp_pose,
                         offset_mm=20.0,
                     )
@@ -976,14 +1012,15 @@ class PegInHoleController(Node):
                     return grasp_pose
 
                 if offset_mm == self.ctx.pick_lift_above_peg_z_mm:
-                    # 잡고 들어올리는 위치: grasp pose 기준 local +Z 방향 50mm
-                    return self._make_pose_offset_along_local_z(
+                    # 잡고 빠져나오는 위치: grasp pose 기준 local +Y 방향 50mm
+                    # pregrasp와 같은 축을 사용한다.
+                    return self._make_pose_offset_along_local_y(
                         grasp_pose,
                         offset_mm=50.0,
                     )
 
-                # 예외적으로 다른 offset이 들어오면 local +Z offset으로 처리한다.
-                return self._make_pose_offset_along_local_z(
+                # 예외적으로 다른 offset이 들어오면 pregrasp/lift와 같은 local +Y offset으로 처리한다.
+                return self._make_pose_offset_along_local_y(
                     grasp_pose,
                     offset_mm=float(offset_mm),
                 )
@@ -1042,18 +1079,19 @@ class PegInHoleController(Node):
 
         base_rx = float(target_pose[3])
         base_ry = float(target_pose[4])
-        yaw_deg = float(target_pose[5])
-        yaw_rad = np.deg2rad(yaw_deg)
+        raw_yaw_deg = float(target_pose[5])
+        tilt_yaw_deg = raw_yaw_deg + 45.0
+        tilt_yaw_rad = np.deg2rad(tilt_yaw_deg)
         tilt_deg = float(self.ctx.place_tilt_deg)
 
-        target_pose[3] = base_rx - tilt_deg * np.sin(yaw_rad)
-        target_pose[4] = base_ry + tilt_deg * np.cos(yaw_rad)
-
+        target_pose[3] = base_rx - tilt_deg * np.sin(tilt_yaw_rad)
+        target_pose[4] = base_ry + tilt_deg * np.cos(tilt_yaw_rad)
+        """
         self.get_logger().info(
             f"[PLACE TILT] tilt={tilt_deg:.2f}deg, yaw={yaw_deg:.2f}deg, "
             f"base_rpy=[{base_rx:.2f}, {base_ry:.2f}, {yaw_deg:.2f}], "
             f"tilted_pose={np.round(target_pose, 3)}"
-        )
+        )"""
 
         return target_pose
 

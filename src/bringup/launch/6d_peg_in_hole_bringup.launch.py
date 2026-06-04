@@ -7,6 +7,12 @@ colcon build --symlink-install --packages-select sixd_pose_vision calib control 
 source install/setup.bash
 
 ros2 launch bringup 6d_peg_in_hole_bringup.launch.py
+
+
+
+source /opt/ros/humble/setup.bash
+python3 src/robot_ex_2026/robot_ex_2026/grip_current.py
+
 """
 
 from launch import LaunchDescription
@@ -21,14 +27,14 @@ def generate_launch_description():
     # ============================================================
     # PC 변경 시 여기 3개 경로만 먼저 확인 **********************************************************
 
-    foundationpose_repo_path = "/home/chan/FoundationPose"
+    foundationpose_repo_path = "/home/chu/FoundationPose"
 
     handeye_result_path = (
-        "/home/chan/robot_manipulation-bin-picking/src/calib/config/handeye_capture_rs/handeye_result.json"
+        "/home/chu/robot_manipulation-bin-picking/src/calib/config/handeye_capture_rs/handeye_result.json"
     )
 
     object_grasp_yaml_path = (
-        "/home/chan/robot_manipulation-bin-picking/src/calib/config/object_grasp.yaml"
+        "/home/chu/robot_manipulation-bin-picking/src/calib/config/object_grasp.yaml"
     )
 
     # ============================================================
