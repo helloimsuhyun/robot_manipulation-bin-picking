@@ -2,7 +2,7 @@
 """
 Mixed 6D pose vision node.
 
-object mode: RealSense RGB-D -> YOLO-seg preview -> trigger topic -> nearest object -> FoundationPose register-only 6D pose
+object mode: RealSense RGB-D -> YOLO-seg preview -> trigger topic -> nearest object -> FoundationPose register + short tracking refinement 6D pose
 insert mode: RealSense RGB-D -> YOLO-seg -> existing depth PCA + template yaw
 
 Important paths are ROS parameters:
@@ -395,15 +395,18 @@ class MixedPoseVisionNode(Node):
         self.declare_parameter("object_pose_topic", "/object_pose_stamped")
         self.declare_parameter("insert_pose_topic", "/insert_pose_stamped")
         self.declare_parameter("detect_mode_topic", "/detect_mode")
-        self.declare_parameter("object_trigger_topic", "/manipulation/object_6d_trigger")
+        self.declare_parameter("object_trigger_topic", "/object_6d_trigger")
 
         # Runtime parameters
         self.declare_parameter("default_mode", "object")
         self.declare_parameter("enable_visualization", True)
         self.declare_parameter("frame_id", "camera_color_optical_frame")
         self.declare_parameter("conf_thresh", 0.4)
+        # 템플릿 매칭
         self.declare_parameter("angle_step_deg", 1)
         self.declare_parameter("match_size", 160)
+        
+        # 리얼센스
         self.declare_parameter("color_width", 848)
         self.declare_parameter("color_height", 480)
         self.declare_parameter("fps", 30)
@@ -412,7 +415,12 @@ class MixedPoseVisionNode(Node):
         self.declare_parameter("fp_register_iter", 5)
         self.declare_parameter("fp_track_iter", 2)
         self.declare_parameter("fp_track_loss_thr", 0.2)
-        self.declare_parameter("fp_use_tracking", True)
+
+        # Trigger one-shot refinement:
+        #   0 -> old behavior: register-only and publish immediately.
+        #   N -> fresh register once, then track_one for N additional frames, publish final pose, reset.
+        self.declare_parameter("fp_trigger_track_frames", 10)
+        self.declare_parameter("fp_trigger_track_use_new_frames", True)
         self.declare_parameter("fp_debug", 0)
         self.declare_parameter("fp_debug_dir", "/home/choisuhyun/course/robot_manipulation-bin-picking/FoundationPose/debug_ros")
 
@@ -512,7 +520,7 @@ class MixedPoseVisionNode(Node):
 
         self.timer = self.create_timer(0.1, self._timer_callback)
         self.get_logger().info(
-            f"MixedPoseVisionNode ready | mode={self.mode} | object=triggered FoundationPose register-only | insert=PCA+template | "
+            f"MixedPoseVisionNode ready | mode={self.mode} | object=triggered FoundationPose register+short-track | insert=PCA+template | "
             f"depth_scale={self.depth_scale:.6f}"
         )
 
@@ -661,14 +669,21 @@ class MixedPoseVisionNode(Node):
         self._object_trigger_class = None
         return True, target_class, seq
 
-    def _timer_callback(self):
+    def _read_aligned_rgbd(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         frames = self.pipeline.wait_for_frames()
         aligned = self.align.process(frames)
-        color_frame, depth_frame = aligned.get_color_frame(), aligned.get_depth_frame()
+        color_frame = aligned.get_color_frame()
+        depth_frame = aligned.get_depth_frame()
         if not color_frame or not depth_frame:
-            return
+            return None, None
         color = np.asanyarray(color_frame.get_data())
         depth = np.asanyarray(depth_frame.get_data())
+        return color, depth
+
+    def _timer_callback(self):
+        color, depth = self._read_aligned_rgbd()
+        if color is None or depth is None:
+            return
         display = color.copy()
 
         if self.mode == "object":
@@ -828,30 +843,59 @@ class MixedPoseVisionNode(Node):
         class_name = det["class_name"]
 
         pose_mat = None
+        refined_frames = 0
+        register_iter = int(self.get_parameter("fp_register_iter").value)
+        track_iter = int(self.get_parameter("fp_track_iter").value)
+        track_loss_thr = float(self.get_parameter("fp_track_loss_thr").value)
+        trigger_track_frames = max(0, int(self.get_parameter("fp_trigger_track_frames").value))
+        trigger_track_use_new_frames = bool(self.get_parameter("fp_trigger_track_use_new_frames").value)
+
         try:
             est = self._get_fp_estimator(class_name)
             if est is not None:
-                # Important: trigger-based object pose uses register-only.
-                # This avoids stale tracking state after disappearance/reappearance.
+                # Each trigger starts with a fresh register to avoid stale pose.
+                # Then, only inside this trigger request, run a short track_one refinement.
+                # This is useful when robot/camera/object are static during capture.
                 est.reset()
                 pose_mat = est.estimate(
                     rgb_bgr=color,
                     depth_uint16=depth,
                     mask_uint8=det["mask_img"],
                     K=self.K,
-                    register_iter=int(self.get_parameter("fp_register_iter").value),
-                    track_iter=int(self.get_parameter("fp_track_iter").value),
-                    track_loss_thr=float(self.get_parameter("fp_track_loss_thr").value),
+                    register_iter=register_iter,
+                    track_iter=track_iter,
+                    track_loss_thr=track_loss_thr,
                     use_tracking=False,
                     depth_scale=self.depth_scale,
                 )
+
+                for _ in range(trigger_track_frames):
+                    track_color = color
+                    track_depth = depth
+                    if trigger_track_use_new_frames:
+                        next_color, next_depth = self._read_aligned_rgbd()
+                        if next_color is not None and next_depth is not None:
+                            track_color, track_depth = next_color, next_depth
+
+                    pose_mat = est.estimate(
+                        rgb_bgr=track_color,
+                        depth_uint16=track_depth,
+                        mask_uint8=det["mask_img"],
+                        K=self.K,
+                        register_iter=register_iter,
+                        track_iter=track_iter,
+                        track_loss_thr=track_loss_thr,
+                        use_tracking=True,
+                        depth_scale=self.depth_scale,
+                    )
+                    refined_frames += 1
+
                 est.reset()
         except Exception as e:
             self.get_logger().warn(f"[FP] triggered pose failed: {class_name}: {e}")
             traceback.print_exc()
             if class_name in self._fp_estimators:
                 self._fp_estimators[class_name].reset()
-
         if pose_mat is None:
             self._draw_detection(display, det, None, "FP failed")
             status["status"] = "fp_failed"
@@ -860,8 +904,11 @@ class MixedPoseVisionNode(Node):
             return [], status
 
         extra = {
-            "pose_source": "foundationpose_register_only",
+            "pose_source": "foundationpose_register_short_track",
             "trigger_seq": int(trigger_seq),
+            "register_iter": int(register_iter),
+            "track_iter": int(track_iter),
+            "track_refine_frames": int(refined_frames),
             "priority": {
                 "selected": True,
                 "reason": "nearest_depth" if requested_class is None else "requested_class_nearest_depth",
@@ -882,13 +929,15 @@ class MixedPoseVisionNode(Node):
         self.last_object_status_text = f"last FP pose seq={trigger_seq}"
 
         # 8) trigger 대상은 pose axis + 3D CAD bbox로 다시 강조해서 그림.
-        self._draw_detection(display, det, pose_mat, "TRIGGERED register-only")
+        self._draw_detection(display, det, pose_mat, f"TRIGGERED reg+track({refined_frames})")
 
         status["status"] = "success"
         status["selected_class"] = class_name
         status["selected_depth_m"] = round(float(det["depth_med"]), 4)
         self.get_logger().info(
-            f"[OBJECT_6D] seq={trigger_seq} success class={class_name} depth={det['depth_med']:.4f}m"
+            f"[OBJECT_6D] seq={trigger_seq} success class={class_name} "
+            f"depth={det['depth_med']:.4f}m register_iter={register_iter} "
+            f"track_iter={track_iter} refined_frames={refined_frames}"
         )
         return [obj], status
 

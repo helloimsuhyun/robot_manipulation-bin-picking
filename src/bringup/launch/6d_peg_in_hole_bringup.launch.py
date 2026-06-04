@@ -62,11 +62,12 @@ def generate_launch_description():
             "enable_visualization": "true",
             "conf_thresh": "0.4",
 
-            "fp_register_iter": "7",
+            "fp_register_iter": "5",
             "fp_track_iter": "2",
             "fp_track_loss_thr": "0.2",
+            "fp_trigger_track_frames": "10",
+            "fp_trigger_track_use_new_frames": "true",
             "fp_debug": "0",
-            "fp_use_tracking": "false",
 
             "object_topic": object_topic,
             "insert_topic": insert_topic,
@@ -115,7 +116,7 @@ def generate_launch_description():
             "detect_mode_settle_sec": 0.5,
 
             # 실제 제어 노드 구조는 유지하고, publish 직후 preview만 띄움
-            "visualize_pose6_target": True,
+            "visualize_pose6_target": False,
             "visualize_axes_length_mm": 50.0,
             "visualize_approach_length_mm": 80.0,
             "visualize_blocking": False,
