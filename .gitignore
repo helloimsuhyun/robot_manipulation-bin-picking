@@ -63,3 +63,10 @@ __pycache__/
 
 # Large local installers
 *.deb
+
+
+# Keep sixd_pose_vision template images
+!src/
+!src/sixd_pose_vision/
+!src/sixd_pose_vision/templates/
+!src/sixd_pose_vision/templates/*.png
