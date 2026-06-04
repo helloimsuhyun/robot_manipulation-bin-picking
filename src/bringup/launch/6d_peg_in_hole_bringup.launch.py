@@ -86,9 +86,6 @@ def generate_launch_description():
             "handeye_result_path": handeye_result_path,
             "object_grasp_yaml_path": object_grasp_yaml_path,
 
-            # 최종 출력은 제어부 moveL에 바로 넣는 TCP target pose6
-            "peg_target_pose_mode": "moveL_pose6",
-
             # object_to_center 적용 후 centered object +Z가 world +Z에 더 가깝도록 보정
             "canonicalize_object_axes": True,
             "canonicalize_z_flip_margin": 0.05,

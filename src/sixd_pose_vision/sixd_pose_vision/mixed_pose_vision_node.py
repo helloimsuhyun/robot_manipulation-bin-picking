@@ -395,7 +395,7 @@ class MixedPoseVisionNode(Node):
         self.declare_parameter("object_pose_topic", "/object_pose_stamped")
         self.declare_parameter("insert_pose_topic", "/insert_pose_stamped")
         self.declare_parameter("detect_mode_topic", "/detect_mode")
-        self.declare_parameter("object_trigger_topic", "/object_6d_trigger")
+        self.declare_parameter("object_trigger_topic", "/manipulation/object_6d_trigger")
 
         # Runtime parameters
         self.declare_parameter("default_mode", "object")
@@ -409,7 +409,7 @@ class MixedPoseVisionNode(Node):
         self.declare_parameter("fps", 30)
 
         # FoundationPose parameters
-        self.declare_parameter("fp_register_iter", 10)
+        self.declare_parameter("fp_register_iter", 5)
         self.declare_parameter("fp_track_iter", 2)
         self.declare_parameter("fp_track_loss_thr", 0.2)
         self.declare_parameter("fp_use_tracking", True)
