@@ -80,13 +80,13 @@ class PegInHoleController(Node):
                 ("place_up_target_z_mm", 110.0),
 
                 # place tilt / servo_t sequence
-                ("place_tilt_deg", 12.0),
+                ("place_tilt_deg", 7.0),
                 ("place_lift_current_tcp_z_mm", 30.0),
 
                 ("servo_t_t1_sec", 0.01),
                 ("servo_t_t2_sec", 0.05),
                 ("servo_t_sleep_sec", 0.01),
-                ("servo_t_compensation", 3),
+                ("servo_t_compensation", 1),
 
                 # 약한 삽입 힘은 현재 joint torque vector로 지정한다.
                 # Cartesian -Z force가 아니라 servo_t 외부 joint torque이므로 반드시 작게 시작한다.
@@ -94,7 +94,7 @@ class PegInHoleController(Node):
                 ("servo_insert_down_torque", [0.0, 0.0, 0.5, 0.0, 0.0, 0.0]),
 
                 # 4/5번 조인트 자세 복귀 servo_t
-                ("servo_level_max_duration_sec", 5.0),
+                ("servo_level_max_duration_sec", 3.0),
                 ("servo_level_target_stable_count", 10),
                 ("servo_level_j4_tol_deg", 1.0),
                 ("servo_level_j5_tol_deg", 1.0),
@@ -110,8 +110,8 @@ class PegInHoleController(Node):
                 ("servo_level_j4_deadband_deg", 0.3),
                 ("servo_level_j5_deadband_deg", 0.3),
                 ("servo_jvel_lpf_alpha", 0.1),
-                ("servo_torque_rate_limit", 0.08),
-                ("servo_torque_lpf_alpha", 0.20),
+                ("servo_torque_rate_limit", 0.16),
+                ("servo_torque_lpf_alpha", 0.30),
 
                 ("move_j_speed", 60.0),
                 ("move_j_acc", 80.0),
@@ -1067,11 +1067,14 @@ class PegInHoleController(Node):
 
         target_pose = self.ctx.current_hole_place_pose.copy()
 
-        # 네모 peg/object_id=1 삽입 시 x 방향으로 +2 mm 보정
+        # 네모 peg/object_id=1 삽입 시 x 방향 +2 mm, 카메라 yaw +45 deg 보정
         if self.ctx.current_target_id == 1:
+            raw_yaw = float(target_pose[5])
             target_pose[0] += 2.0
+            target_pose[5] = self._normalize_yaw_deg(raw_yaw + 45.0)
             self.get_logger().info(
                 f"[PLACE OFFSET] square tilted. apply x offset +2.0 mm, "
+                f"yaw +45.0 deg: {raw_yaw:.3f} -> {target_pose[5]:.3f}, "
                 f"target x = {target_pose[0]:.2f}"
             )
 
@@ -1323,11 +1326,14 @@ class PegInHoleController(Node):
 
             target_pose = self.ctx.current_hole_place_pose.copy()
 
-            # 네모 peg/object_id=1 삽입 시 x 방향으로 +2 mm 보정
+            # 네모 peg/object_id=1 삽입 시 x 방향 +2 mm, 카메라 yaw +45 deg 보정
             if self.ctx.current_target_id == 1:
+                raw_yaw = float(target_pose[5])
                 target_pose[0] += 2.0
+                target_pose[5] = self._normalize_yaw_deg(raw_yaw + 45.0)
                 self.get_logger().info(
                     f"[PLACE OFFSET] square target. apply x offset +2.0 mm, "
+                    f"yaw +45.0 deg: {raw_yaw:.3f} -> {target_pose[5]:.3f}, "
                     f"target x = {target_pose[0]:.2f}"
                 )
 
@@ -1386,9 +1392,12 @@ class PegInHoleController(Node):
             target_pose = self.ctx.current_hole_place_pose.copy()
 
             if self.ctx.current_target_id == 1:
+                raw_yaw = float(target_pose[5])
                 target_pose[0] += 2.0
+                target_pose[5] = self._normalize_yaw_deg(raw_yaw + 45.0)
                 self.get_logger().info(
                     f"[PLACE OFFSET] square descend. apply x offset +2.0 mm, "
+                    f"yaw +45.0 deg: {raw_yaw:.3f} -> {target_pose[5]:.3f}, "
                     f"target x = {target_pose[0]:.2f}"
                 )
 

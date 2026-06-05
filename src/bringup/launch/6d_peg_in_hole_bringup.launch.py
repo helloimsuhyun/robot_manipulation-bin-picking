@@ -157,15 +157,15 @@ def generate_launch_description():
             "pick_lift_above_peg_z_mm": 80.0,
 
             "place_approach_target_z_mm": 108.0,
-            "place_down_target_z_mm": 98.0,
+            "place_down_target_z_mm": 81.0,
             "place_up_target_z_mm": 110.0,
 
-            "move_j_speed": 60.0,
-            "move_j_acc": 60.0,
+            "move_j_speed": 90.0,
+            "move_j_acc": 90.0,
             "move_l_speed": 60.0,
             "move_l_acc": 120.0,
-            "approach_move_l_speed": 60.0,
-            "approach_move_l_acc": 120.0,
+            "approach_move_l_speed": 150.0,
+            "approach_move_l_acc": 150.0,
             "descend_move_l_speed": 20.0,
             "descend_move_l_acc": 40.0,
 
