@@ -81,6 +81,45 @@ def depth_median_in_mask(depth_image: np.ndarray, mask: np.ndarray, depth_scale:
     return float(np.median(z)) if len(z) > 0 else float("inf")
 
 
+def depth_front_median_score_in_mask(
+    depth_image: np.ndarray,
+    mask: np.ndarray,
+    depth_scale: float,
+    front_ratio: float = 0.35,
+    min_valid_pixels: int = 30,
+) -> float:
+    """
+    Nearest-object selection용 robust depth score.
+
+    전체 mask median(p50)이 아니라, 가까운 쪽 depth subset의 median을 사용한다.
+
+    절차:
+      1. mask 내부 valid depth만 수집
+      2. invalid depth 0 제거
+      3. depth 오름차순 정렬
+      4. 가까운 쪽 front_ratio만 선택
+      5. 그 subset의 median 반환
+    """
+    if mask is None:
+        return float("inf")
+
+    z = depth_image[mask > 0].astype(np.float32) * float(depth_scale)
+    z = z[z > 0]
+
+    if len(z) < min_valid_pixels:
+        return float("inf")
+
+    z_sorted = np.sort(z)
+
+    front_count = int(round(len(z_sorted) * float(front_ratio)))
+    front_count = max(min_valid_pixels, front_count)
+    front_count = min(front_count, len(z_sorted))
+
+    z_front = z_sorted[:front_count]
+
+    return float(np.median(z_front))
+
+
 def pose_to_dict(pose_mat: np.ndarray, class_name: str, confidence: float, extra: Optional[Dict] = None) -> Dict:
     pose_mat = np.asarray(pose_mat, dtype=np.float64).reshape(4, 4)
     R = orthonormalize_R(pose_mat[:3, :3])
