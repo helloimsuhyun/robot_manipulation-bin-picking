@@ -54,7 +54,7 @@ FoundationPose/
 build/
 install/
 log/
-
+g
 # Python cache
 __pycache__/
 *.pyc

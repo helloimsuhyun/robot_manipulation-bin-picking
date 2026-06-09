@@ -14,8 +14,10 @@ hole trigger input remains unchanged:
 2. vision 부에서 정보 구독
 
 peg output:
-Success, len(data) == 6:
+peg output:
+Success, len(data) == 7:
 [
+  object_id,
   tcp_x_mm,
   tcp_y_mm,
   tcp_z_mm,
@@ -24,7 +26,7 @@ Success, len(data) == 6:
   tcp_rz_deg
 ]
 
-Failure / requested object pose not available, len(data) != 6:
+Failure / requested object pose not available, len(data) != 7:
 [
   currently_visible_object_id_0,
   currently_visible_object_id_1,
@@ -51,9 +53,9 @@ vision object -> centerd object -> safe centored object (+z축 바닥 방지 , x
       base_T_tcp_goal =
           base_T_centered_object_safe
           @ centered_object_T_tcp_goal
-  output pose6 = [x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg]
+    output = [object_id, x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg]
 
-"""
+    """
 
 
 
@@ -507,17 +509,17 @@ class ObjectPoseTransformNode(Node):
 
     Output:
         /vision/peg_targets:
-            Success: 6 floats:
-                [tcp_x_mm, tcp_y_mm, tcp_z_mm, tcp_rx_deg, tcp_ry_deg, tcp_rz_deg]
+            Success: 7 floats:
+                [object_id, tcp_x_mm, tcp_y_mm, tcp_z_mm, tcp_rx_deg, tcp_ry_deg, tcp_rz_deg]
 
             Failure / requested object pose not available: variable-length id list:
                 [currently_visible_object_id_0, currently_visible_object_id_1, ...]
 
             Therefore the controller can branch by len(data):
-                len(data) == 6 -> success moveL pose6 response
-                len(data) != 6 -> failure/fallback visible-id response
+                len(data) == 7 -> success [object_id, moveL pose6] response
+                len(data) != 7 -> failure/fallback visible-id response
 
-            The published pose6 is intended to be sent directly to robot moveL.
+            The published pose6 part, data[1:7], is intended to be sent directly to robot moveL.
 
         /vision/hole_targets:
             insert target, legacy format. 4 floats per target:
@@ -582,6 +584,7 @@ class ObjectPoseTransformNode(Node):
             "cross_insert": 2,
         }
         self.id_to_class = {
+            -1: "nearest",
             0: "cylinder",
             1: "hole",
             2: "cross",
@@ -651,7 +654,7 @@ class ObjectPoseTransformNode(Node):
         self.get_logger().info(
             "ObjectPoseTransformNode ready. "
             "peg trigger=/manipulation/trigger_peg: [object_id, tcp_pose6]; "
-            "object output=/vision/peg_targets: success len=6 [tcp_moveL_pose6], failure len!=6 [visible_ids]; "
+            "object output=/vision/peg_targets: success len=7 [object_id, tcp_moveL_pose6], failure len!=7 [visible_ids]; "
             "insert output=/vision/hole_targets: [x_mm, y_mm, yaw_deg, id]."
         )
 
@@ -1032,7 +1035,7 @@ class ObjectPoseTransformNode(Node):
             return None
 
         obj_id = int(self.class_to_id[cls])
-        if requested_object_idx is not None and obj_id != int(requested_object_idx):
+        if requested_object_idx is not None and int(requested_object_idx) != -1 and obj_id != int(requested_object_idx):
             return None
 
         try:
@@ -1175,7 +1178,7 @@ class ObjectPoseTransformNode(Node):
                 "estimated_last_joint_deg": float(best["estimated_j5"]),
                 "last_joint_delta_deg": float(best["delta_j5"]),
                 "last_joint_signed_delta_deg": float(best["signed_delta_j5"]),
-                "output_format": "moveL_pose6_6",
+                "output_format": "id_plus_moveL_pose6_7",
             }
 
         except Exception as e:
@@ -1261,15 +1264,18 @@ class ObjectPoseTransformNode(Node):
     @staticmethod
     def object_targets_to_msg_data(targets):
         """
-        Object target format:
-            [tcp_x_mm, tcp_y_mm, tcp_z_mm, tcp_rx_deg, tcp_ry_deg, tcp_rz_deg]
-        Total 6 floats per target. This is intended to be sent directly to moveL.
+        Object target success format:
+            [object_id, tcp_x_mm, tcp_y_mm, tcp_z_mm, tcp_rx_deg, tcp_ry_deg, tcp_rz_deg]
+
+        object_id is the actual recognized object id from vision result class.
+        Total 7 floats per target.
         """
         data = []
 
         for t in targets:
+            obj_id = float(t["id"])
             pose6 = np.asarray(t["target_pose6"], dtype=np.float64).reshape(6)
-            data.extend(pose6.tolist())
+            data.extend([obj_id] + pose6.tolist())
 
         return data
 
@@ -1280,8 +1286,8 @@ class ObjectPoseTransformNode(Node):
             [currently_visible_object_id_0, currently_visible_object_id_1, ...]
 
         The controller distinguishes this from success by length:
-            len(data) == 6 -> success moveL pose6 response
-            len(data) != 6 -> fallback visible-id response
+            len(data) == 7 -> success [object_id, moveL pose6]
+            len(data) != 7 -> fallback visible-id response
         """
         ids = []
         for v in visible_ids:
@@ -1688,7 +1694,7 @@ class ObjectPoseTransformNode(Node):
         self.get_logger().warn(
             f"[PUBLISH] topic={topic_name} type={label} format=visible_ids_fallback "
             f"requested_id={requested_id} visible_ids={msg.data} data_len={len(msg.data)} "
-            f"rule='len(data)!=6 means requested pose unavailable'"
+            f"rule='len(data)!=7 means requested pose unavailable'"
         )
 
         self.publish_repeated(publisher, msg, count=10)
@@ -1712,7 +1718,7 @@ class ObjectPoseTransformNode(Node):
         }
 
         self.get_logger().info(
-            f"[PUBLISH] topic={topic_name} type={label} format=moveL_pose6_6_success "
+            f"[PUBLISH] topic={topic_name} type={label} format=id_plus_moveL_pose6_7_success "
             f"target={debug_target} data_len={len(msg.data)}"
         )
 
