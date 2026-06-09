@@ -757,15 +757,30 @@ class MixedPoseVisionNode(Node):
         for i, mask_xy in enumerate(results.masks.xy):
             mask_img = mask_from_polygon(mask_xy, color.shape)
             cls_id = int(results.boxes.cls[i])
+
+            # depth_med: 기존 전체 mask median. 디버그/로그용으로 유지.
+            # depth_score: nearest 선택용. 가까운 쪽 35% depth subset의 median.
+            depth_med = depth_median_in_mask(depth, mask_img, self.depth_scale)
+            depth_score = depth_front_median_score_in_mask(
+                depth,
+                mask_img,
+                self.depth_scale,
+                front_ratio=0.35,
+                min_valid_pixels=30,
+            )
+
             detections.append({
                 "class_name": results.names[cls_id],
                 "confidence": float(results.boxes.conf[i]),
                 "mask_xy": mask_xy,
                 "mask_img": mask_img,
-                "depth_med": depth_median_in_mask(depth, mask_img, self.depth_scale),
+                "depth_med": depth_med,
+                "depth_score": depth_score,
                 "bbox": results.boxes.xyxy[i].cpu().numpy().astype(int),
             })
-        detections.sort(key=lambda d: d["depth_med"])
+
+        # allowed-id nearest 선택과 preview 대표 detection 모두 depth_score 기준으로 정렬.
+        detections.sort(key=lambda d: d.get("depth_score", d["depth_med"]))
         return detections
 
     def _available_object_info(self, detections: List[Dict]) -> Tuple[List[int], List[str]]:
@@ -799,7 +814,7 @@ class MixedPoseVisionNode(Node):
         candidates = [d for d in detections if d["class_name"] == self.last_object_class_name]
         if not candidates:
             return None
-        candidates.sort(key=lambda d: d["depth_med"])
+        candidates.sort(key=lambda d: d.get("depth_score", d["depth_med"]))
         return candidates[0]
 
     def _process_object_mode(
@@ -861,7 +876,7 @@ class MixedPoseVisionNode(Node):
             ]
 
         # raw_detections is already sorted by depth, but sort again after filtering.
-        target_detections.sort(key=lambda d: d["depth_med"])
+        target_detections.sort(key=lambda d: d.get("depth_score", d["depth_med"]))
         status["detected_count"] = len(target_detections)
 
         # 3) 우선 전체 YOLO detection을 항상 그림.
@@ -884,7 +899,8 @@ class MixedPoseVisionNode(Node):
 
             status["status"] = "preview_detected"
             status["preview_class"] = raw_detections[0]["class_name"]
-            status["preview_depth_m"] = round(float(raw_detections[0]["depth_med"]), 4)
+            status["preview_depth_m"] = round(float(raw_detections[0].get("depth_score", raw_detections[0]["depth_med"])), 4)
+            status["preview_depth_median_m"] = round(float(raw_detections[0]["depth_med"]), 4)
             if self.last_object_class_name is not None:
                 status["last_pose_class"] = self.last_object_class_name
             return [], status
@@ -978,6 +994,7 @@ class MixedPoseVisionNode(Node):
                 ),
                 "allowed_ids": requested_allowed_ids,
                 "depth_median_m": round(float(det["depth_med"]), 4),
+                "depth_score_m": round(float(det.get("depth_score", det["depth_med"])), 4),
                 "detected_count": len(target_detections),
                 "detected_count_raw": int(status["detected_count_raw"]),
             },
@@ -999,10 +1016,12 @@ class MixedPoseVisionNode(Node):
         status["status"] = "success"
         status["selected_class"] = class_name
         status["selected_id"] = int(self.class_to_id[class_name])
-        status["selected_depth_m"] = round(float(det["depth_med"]), 4)
+        status["selected_depth_m"] = round(float(det.get("depth_score", det["depth_med"])), 4)
+        status["selected_depth_median_m"] = round(float(det["depth_med"]), 4)
         self.get_logger().info(
             f"[OBJECT_6D] seq={trigger_seq} success class={class_name} "
-            f"depth={det['depth_med']:.4f}m register_iter={register_iter} "
+            f"depth_score={det.get('depth_score', det['depth_med']):.4f}m "
+            f"depth_med={det['depth_med']:.4f}m register_iter={register_iter} "
             f"track_iter={track_iter} refined_frames={refined_frames}"
         )
         return [obj], status
@@ -1036,6 +1055,7 @@ class MixedPoseVisionNode(Node):
             obj = pca_pose_to_dict(pose_mat, det["class_name"], det["confidence"], yaw_deg, yaw_score, yaw_source)
             obj["pose_source"] = "depth_pca_template"
             obj["depth_median_m"] = round(float(det["depth_med"]), 4)
+            obj["depth_score_m"] = round(float(det.get("depth_score", det["depth_med"])), 4)
             objects.append(obj)
             ps = make_pose_stamped(pose_mat, self.frame_id)
             ps.header.stamp = self.get_clock().now().to_msg()
