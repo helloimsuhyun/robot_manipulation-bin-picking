@@ -19,10 +19,11 @@ class VisionInterface:
         peg_targets, hole_targets = [x, y, yaw, id, ...]
 
     6D peg 방식(use_6d_peg_interface=True):
-        trigger_peg = [object_id, x, y, z, rx, ry, rz]
-            - object_id=-1이면 비전부가 잡을 peg를 자동 선택한다.
+        trigger_peg = [allow_circle, allow_square, allow_cross, x, y, z, rx, ry, rz]
+            - allow_* = 1이면 잡아도 됨, 0이면 잡으면 안 됨.
+            - 순서: circle(id=0), square/hole(id=1), cross(id=2), pose6.
         peg_targets success = [object_id, x, y, z, rx, ry, rz] # len(data)==7
-            - data[0]은 실제 인식된 object_id이다.
+            - data[0]은 실제 인식되어 선택된 object_id이다.
             - data[1:7]은 move_l용 최종 grasp pose이다.
         peg_targets legacy = [T00, T01, ... T33, object_id]   # len(data)==17
             - 이전 4x4 matrix 방식 호환용이다.
@@ -61,10 +62,9 @@ class VisionInterface:
         self.camera_settle_sec = float(camera_settle_sec)
         self.use_6d_peg_interface = bool(use_6d_peg_interface)
 
-        # 6D peg 방식에서는 trigger에 object_id가 포함된다.
-        # object_id=-1이면 비전부가 자동 선택하고,
-        # peg_targets 성공 메시지의 data[0]으로 실제 object_id를 돌려준다.
-        self.pending_peg_request_id: int | None = None
+        # 6D peg 방식에서는 trigger에 "잡아도 되는 object id mask"가 포함된다.
+        # 응답 성공 메시지의 data[0]으로 실제 선택된 object_id를 돌려받는다.
+        self.pending_peg_allowed_ids: list[int] = []
 
         self.latest_peg_xyyawid: list[tuple[float, float, float, int]] = []
         self.latest_hole_xyyawid: list[tuple[float, float, float, int]] = []
@@ -178,28 +178,47 @@ class VisionInterface:
             f"ee_pose = {ee_pose}"
         )
 
-    def publish_peg_6d_trigger(self, object_id: int):
+    def publish_peg_6d_trigger(self, allowed_object_ids: list[int] | tuple[int, ...] | int):
         """
         6D peg trigger.
 
         publish data:
-            [object_id, x, y, z, rx, ry, rz]
-        """
-        object_id = int(object_id)
-        self.pending_peg_request_id = object_id
+            [allow_circle, allow_square, allow_cross, x, y, z, rx, ry, rz]
 
+        id mapping:
+            0: circle/cylinder
+            1: square/hole
+            2: cross
+        """
+        if isinstance(allowed_object_ids, int):
+            raw_ids = [int(allowed_object_ids)]
+        else:
+            raw_ids = [int(v) for v in allowed_object_ids]
+
+        allowed_ids: list[int] = []
+        for object_id in raw_ids:
+            if object_id in self.VALID_OBJECT_IDS and object_id not in allowed_ids:
+                allowed_ids.append(object_id)
+
+        if len(allowed_ids) == 0:
+            allowed_ids = list(self.VALID_OBJECT_IDS)
+
+        self.pending_peg_allowed_ids = list(allowed_ids)
+
+        allow_flags = [1.0 if object_id in allowed_ids else 0.0 for object_id in self.VALID_OBJECT_IDS]
         ee_pose = self._get_ee_pose_after_settle()
 
         msg = Float64MultiArray()
-        msg.data = [float(object_id)] + [float(v) for v in ee_pose[:6]]
+        msg.data = allow_flags + [float(v) for v in ee_pose[:6]]
 
         self.trigger_peg_pub.publish(msg)
         rclpy.spin_once(self.node, timeout_sec=0.05)
 
+        allowed_names = [self.shape_name(object_id) for object_id in allowed_ids]
         self.node.get_logger().info(
             f"[VISION TRIGGER] PEG 6D trigger published. "
-            f"object_id = {object_id} ({self.shape_name(object_id)}), "
-            f"data = {msg.data}"
+            f"allowed_ids={allowed_ids}, allowed_names={allowed_names}, "
+            f"allow_flags={allow_flags}, data={msg.data}"
         )
 
     def trigger_peg_capture(self):
@@ -279,25 +298,18 @@ class VisionInterface:
 
         # 구버전 호환:
         # data = [x, y, z, rx, ry, rz]
-        # 이 경우에는 pending request id를 object_id로 사용한다.
-        # 단, request_id=-1에서는 실제 id를 알 수 없으므로 무시한다.
+        # 이 경우 실제 object_id가 없으므로, allowed id가 정확히 1개일 때만 사용한다.
         if len(data) == 6:
-            if self.pending_peg_request_id is None:
+            if len(self.pending_peg_allowed_ids) != 1:
                 self.node.get_logger().warn(
-                    "[VISION SUB] 6D peg grasp pose received, "
-                    "but pending request id is None. Ignore this message."
-                )
-                return [], []
-
-            object_id = int(self.pending_peg_request_id)
-
-            if object_id == -1:
-                self.node.get_logger().warn(
-                    "[VISION SUB] Legacy len=6 peg pose received for request_id=-1. "
-                    "Actual object_id is unknown, so ignore this message. "
+                    "[VISION SUB] Legacy len=6 peg pose received, "
+                    f"but allowed_ids={self.pending_peg_allowed_ids}. "
+                    "Actual object_id is ambiguous, so ignore this message. "
                     "Expected len=7: [object_id, x, y, z, rx, ry, rz]."
                 )
                 return [], []
+
+            object_id = int(self.pending_peg_allowed_ids[0])
 
             if object_id not in self.VALID_OBJECT_IDS:
                 self.node.get_logger().warn(
@@ -429,19 +441,25 @@ class VisionInterface:
 
         return False
 
-    def _wait_for_peg_6d_target(self, request_id: int) -> list[VisionTarget]:
+    def _wait_for_peg_6d_target(self, allowed_object_ids: list[int] | tuple[int, ...]) -> list[VisionTarget]:
         """
         6D peg 전용 대기 함수.
 
         기존 _wait_for_peg_msg()는 메시지 하나만 받으면 바로 종료한다.
-        6D 방식에서는 len(data)!=17 fallback visible_ids가 먼저 들어올 수 있으므로,
+        6D 방식에서는 len(data)!=7 fallback visible_ids가 먼저 들어올 수 있으므로,
         성공 pose가 들어오거나 timeout이 날 때까지 계속 기다린다.
 
         반환:
-            [VisionTarget] : request_id에 해당하는 6D pose 수신 성공
-            []             : timeout 또는 해당 id pose 없음
+            [VisionTarget] : allowed_object_ids 중 하나의 6D pose 수신 성공
+            []             : timeout 또는 허용 id pose 없음
         """
-        request_id = int(request_id)
+        allowed_ids = []
+        for object_id in allowed_object_ids:
+            object_id = int(object_id)
+            if object_id in self.VALID_OBJECT_IDS and object_id not in allowed_ids:
+                allowed_ids.append(object_id)
+        if len(allowed_ids) == 0:
+            allowed_ids = list(self.VALID_OBJECT_IDS)
 
         # FoundationPose는 object 종류에 따라 3초 이상 걸릴 수 있어서
         # 6D peg는 최소 6초는 기다리도록 한다.
@@ -458,7 +476,7 @@ class VisionInterface:
             if elapsed > timeout_sec:
                 self.node.get_logger().warn(
                     f"[VISION] 6D peg target wait timeout. "
-                    f"request_id={request_id}, "
+                    f"allowed_ids={allowed_ids}, "
                     f"last_visible_ids={last_visible_ids}, "
                     f"timeout_sec={timeout_sec:.2f}"
                 )
@@ -474,19 +492,16 @@ class VisionInterface:
 
             # 성공 pose가 온 경우
             if len(self.latest_peg_targets_6d) > 0:
-                if request_id == -1:
-                    matched_targets = list(self.latest_peg_targets_6d)
-                else:
-                    matched_targets = [
-                        target
-                        for target in self.latest_peg_targets_6d
-                        if int(target.object_id) == request_id
-                    ]
+                matched_targets = [
+                    target
+                    for target in self.latest_peg_targets_6d
+                    if int(target.object_id) in allowed_ids
+                ]
 
                 if len(matched_targets) > 0:
                     self.node.get_logger().info(
                         f"[VISION] 6D peg request success. "
-                        f"request_id={request_id}, "
+                        f"allowed_ids={allowed_ids}, "
                         f"target_count={len(matched_targets)}"
                     )
                     return matched_targets
@@ -498,7 +513,7 @@ class VisionInterface:
 
                 self.node.get_logger().warn(
                     f"[VISION] 6D peg pose received, but id mismatch. "
-                    f"request_id={request_id}, received_ids={received_ids}. "
+                    f"allowed_ids={allowed_ids}, received_ids={received_ids}. "
                     "Keep waiting..."
                 )
                 continue
@@ -506,13 +521,12 @@ class VisionInterface:
             # fallback visible_ids가 온 경우
             last_visible_ids = list(self.latest_peg_visible_ids)
 
-            if request_id == -1 or request_id in last_visible_ids:
-                # 현재 id가 보이기는 하지만 pose 계산이 아직 끝나지 않은 상태로 보고 계속 대기한다.
-                # request_id=-1은 비전부 자동 선택 요청이므로, visible id가 하나라도 있으면 계속 기다린다.
+            if any(object_id in last_visible_ids for object_id in allowed_ids):
+                # 허용된 id가 보이기는 하지만 pose 계산이 아직 끝나지 않은 상태로 보고 계속 대기한다.
                 if not printed_wait_visible:
                     self.node.get_logger().info(
-                        f"[VISION] Requested 6D peg id={request_id} "
-                        f"is visible but pose is not ready yet. "
+                        f"[VISION] Allowed 6D peg ids={allowed_ids} "
+                        f"are visible but pose is not ready yet. "
                         f"visible_ids={last_visible_ids}. Keep waiting..."
                     )
                     printed_wait_visible = True
@@ -523,14 +537,14 @@ class VisionInterface:
                 # 이전 요청의 fallback이 늦게 들어올 수 있고,
                 # FoundationPose가 현재 요청을 처리 중일 수 있으므로 timeout까지 기다린다.
                 self.node.get_logger().info(
-                    f"[VISION] Requested 6D peg id={request_id} pose not ready. "
+                    f"[VISION] Allowed 6D peg ids={allowed_ids} pose not ready. "
                     f"visible_ids={last_visible_ids}. Keep waiting..."
                 )
                 continue
 
             if not printed_wait_no_visible:
                 self.node.get_logger().info(
-                    f"[VISION] Requested 6D peg id={request_id} "
+                    f"[VISION] Allowed 6D peg ids={allowed_ids} "
                     "pose not ready. No visible object ids returned yet. Keep waiting..."
                 )
                 printed_wait_no_visible = True
@@ -620,46 +634,47 @@ class VisionInterface:
 
     def inspect_pegs_6d(self, preferred_object_ids: list[int] | None = None) -> list[VisionTarget]:
         """
-        6D peg 방식에서는 trigger 1회당 요청한 object_id 1개의 pose만 온다.
-        len(data)==17이면 성공 pose이고, len(data)!=17이면 현재 보이는 id 목록이다.
+        6D peg 방식에서는 trigger 1회에 "잡아도 되는 object id mask"를 보낸다.
 
-        수정 내용:
-            - fallback visible_ids 메시지를 받았다고 바로 실패 처리하지 않는다.
-            - request_id에 해당하는 len(data)==17 pose가 올 때까지 기다린다.
-            - timeout은 6D FoundationPose 처리 시간을 고려해서 최소 6초로 둔다.
+        publish format:
+            [allow_circle, allow_square, allow_cross, x, y, z, rx, ry, rz]
+
+        예:
+            [1, 1, 1, pose6...] -> 원/네모/십자가 모두 허용
+            [1, 0, 0, pose6...] -> 원만 허용
+            [0, 1, 1, pose6...] -> 네모/십자가 허용
+
+        vision 쪽은 허용된 후보 중 하나를 선택해서
+            [actual_object_id, x, y, z, rx, ry, rz]
+        로 반환한다.
         """
         if preferred_object_ids is None or len(preferred_object_ids) == 0:
-            request_ids = list(self.VALID_OBJECT_IDS)
+            allowed_ids = list(self.VALID_OBJECT_IDS)
         else:
-            request_ids = []
+            allowed_ids = []
             for object_id in preferred_object_ids:
                 object_id = int(object_id)
-                if (object_id == -1 or object_id in self.VALID_OBJECT_IDS) and object_id not in request_ids:
-                    request_ids.append(object_id)
+                if object_id in self.VALID_OBJECT_IDS and object_id not in allowed_ids:
+                    allowed_ids.append(object_id)
 
-        if len(request_ids) == 0:
-            self.node.get_logger().warn("[VISION] No valid 6D peg request ids")
-            return []
-
-        for request_id in request_ids:
-            self.peg_msg_received = False
-            self.latest_peg_targets_6d = []
-            self.latest_peg_visible_ids = []
-
-            self.publish_peg_6d_trigger(request_id)
-
-            targets = self._wait_for_peg_6d_target(request_id)
-
-            if len(targets) > 0:
-                return targets
-
+        if len(allowed_ids) == 0:
             self.node.get_logger().warn(
-                f"[VISION] Requested 6D peg id={request_id} "
-                f"({self.shape_name(request_id)}) unavailable after waiting."
+                "[VISION] No valid 6D peg allowed ids. Fall back to all ids."
             )
+            allowed_ids = list(self.VALID_OBJECT_IDS)
+
+        self.peg_msg_received = False
+        self.latest_peg_targets_6d = []
+        self.latest_peg_visible_ids = []
+
+        self.publish_peg_6d_trigger(allowed_ids)
+        targets = self._wait_for_peg_6d_target(allowed_ids)
+
+        if len(targets) > 0:
+            return targets
 
         self.node.get_logger().warn(
-            f"[VISION] No 6D peg pose available for request_ids={request_ids}"
+            f"[VISION] No 6D peg pose available for allowed_ids={allowed_ids}"
         )
         return []
 
