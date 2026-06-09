@@ -14,6 +14,9 @@ ros2 launch bringup 6d_peg_in_hole_bringup.launch.py
 source /opt/ros/humble/setup.bash
 python3 src/robot_ex_2026/robot_ex_2026/grip_current.py
 
+source /opt/ros/humble/setup.bash
+ros2 topic pub --once /manual_continue std_msgs/msg/Empty "{}"
+
 """
 
 from launch import LaunchDescription
@@ -146,8 +149,8 @@ def generate_launch_description():
             "grip_stop": 2,
 
             "home_joint": [-90.0, 0.0, 90.0, 0.0, 90.0, 45.0],
-            "peg_camera_joint": [10.87, 2.78, 79.15, 8.07, 90.0, 34.16],
-            "hole_camera_joint": [-169.23, 2.78, 79.15, 8.07, 90.0, 34.16],
+            'peg_camera_joint': [9.68, 8.52, 55.63, 25.85, 90.0, 35.39],
+            'hole_camera_joint': [-173.76, 8.07, 56.16, 25.78, 90.0, 38.83],
             "peg_return_mid_joint": [-47.0, 2.78, 79.15, 8.07, 90.0, 34.16],
 
             "pick_down_target_z_mm": 69.83,
