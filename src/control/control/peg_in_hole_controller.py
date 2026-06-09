@@ -446,12 +446,13 @@ class PegInHoleController(Node):
         """
         6D peg 비전은 trigger 1회당 object_id 1개의 pose만 반환한다.
 
-        - 아직 jig layout을 모르면 어떤 peg든 잡아도 되므로 0, 1, 2 순서로 요청한다.
+        - 아직 jig layout을 모르면 어떤 peg든 잡아도 되므로 -1로 자동 선택을 요청한다.
+          이때 실제 잡을 object_id는 /vision/peg_targets 응답의 data[0]에서 받는다.
         - jig layout을 이미 알고 있으면 남은 jig id만 요청한다.
         - skip_once id는 가능한 한 이번 요청 후보에서 제외한다.
         """
         if len(self.ctx.active_jig_targets) == 0:
-            request_ids = [0, 1, 2]
+            request_ids = [-1]
         else:
             request_ids = [
                 int(object_id)

@@ -20,8 +20,10 @@ class VisionInterface:
 
     6D peg 방식(use_6d_peg_interface=True):
         trigger_peg = [object_id, x, y, z, rx, ry, rz]
-        peg_targets success = [x, y, z, rx, ry, rz]            # len(data)==6
-            - 비전 노드에서 이미 move_l용 최종 grasp pose를 계산해서 보낸다.
+            - object_id=-1이면 비전부가 잡을 peg를 자동 선택한다.
+        peg_targets success = [object_id, x, y, z, rx, ry, rz] # len(data)==7
+            - data[0]은 실제 인식된 object_id이다.
+            - data[1:7]은 move_l용 최종 grasp pose이다.
         peg_targets legacy = [T00, T01, ... T33, object_id]   # len(data)==17
             - 이전 4x4 matrix 방식 호환용이다.
         peg_targets failure = [visible_id0, visible_id1, ...] # 그 외 길이
@@ -59,9 +61,9 @@ class VisionInterface:
         self.camera_settle_sec = float(camera_settle_sec)
         self.use_6d_peg_interface = bool(use_6d_peg_interface)
 
-        # 6D peg 방식에서는 trigger에는 object_id가 포함되지만,
-        # 새 peg_targets 성공 메시지는 [x, y, z, rx, ry, rz]만 온다.
-        # 따라서 현재 어떤 object_id를 요청했는지 기억해야 한다.
+        # 6D peg 방식에서는 trigger에 object_id가 포함된다.
+        # object_id=-1이면 비전부가 자동 선택하고,
+        # peg_targets 성공 메시지의 data[0]으로 실제 object_id를 돌려준다.
         self.pending_peg_request_id: int | None = None
 
         self.latest_peg_xyyawid: list[tuple[float, float, float, int]] = []
@@ -246,9 +248,39 @@ class VisionInterface:
     def _parse_peg_6d_msg(self, msg: Float64MultiArray) -> tuple[list[VisionTarget], list[int]]:
         data = list(msg.data)
 
-        # 새 방식:
+        # 최신 방식:
         # 비전 노드가 이미 move_l에 넣을 최종 grasp pose를 계산해서 보낸다.
+        # data = [actual_object_id, x, y, z, rx, ry, rz]
+        # 특히 request_id=-1로 요청한 경우, data[0]을 실제 잡을 object_id로 사용해야 한다.
+        if len(data) == 7:
+            object_id = int(round(float(data[0])))
+
+            if object_id not in self.VALID_OBJECT_IDS:
+                self.node.get_logger().warn(
+                    f"[VISION SUB] Unknown 6D peg response id: {object_id}. "
+                    f"Expected 0=cylinder, 1=hole, 2=cross."
+                )
+                return [], []
+
+            pose6 = np.asarray(data[1:7], dtype=np.float64)
+
+            target = VisionTarget(
+                pose=pose6.copy(),
+                object_id=object_id,
+                transform=None,
+            )
+
+            self.node.get_logger().info(
+                f"[VISION SUB] 6D peg grasp pose received directly: "
+                f"id={object_id} ({self.shape_name(object_id)}), "
+                f"pose6={np.round(pose6, 3).tolist()}"
+            )
+            return [target], []
+
+        # 구버전 호환:
         # data = [x, y, z, rx, ry, rz]
+        # 이 경우에는 pending request id를 object_id로 사용한다.
+        # 단, request_id=-1에서는 실제 id를 알 수 없으므로 무시한다.
         if len(data) == 6:
             if self.pending_peg_request_id is None:
                 self.node.get_logger().warn(
@@ -258,6 +290,14 @@ class VisionInterface:
                 return [], []
 
             object_id = int(self.pending_peg_request_id)
+
+            if object_id == -1:
+                self.node.get_logger().warn(
+                    "[VISION SUB] Legacy len=6 peg pose received for request_id=-1. "
+                    "Actual object_id is unknown, so ignore this message. "
+                    "Expected len=7: [object_id, x, y, z, rx, ry, rz]."
+                )
+                return [], []
 
             if object_id not in self.VALID_OBJECT_IDS:
                 self.node.get_logger().warn(
@@ -275,7 +315,7 @@ class VisionInterface:
             )
 
             self.node.get_logger().info(
-                f"[VISION SUB] 6D peg grasp pose received directly: "
+                f"[VISION SUB] Legacy 6D peg grasp pose received directly: "
                 f"id={object_id} ({self.shape_name(object_id)}), "
                 f"pose6={np.round(pose6, 3).tolist()}"
             )
@@ -434,11 +474,14 @@ class VisionInterface:
 
             # 성공 pose가 온 경우
             if len(self.latest_peg_targets_6d) > 0:
-                matched_targets = [
-                    target
-                    for target in self.latest_peg_targets_6d
-                    if int(target.object_id) == request_id
-                ]
+                if request_id == -1:
+                    matched_targets = list(self.latest_peg_targets_6d)
+                else:
+                    matched_targets = [
+                        target
+                        for target in self.latest_peg_targets_6d
+                        if int(target.object_id) == request_id
+                    ]
 
                 if len(matched_targets) > 0:
                     self.node.get_logger().info(
@@ -463,8 +506,9 @@ class VisionInterface:
             # fallback visible_ids가 온 경우
             last_visible_ids = list(self.latest_peg_visible_ids)
 
-            if request_id in last_visible_ids:
-                # 현재 id가 보이기는 하지만 pose 계산이 아직 끝나지 않은 상태로 보고 계속 대기
+            if request_id == -1 or request_id in last_visible_ids:
+                # 현재 id가 보이기는 하지만 pose 계산이 아직 끝나지 않은 상태로 보고 계속 대기한다.
+                # request_id=-1은 비전부 자동 선택 요청이므로, visible id가 하나라도 있으면 계속 기다린다.
                 if not printed_wait_visible:
                     self.node.get_logger().info(
                         f"[VISION] Requested 6D peg id={request_id} "
@@ -590,7 +634,7 @@ class VisionInterface:
             request_ids = []
             for object_id in preferred_object_ids:
                 object_id = int(object_id)
-                if object_id in self.VALID_OBJECT_IDS and object_id not in request_ids:
+                if (object_id == -1 or object_id in self.VALID_OBJECT_IDS) and object_id not in request_ids:
                     request_ids.append(object_id)
 
         if len(request_ids) == 0:
