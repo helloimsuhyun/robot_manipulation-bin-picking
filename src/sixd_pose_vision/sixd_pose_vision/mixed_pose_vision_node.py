@@ -2,7 +2,7 @@
 """
 Mixed 6D pose vision node.
 
-object mode: RealSense RGB-D -> YOLO-seg preview -> trigger topic -> nearest object -> FoundationPose register + short tracking refinement 6D pose
+object mode: RealSense RGB-D -> YOLO-seg preview -> trigger topic -> allowed-id nearest object -> FoundationPose register + short tracking refinement 6D pose
 insert mode: RealSense RGB-D -> YOLO-seg -> existing depth PCA + template yaw
 
 Important paths are ROS parameters:
@@ -395,7 +395,7 @@ class MixedPoseVisionNode(Node):
         self.declare_parameter("object_pose_topic", "/object_pose_stamped")
         self.declare_parameter("insert_pose_topic", "/insert_pose_stamped")
         self.declare_parameter("detect_mode_topic", "/detect_mode")
-        self.declare_parameter("object_trigger_topic", "/object_6d_trigger")
+        self.declare_parameter("object_trigger_topic", "/manipulation/object_6d_trigger")
 
         # Runtime parameters
         self.declare_parameter("default_mode", "object")
@@ -481,11 +481,14 @@ class MixedPoseVisionNode(Node):
 
         # Object 6D is computed only when a trigger message arrives.
         # Trigger payload examples:
-        #   "" or "nearest"          -> nearest detected object
-        #   "cross"                  -> nearest detected cross only
-        #   '{"class":"cylinder"}' -> nearest detected cylinder only
+        #   "" or "nearest"                       -> nearest detected object
+        #   "cross"                               -> nearest detected cross only
+        #   '{"class":"cylinder"}'              -> nearest detected cylinder only
+        #   '{"allowed_ids":[0,2]}'              -> nearest detected cylinder/cross only
+        #   '{"allowed_classes":["cylinder"]}' -> nearest detected cylinder only
         self._object_trigger_pending = False
         self._object_trigger_class: Optional[str] = None
+        self._object_trigger_allowed_ids: Optional[List[int]] = None
         self._object_trigger_seq = 0
 
         self.object_model = self._load_yolo(self.object_yolo_path, "object")
@@ -636,17 +639,45 @@ class MixedPoseVisionNode(Node):
 
     def _object_trigger_callback(self, msg: String):
         payload = msg.data.strip()
+
         target_class = None
+        allowed_ids = None
 
         if payload:
-            # Accept either raw class name, "nearest", or JSON: {"class":"cross"}
             try:
                 data = json.loads(payload)
+
                 if isinstance(data, dict):
-                    target_class = data.get("class") or data.get("target_class")
+                    if "allowed_ids" in data:
+                        allowed_ids = []
+                        for v in data.get("allowed_ids", []):
+                            try:
+                                obj_id = int(round(float(v)))
+                            except Exception:
+                                continue
+                            if obj_id in {0, 1, 2} and obj_id not in allowed_ids:
+                                allowed_ids.append(obj_id)
+
+                    elif "allowed_classes" in data:
+                        allowed_ids = []
+                        for cls in data.get("allowed_classes", []):
+                            cls = str(cls).strip()
+                            if cls in self.class_to_id:
+                                obj_id = int(self.class_to_id[cls])
+                                if obj_id not in allowed_ids:
+                                    allowed_ids.append(obj_id)
+
+                    else:
+                        target_class = data.get("class") or data.get("target_class")
+
             except Exception:
+                # Backward compatibility:
+                # raw class name, "nearest", etc.
                 if payload.lower() not in {"nearest", "object", "trigger", "capture", "1", "true"}:
                     target_class = payload
+
+        if allowed_ids is not None and len(allowed_ids) == 0:
+            allowed_ids = None
 
         if target_class is not None:
             target_class = str(target_class).strip()
@@ -655,19 +686,27 @@ class MixedPoseVisionNode(Node):
 
         self._object_trigger_pending = True
         self._object_trigger_class = target_class
+        self._object_trigger_allowed_ids = allowed_ids
         self._object_trigger_seq += 1
         self.get_logger().info(
-            f"[OBJECT_TRIGGER] seq={self._object_trigger_seq} target_class={target_class or 'nearest'}"
+            f"[OBJECT_TRIGGER] seq={self._object_trigger_seq} "
+            f"target_class={target_class or 'nearest'} "
+            f"allowed_ids={allowed_ids if allowed_ids is not None else 'all'}"
         )
 
-    def _consume_object_trigger(self) -> Tuple[bool, Optional[str], int]:
+    def _consume_object_trigger(self) -> Tuple[bool, Optional[str], Optional[List[int]], int]:
         if not self._object_trigger_pending:
-            return False, None, self._object_trigger_seq
+            return False, None, None, self._object_trigger_seq
+
         target_class = self._object_trigger_class
+        allowed_ids = self._object_trigger_allowed_ids
         seq = self._object_trigger_seq
+
         self._object_trigger_pending = False
         self._object_trigger_class = None
-        return True, target_class, seq
+        self._object_trigger_allowed_ids = None
+
+        return True, target_class, allowed_ids, seq
 
     def _read_aligned_rgbd(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         frames = self.pipeline.wait_for_frames()
@@ -687,13 +726,14 @@ class MixedPoseVisionNode(Node):
         display = color.copy()
 
         if self.mode == "object":
-            triggered, target_class, trigger_seq = self._consume_object_trigger()
+            triggered, target_class, allowed_ids, trigger_seq = self._consume_object_trigger()
             objects, status = self._process_object_mode(
                 color=color,
                 depth=depth,
                 display=display,
                 run_fp=triggered,
                 requested_class=target_class,
+                requested_allowed_ids=allowed_ids,
                 trigger_seq=trigger_seq,
             )
             # Object 6D response is published only for an explicit trigger.
@@ -769,12 +809,14 @@ class MixedPoseVisionNode(Node):
         display,
         run_fp: bool,
         requested_class: Optional[str],
+        requested_allowed_ids: Optional[List[int]],
         trigger_seq: int,
     ) -> Tuple[List[Dict], Dict]:
         status = {
             "triggered": bool(run_fp),
             "trigger_seq": int(trigger_seq),
             "requested_class": requested_class,
+            "requested_allowed_ids": requested_allowed_ids,
             "status": "preview" if not run_fp else "pending",
         }
         trigger_text = "TRIGGERED" if run_fp else "WAIT_TRIGGER"
@@ -801,10 +843,25 @@ class MixedPoseVisionNode(Node):
             status["message"] = "no object detected"
             return [], status
 
-        # 2) trigger 대상 선택용 detection list. requested_class가 있으면 그 class 중 nearest.
+        # 2) trigger 대상 선택용 detection list.
+        #    requested_allowed_ids가 있으면 0인 물체는 제외하고,
+        #    1인 물체들 중 depth가 가장 가까운 detection을 선택한다.
         target_detections = raw_detections
-        if requested_class:
-            target_detections = [d for d in raw_detections if d["class_name"] == requested_class]
+        if requested_allowed_ids is not None:
+            allowed_ids_set = {int(v) for v in requested_allowed_ids}
+            target_detections = [
+                d for d in raw_detections
+                if d["class_name"] in self.class_to_id
+                and int(self.class_to_id[d["class_name"]]) in allowed_ids_set
+            ]
+        elif requested_class:
+            target_detections = [
+                d for d in raw_detections
+                if d["class_name"] == requested_class
+            ]
+
+        # raw_detections is already sorted by depth, but sort again after filtering.
+        target_detections.sort(key=lambda d: d["depth_med"])
         status["detected_count"] = len(target_detections)
 
         # 3) 우선 전체 YOLO detection을 항상 그림.
@@ -835,7 +892,10 @@ class MixedPoseVisionNode(Node):
         # 5) trigger가 들어왔는데 요청 class가 현재 안 보이면, 전체 preview는 유지하고 실패 반환.
         if not target_detections:
             status["status"] = "no_detection"
-            status["message"] = f"requested class not detected: {requested_class}"
+            if requested_allowed_ids is not None:
+                status["message"] = f"no allowed object detected: allowed_ids={requested_allowed_ids}"
+            else:
+                status["message"] = f"requested class not detected: {requested_class}"
             return [], status
 
         # 6) FoundationPose는 선택된 1개 target만 수행한다.
@@ -911,7 +971,12 @@ class MixedPoseVisionNode(Node):
             "track_refine_frames": int(refined_frames),
             "priority": {
                 "selected": True,
-                "reason": "nearest_depth" if requested_class is None else "requested_class_nearest_depth",
+                "reason": (
+                    "allowed_ids_nearest_depth"
+                    if requested_allowed_ids is not None
+                    else ("nearest_depth" if requested_class is None else "requested_class_nearest_depth")
+                ),
+                "allowed_ids": requested_allowed_ids,
                 "depth_median_m": round(float(det["depth_med"]), 4),
                 "detected_count": len(target_detections),
                 "detected_count_raw": int(status["detected_count_raw"]),
@@ -933,6 +998,7 @@ class MixedPoseVisionNode(Node):
 
         status["status"] = "success"
         status["selected_class"] = class_name
+        status["selected_id"] = int(self.class_to_id[class_name])
         status["selected_depth_m"] = round(float(det["depth_med"]), 4)
         self.get_logger().info(
             f"[OBJECT_6D] seq={trigger_seq} success class={class_name} "

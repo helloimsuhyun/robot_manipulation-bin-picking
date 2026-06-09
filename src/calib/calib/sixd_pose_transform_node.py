@@ -2,9 +2,18 @@
 1. 제어부 트리거 (촬영 위치 TCP 좌표)
 peg trigger input:
 [
-  object_id,
+  use_cylinder, use_hole, use_cross,
   tcp_x_mm, tcp_y_mm, tcp_z_mm, tcp_rx_deg, tcp_ry_deg, tcp_rz_deg
 ]
+
+Object id mapping:
+  0: cylinder
+  1: hole
+  2: cross
+
+The first three values are 0/1 flags.
+Objects with flag 0 are excluded.
+Among objects with flag 1, the vision node runs 6D pose only for the nearest detected object.
 
 hole trigger input remains unchanged:
 [
@@ -491,8 +500,11 @@ class ObjectPoseTransformNode(Node):
     Input:
         /manipulation/trigger_peg:
             std_msgs/Float64MultiArray
-            data = [object_id, x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg]
-            object_id is mapped to class name and relayed to the 6D pose trigger topic.
+            data = [use_cylinder, use_hole, use_cross, x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg]
+            The first three values are 0/1 flags for object ids:
+                0: cylinder, 1: hole, 2: cross.
+            Objects with flag 0 are excluded.
+            The allowed ids are relayed to the 6D pose trigger topic.
 
         /object_poses:
             Object detections from mixed_pose_vision_node.
@@ -510,9 +522,9 @@ class ObjectPoseTransformNode(Node):
     Output:
         /vision/peg_targets:
             Success: 7 floats:
-                [object_id, tcp_x_mm, tcp_y_mm, tcp_z_mm, tcp_rx_deg, tcp_ry_deg, tcp_rz_deg]
+                [selected_object_id, tcp_x_mm, tcp_y_mm, tcp_z_mm, tcp_rx_deg, tcp_ry_deg, tcp_rz_deg]
 
-            Failure / requested object pose not available: variable-length id list:
+            Failure / requested/allowed object pose not available: variable-length id list:
                 [currently_visible_object_id_0, currently_visible_object_id_1, ...]
 
             Therefore the controller can branch by len(data):
@@ -653,8 +665,8 @@ class ObjectPoseTransformNode(Node):
 
         self.get_logger().info(
             "ObjectPoseTransformNode ready. "
-            "peg trigger=/manipulation/trigger_peg: [object_id, tcp_pose6]; "
-            "object output=/vision/peg_targets: success len=7 [object_id, tcp_moveL_pose6], failure len!=7 [visible_ids]; "
+            "peg trigger=/manipulation/trigger_peg: [use_cylinder, use_hole, use_cross, tcp_pose6]; "
+            "object output=/vision/peg_targets: success len=7 [selected_object_id, tcp_moveL_pose6], failure len!=7 [visible_ids]; "
             "insert output=/vision/hole_targets: [x_mm, y_mm, yaw_deg, id]."
         )
 
@@ -684,16 +696,25 @@ class ObjectPoseTransformNode(Node):
         self.detect_mode_pub.publish(msg)
         self.get_logger().info(f"request detect_mode: {mode}")
 
-    def publish_object_6d_trigger(self, object_idx: int):
-        class_name = self.class_name_from_id(object_idx)
+    def publish_object_6d_trigger(self, allowed_object_ids: List[int]):
+        allowed_object_ids = [int(v) for v in allowed_object_ids]
+        allowed_classes = [self.class_name_from_id(v) for v in allowed_object_ids]
+
         msg = String()
-        msg.data = class_name
+        msg.data = json.dumps(
+            {
+                "allowed_ids": allowed_object_ids,
+                "allowed_classes": allowed_classes,
+            },
+            ensure_ascii=False,
+        )
         self.object_6d_trigger_pub.publish(msg)
+
         self.get_logger().info(
             f"request object 6D pose: topic={self.object_6d_trigger_topic}, "
-            f"id={object_idx}, class={class_name}"
+            f"allowed_ids={allowed_object_ids}, allowed_classes={allowed_classes}"
         )
-        return class_name
+        return allowed_classes
 
     def class_name_from_id(self, object_idx: int) -> str:
         if int(object_idx) not in self.id_to_class:
@@ -1023,7 +1044,7 @@ class ObjectPoseTransformNode(Node):
         self,
         obj: Dict[str, Any],
         base_T_ee: np.ndarray,
-        requested_object_idx: Optional[int] = None,
+        allowed_object_ids: Optional[List[int]] = None,
     ) -> Optional[Dict[str, Any]]:
         cls = str(obj.get("class", ""))
         conf = float(obj.get("confidence", 0.0))
@@ -1035,8 +1056,10 @@ class ObjectPoseTransformNode(Node):
             return None
 
         obj_id = int(self.class_to_id[cls])
-        if requested_object_idx is not None and int(requested_object_idx) != -1 and obj_id != int(requested_object_idx):
-            return None
+        if allowed_object_ids is not None:
+            allowed_object_ids = [int(v) for v in allowed_object_ids]
+            if obj_id not in allowed_object_ids:
+                return None
 
         try:
             # FoundationPose/CAD raw object pose in camera frame.
@@ -1163,6 +1186,7 @@ class ObjectPoseTransformNode(Node):
                 "class": cls,
                 "id": obj_id,
                 "confidence": conf,
+                "source_depth_m": self.object_source_depth_m(obj),
                 "x": float(p[0]),
                 "y": float(p[1]),
                 "z": float(p[2]),
@@ -1241,13 +1265,26 @@ class ObjectPoseTransformNode(Node):
         yaw_deg = np.degrees(yaw_rad)
         return float((yaw_deg + 180.0) % 360.0 - 180.0)
 
-    def make_pose6_targets_from_objects(self, objects, base_T_ee, requested_object_idx=None):
+    @staticmethod
+    def object_source_depth_m(obj: Dict[str, Any]) -> float:
+        """Depth median from vision JSON, used only for robust nearest fallback."""
+        try:
+            priority = obj.get("priority", {})
+            if isinstance(priority, dict) and "depth_median_m" in priority:
+                return float(priority["depth_median_m"])
+            if "depth_median_m" in obj:
+                return float(obj["depth_median_m"])
+        except Exception:
+            pass
+        return float("inf")
+
+    def make_pose6_targets_from_objects(self, objects, base_T_ee, allowed_object_ids=None):
         targets = []
         for obj in objects:
             target = self.object_to_pose6_target_dict(
                 obj,
                 base_T_ee,
-                requested_object_idx=requested_object_idx,
+                allowed_object_ids=allowed_object_ids,
             )
             if target is not None:
                 targets.append(target)
@@ -1324,19 +1361,34 @@ class ObjectPoseTransformNode(Node):
     # ============================================================
 
     @staticmethod
-    def parse_peg_trigger_data(trigger_msg) -> Tuple[int, np.ndarray]:
+    def parse_peg_trigger_data(trigger_msg) -> Tuple[List[int], np.ndarray]:
         data = np.asarray(trigger_msg.data, dtype=np.float64).reshape(-1)
-        if data.size < 7:
+        if data.size < 9:
             raise ValueError(
                 "peg trigger data must be "
-                "[object_id, x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg]. "
+                "[use_cylinder, use_hole, use_cross, "
+                "x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg]. "
                 f"got {data.size} values"
             )
 
-        object_idx = int(round(float(data[0])))
-        base_T_ee = pose6_mm_deg_to_T_mm(data[1:7])
+        use_flags = [int(round(float(v))) for v in data[:3]]
+        for flag in use_flags:
+            if flag not in (0, 1):
+                raise ValueError(
+                    "peg trigger use flags must be 0 or 1: "
+                    f"[use_cylinder, use_hole, use_cross]={use_flags}"
+                )
+
+        allowed_object_ids = [obj_id for obj_id, flag in enumerate(use_flags) if flag == 1]
+        if not allowed_object_ids:
+            raise ValueError(
+                "peg trigger must enable at least one object. "
+                "example: [1, 0, 1, tcp_x, tcp_y, tcp_z, tcp_rx, tcp_ry, tcp_rz]"
+            )
+
+        base_T_ee = pose6_mm_deg_to_T_mm(data[3:9])
         validate_T(base_T_ee, name="base_T_ee")
-        return object_idx, base_T_ee
+        return allowed_object_ids, base_T_ee
 
     def schedule_once(self, delay_sec: float, timer_attr: str, callback):
         delay_sec = max(float(delay_sec), 0.0)
@@ -1359,30 +1411,32 @@ class ObjectPoseTransformNode(Node):
             return
 
         try:
-            object_idx, _ = self.parse_peg_trigger_data(trigger_msg)
-            self.class_name_from_id(object_idx)
+            allowed_object_ids, _ = self.parse_peg_trigger_data(trigger_msg)
+            for object_idx in allowed_object_ids:
+                self.class_name_from_id(object_idx)
         except Exception as e:
             self.get_logger().warn(f"invalid peg trigger: {e}")
             return
 
         self.pending_trigger_msg = trigger_msg
-        self.pending_object_idx = object_idx
+        self.pending_object_idx = allowed_object_ids
         self.pending_task = "peg_settling"
 
         self.publish_detect_mode("object")
 
         delay_sec = float(self.get_parameter("detect_mode_settle_sec").value)
         self.get_logger().info(
-            f"peg trigger accepted: switch detect_mode=object, "
-            f"wait {delay_sec:.3f}s, then send object 6D trigger"
+            f"peg trigger accepted: allowed_ids={allowed_object_ids}, "
+            f"switch detect_mode=object, wait {delay_sec:.3f}s, "
+            f"then send object 6D trigger"
         )
         self.schedule_once(
             delay_sec,
             "object_trigger_delay_timer",
-            lambda: self.finish_peg_settle_and_trigger_object(object_idx),
+            lambda: self.finish_peg_settle_and_trigger_object(allowed_object_ids),
         )
 
-    def finish_peg_settle_and_trigger_object(self, object_idx: int):
+    def finish_peg_settle_and_trigger_object(self, allowed_object_ids: List[int]):
         if self.pending_task != "peg_settling":
             self.get_logger().warn(
                 f"skip delayed object 6D trigger: pending_task={self.pending_task}"
@@ -1390,7 +1444,7 @@ class ObjectPoseTransformNode(Node):
             return
 
         self.pending_task = "peg_wait_object"
-        self.publish_object_6d_trigger(object_idx)
+        self.publish_object_6d_trigger(allowed_object_ids)
 
     def hole_trigger_callback(self, trigger_msg):
         if self.pending_task is not None:
@@ -1424,18 +1478,18 @@ class ObjectPoseTransformNode(Node):
         self.get_logger().info("hole trigger: now accepting next /insert_poses message")
 
     def collect_peg_object_frame(self):
-        object_idx, base_T_ee = self.parse_peg_trigger_data(self.pending_trigger_msg)
+        allowed_object_ids, base_T_ee = self.parse_peg_trigger_data(self.pending_trigger_msg)
         if self.pending_object_idx is not None:
-            object_idx = int(self.pending_object_idx)
+            allowed_object_ids = [int(v) for v in self.pending_object_idx]
 
         targets = self.make_pose6_targets_from_objects(
             self.latest_objects,
             base_T_ee,
-            requested_object_idx=object_idx,
+            allowed_object_ids=allowed_object_ids,
         )
 
         self.get_logger().info(
-            f"[PEG-OBJECT] requested_id={object_idx}, "
+            f"[PEG-OBJECT] allowed_ids={allowed_object_ids}, "
             f"targets={len(targets)}, "
             f"visible_ids={self.latest_object_available_ids}, "
             f"perception_status={self.latest_object_status}"
@@ -1446,14 +1500,21 @@ class ObjectPoseTransformNode(Node):
                 publisher=self.peg_pub,
                 topic_name=self.peg_output_topic,
                 visible_ids=self.latest_object_available_ids,
-                requested_id=object_idx,
+                requested_id=None,
                 label="PEG-OBJECT",
             )
             return
 
-        # requested_object_idx already filters the requested class/id.
-        # If multiple detections remain, use the highest-confidence target.
-        target = max(targets, key=lambda t: float(t["confidence"]))
+        # Vision normally returns one nearest allowed object.
+        # If multiple objects are received for backward compatibility, choose nearest depth first,
+        # then higher confidence as a tie-breaker.
+        target = min(
+            targets,
+            key=lambda t: (
+                float(t.get("source_depth_m", float("inf"))),
+                -float(t.get("confidence", 0.0)),
+            ),
+        )
 
         self.publish_object_target_once(
             publisher=self.peg_pub,
@@ -1708,6 +1769,7 @@ class ObjectPoseTransformNode(Node):
             "class": target["class"],
             "id": target["id"],
             "confidence": round(float(target["confidence"]), 3),
+            "source_depth_m": target.get("source_depth_m", None),
             "target_frame": target["target_frame"],
             "selected_grasp": target.get("selected_grasp_name", None),
             "selected_yaw_deg": target.get("selected_grasp_yaw_deg", None),
