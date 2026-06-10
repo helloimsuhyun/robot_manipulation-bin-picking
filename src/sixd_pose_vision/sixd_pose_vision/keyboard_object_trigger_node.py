@@ -2,19 +2,17 @@
 """
 Keyboard trigger node for object 6D pose capture + mode switching.
 
+Default trigger_topic is matched to mixed_pose_vision.launch.py:
+  /manipulation/object_6d_trigger
+
 Keys:
   o          : publish "object" to /detect_mode
   i          : publish "insert" to /detect_mode
-
-  c or SPACE : publish "object" mode + "nearest" to /object_6d_trigger
+  c or SPACE : publish "object" mode + "nearest" trigger
   1          : publish "object" mode + "cross"
   2          : publish "object" mode + "cylinder"
   3          : publish "object" mode + "hole"
-
   q or ESC   : quit
-
-Run:
-  ros2 run sixd_pose_vision keyboard_object_trigger_node
 """
 
 import sys
@@ -31,7 +29,7 @@ class KeyboardObjectTriggerNode(Node):
     def __init__(self):
         super().__init__("keyboard_object_trigger_node")
 
-        self.declare_parameter("trigger_topic", "/object_6d_trigger")
+        self.declare_parameter("trigger_topic", "/manipulation/object_6d_trigger")
         self.declare_parameter("detect_mode_topic", "/detect_mode")
         self.declare_parameter("default_trigger_data", "nearest")
 
@@ -98,28 +96,21 @@ class KeyboardObjectTriggerNode(Node):
         if key is None:
             return
 
-        if key == "o" or key == "O":
+        if key in ("o", "O"):
             self._publish_mode("object")
-
-        elif key == "i" or key == "I":
+        elif key in ("i", "I"):
             self._publish_mode("insert")
-
         elif key in ("c", "C", " "):
             self._publish_trigger(self.default_trigger_data, force_object_mode=True)
-
         elif key == "1":
             self._publish_trigger("cross", force_object_mode=True)
-
         elif key == "2":
             self._publish_trigger("cylinder", force_object_mode=True)
-
         elif key == "3":
             self._publish_trigger("hole", force_object_mode=True)
-
         elif key in ("q", "Q", "\x1b"):
             self.get_logger().info("quit requested")
             rclpy.shutdown()
-
         else:
             self.get_logger().warn(f"unknown key: {repr(key)}")
 
@@ -135,7 +126,6 @@ class KeyboardObjectTriggerNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = KeyboardObjectTriggerNode()
-
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

@@ -327,6 +327,76 @@ def canonicalize_xy_flatter_as_x(
     }
     return T, info
 
+
+def compute_centered_axis_tilt_info(
+    T: np.ndarray,
+    up: np.ndarray = np.array([0, 0, 1], dtype=np.float64),
+) -> Dict[str, Any]:
+    """
+    centered/safe object frame의 각 축이 world XY 평면 또는 world +Z와 이루는 각도를 계산한다.
+
+    x_tilt_ground_deg / y_tilt_ground_deg:
+        각 축이 world XY 평면에서 얼마나 들렸는지 [deg].
+        0 deg이면 완전히 XY 평면에 평행하고, 90 deg이면 world Z 방향이다.
+    """
+    T = np.asarray(T, dtype=np.float64).reshape(4, 4)
+    validate_T(T, name="compute_centered_axis_tilt_info")
+
+    up = normalize_vec(up, name="tilt_info_up")
+    R = orthonormalize_R(T[:3, :3])
+    p = T[:3, 3]
+
+    x_axis = R[:, 0]
+    y_axis = R[:, 1]
+    z_axis = R[:, 2]
+
+    x_dot_up = float(np.dot(x_axis, up))
+    y_dot_up = float(np.dot(y_axis, up))
+    z_dot_up = float(np.dot(z_axis, up))
+
+    x_tilt_ground_deg = float(
+        np.degrees(np.arcsin(np.clip(abs(x_dot_up), 0.0, 1.0)))
+    )
+    y_tilt_ground_deg = float(
+        np.degrees(np.arcsin(np.clip(abs(y_dot_up), 0.0, 1.0)))
+    )
+    z_tilt_up_deg = float(
+        np.degrees(np.arccos(np.clip(z_dot_up, -1.0, 1.0)))
+    )
+
+    return {
+        "p": p,
+        "x_axis": x_axis,
+        "y_axis": y_axis,
+        "z_axis": z_axis,
+        "x_dot_up": x_dot_up,
+        "y_dot_up": y_dot_up,
+        "z_dot_up": z_dot_up,
+        "x_tilt_ground_deg": x_tilt_ground_deg,
+        "y_tilt_ground_deg": y_tilt_ground_deg,
+        "z_tilt_up_deg": z_tilt_up_deg,
+    }
+
+
+def log_centered_axis_tilt(logger, label: str, cls: str, tilt_info: Dict[str, Any]):
+    p = tilt_info["p"]
+    x_axis = tilt_info["x_axis"]
+    y_axis = tilt_info["y_axis"]
+    z_axis = tilt_info["z_axis"]
+    logger.info(
+        f"[{label}] cls={cls} "
+        f"p=[{p[0]:+.1f}, {p[1]:+.1f}, {p[2]:+.1f}]mm "
+        f"x=[{x_axis[0]:+.3f}, {x_axis[1]:+.3f}, {x_axis[2]:+.3f}] "
+        f"y=[{y_axis[0]:+.3f}, {y_axis[1]:+.3f}, {y_axis[2]:+.3f}] "
+        f"z=[{z_axis[0]:+.3f}, {z_axis[1]:+.3f}, {z_axis[2]:+.3f}] "
+        f"x_dot_up={tilt_info['x_dot_up']:+.3f} "
+        f"y_dot_up={tilt_info['y_dot_up']:+.3f} "
+        f"z_dot_up={tilt_info['z_dot_up']:+.3f} "
+        f"x_tilt_ground={tilt_info['x_tilt_ground_deg']:.2f}deg "
+        f"y_tilt_ground={tilt_info['y_tilt_ground_deg']:.2f}deg "
+        f"z_tilt_up={tilt_info['z_tilt_up_deg']:.2f}deg"
+    )
+
 def object_json_to_cam_T_obj_mm(obj: Dict[str, Any]) -> np.ndarray:
     if "pose_matrix" in obj:
         T = np.asarray(obj["pose_matrix"], dtype=np.float64).reshape(4, 4)
@@ -768,6 +838,10 @@ class SixDPoseTransformTestNode(Node):
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
         global_unit = data.get("unit", "mm")
+        objects = data.get("objects", {}) or {}
+        if not isinstance(objects, dict):
+            raise ValueError("object_grasp_yaml: 'objects' must be a dict.")
+
         cfg: Dict[str, Dict[str, Any]] = {}
 
         def _pick(obj_data, keys, default):
@@ -780,40 +854,61 @@ class SixDPoseTransformTestNode(Node):
                     return matrix_from_data(blk, unit=obj_data.get("unit", global_unit))
             return default.copy()
 
-        for name, obj_data in (data.get("objects", {}) or {}).items():
+        for name, obj_data in objects.items():
             obj_data = obj_data or {}
+            if not isinstance(obj_data, dict):
+                raise ValueError(f"object_grasp_yaml: objects.{name} must be a dict.")
+
+            # 1번 코드와 동일: raw/CAD object frame -> centered object frame
             raw_T_center = _pick(
                 obj_data,
-                ["object_to_center"],
+                ["object_to_center", "object_to_canonical", "object_to_grasp"],
                 np.eye(4, dtype=np.float64),
             )
 
+            # centered object frame -> final TCP goal frame
             center_T_tcp = _pick(
                 obj_data,
-                ["centered_object_to_tcp"],
+                ["centered_object_to_tcp", "center_to_tcp", "canonical_to_tcp", "object_center_to_tcp"],
                 np.eye(4, dtype=np.float64),
             )
+
             cfg[str(name)] = {
                 "raw_object_T_centered_object": raw_T_center,
-                "centered_object_T_tcp_goal":   center_T_tcp,
+                "centered_object_T_tcp_goal": center_T_tcp,
                 "symmetry": obj_data.get("symmetry", {}) or {},
+                "tilted_grasp": obj_data.get("tilted_grasp", {}) or {},
+                "cylinder_yaw_search": obj_data.get("cylinder_yaw_search", {}) or {},
             }
         self.get_logger().info(f"[YAML] loaded: {path}")
         return cfg
 
-    def _get_transforms(self, cls: str) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    def _get_transforms(
+        self,
+        cls: str,
+    ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
         base = canonical_object_name(cls)
         item = self.grasp_cfg.get(cls) or self.grasp_cfg.get(base) or {
             "raw_object_T_centered_object": np.eye(4, dtype=np.float64),
-            "centered_object_T_tcp_goal":   np.eye(4, dtype=np.float64),
+            "centered_object_T_tcp_goal": np.eye(4, dtype=np.float64),
             "symmetry": {},
+            "tilted_grasp": {},
+            "cylinder_yaw_search": {},
         }
-        raw_T_c   = np.asarray(item["raw_object_T_centered_object"], dtype=np.float64).reshape(4, 4)
-        center_T_tcp = np.asarray(item["centered_object_T_tcp_goal"],    dtype=np.float64).reshape(4, 4)
+        raw_T_c = np.asarray(item["raw_object_T_centered_object"], dtype=np.float64).reshape(4, 4)
+        center_T_tcp = np.asarray(item["centered_object_T_tcp_goal"], dtype=np.float64).reshape(4, 4)
         symmetry = item.get("symmetry", {}) or {}
-        validate_T(raw_T_c,      name=f"raw_T_center[{cls}]")
+        tilted_grasp = item.get("tilted_grasp", {}) or {}
+        cylinder_yaw_search = item.get("cylinder_yaw_search", {}) or {}
+        validate_T(raw_T_c, name=f"raw_T_center[{cls}]")
         validate_T(center_T_tcp, name=f"center_T_tcp[{cls}]")
-        return raw_T_c.copy(), center_T_tcp.copy(), dict(symmetry)
+        return (
+            raw_T_c.copy(),
+            center_T_tcp.copy(),
+            dict(symmetry),
+            dict(tilted_grasp),
+            dict(cylinder_yaw_search),
+        )
 
     def _make_symmetric_grasp_candidates(
         self,
@@ -933,7 +1028,15 @@ class SixDPoseTransformTestNode(Node):
         obj: Dict[str, Any],
         base_T_ee: np.ndarray,
     ) -> Optional[Dict[str, Any]]:
-        cls  = str(obj.get("class", ""))
+        """
+        1번 코드의 object pose -> centered object -> safe centered object -> TCP goal 로직을
+        테스트 노드에 그대로 이식한 버전.
+
+        테스트 노드 차이점:
+          - base_T_ee는 trigger TCP가 아니라, /object_poses 수신 시점에 로봇에서 직접 쿼리한 현재 TCP이다.
+          - publish는 하지 않고 target dict를 반환해서 matplotlib 시각화에 사용한다.
+        """
+        cls = str(obj.get("class", ""))
         conf = float(obj.get("confidence", 0.0))
 
         if conf < self.min_confidence:
@@ -943,18 +1046,28 @@ class SixDPoseTransformTestNode(Node):
             self.get_logger().warn(f"[SKIP] unknown class: {cls}")
             return None
 
+        obj_id = int(self.class_to_id[cls])
+
         try:
-            # cam → base 변환
-            cam_T_obj   = object_json_to_cam_T_obj_mm(obj)
-            base_T_raw  = base_T_ee @ self.ee_T_cam @ cam_T_obj
-            validate_T(base_T_raw, name=f"base_T_raw[{cls}]")
+            # 1. FoundationPose/CAD raw object pose in camera frame.
+            cam_T_obj = object_json_to_cam_T_obj_mm(obj)
 
-            # YAML 오프셋
-            raw_T_center, center_T_tcp_nominal, symmetry = self._get_transforms(cls)
-            base_T_center = base_T_raw @ raw_T_center
-            validate_T(base_T_center, name=f"base_T_center[{cls}]")
+            # 2. 현재 TCP/EE pose + hand-eye + camera object pose.
+            #    1번 코드의 base_T_ee @ ee_T_cam @ cam_T_obj와 동일한 변환식이다.
+            base_T_obj_raw = base_T_ee @ self.ee_T_cam @ cam_T_obj
+            validate_T(base_T_obj_raw, name=f"base_T_obj_raw[{cls}]")
 
-            # Z-up defense
+            # 3. YAML transform 로드:
+            #    raw object/CAD frame -> centered object frame
+            #    centered object frame -> nominal TCP goal frame
+            raw_T_center, center_T_tcp_nominal, symmetry, tilted_grasp_cfg, cylinder_yaw_cfg = (
+                self._get_transforms(cls)
+            )
+
+            base_T_center = base_T_obj_raw @ raw_T_center
+            validate_T(base_T_center, name=f"base_T_centered_object[{cls}]")
+
+            # 4. Z-up defense: object +Z가 world +Z에 더 가깝도록 보정.
             axis_info = None
             if bool(self.get_parameter("canonicalize_object_axes").value):
                 base_T_center, axis_info = defend_centered_object_z_up(
@@ -963,15 +1076,19 @@ class SixDPoseTransformTestNode(Node):
                 )
                 if axis_info["z_flipped"]:
                     self.get_logger().info(
-                        f"[DEFENSE] z_flipped cls={cls} "
-                        f"before={axis_info['before_dot_up']} "
-                        f"after={axis_info['after_dot_up']}"
+                        f"[Z_DEFENSE] cls={cls} z_flipped={axis_info['z_flipped']} "
+                        f"keep_dot_up={axis_info.get('keep_dot_up')} "
+                        f"flip_dot_up={axis_info.get('flip_dot_up')} "
+                        f"after_dot_up={axis_info['after_dot_up']}"
                     )
 
-            # X/Y 평면 방어:
-            # object X/Y 중 월드 XY 평면에 더 평행한 축을 object +X로 선택한다.
-            # 패러럴 그리퍼가 바닥 쪽으로 가파르게 박히는 방향을 피하기 위한 canonicalization.
+            # 5. XY_FLAT + hole/cross tilted branch.
             xy_info = None
+            tilted_grasp_used = False
+            tilted_grasp_reason = ""
+            tilted_pre_yaw_deg = 0.0
+            tilt_info = compute_centered_axis_tilt_info(base_T_center)
+
             if bool(self.get_parameter("canonicalize_xy_flatter_as_x").value):
                 base_T_center, xy_info = canonicalize_xy_flatter_as_x(
                     base_T_center,
@@ -986,26 +1103,145 @@ class SixDPoseTransformTestNode(Node):
                     f"x_flat_after={xy_info['x_flatness_after']:.3f}"
                 )
 
-                # 선택된 X축도 너무 수직이면 pose 자체가 불안정하다고 보고 skip
+                tilt_info = compute_centered_axis_tilt_info(base_T_center)
+                log_centered_axis_tilt(
+                    self.get_logger(),
+                    "CENTERED_OBJECT_SAFE",
+                    cls,
+                    tilt_info,
+                )
+
+                # cylinder는 제외. hole/cross만 tilted grasp branch 허용.
+                tilted_enable = (
+                    bool(tilted_grasp_cfg.get("enable", False))
+                    and canonical_object_name(cls) != "cylinder"
+                )
+                tilted_threshold_deg = float(tilted_grasp_cfg.get("x_tilt_threshold_deg", 999.0))
+                tilted_pre_yaw_deg = float(tilted_grasp_cfg.get("pre_yaw_deg", 45.0))
+
+                if tilted_enable and tilt_info["x_tilt_ground_deg"] >= tilted_threshold_deg:
+                    before_x_tilt = float(tilt_info["x_tilt_ground_deg"])
+
+                    # centered object local +Z 기준 pre_yaw_deg 회전.
+                    base_T_center = base_T_center @ T_rot_z_deg(tilted_pre_yaw_deg)
+                    validate_T(base_T_center, name=f"base_T_centered_object_tilted_yaw[{cls}]")
+
+                    # 회전 후 다시 XY_FLAT 수행.
+                    base_T_center, xy_info_2 = canonicalize_xy_flatter_as_x(
+                        base_T_center,
+                        swap_margin=float(self.get_parameter("canonicalize_xy_swap_margin").value),
+                    )
+                    tilt_info_2 = compute_centered_axis_tilt_info(base_T_center)
+
+                    tilted_grasp_used = True
+                    tilted_grasp_reason = (
+                        f"x_tilt_ground {before_x_tilt:.2f}deg >= "
+                        f"threshold {tilted_threshold_deg:.2f}deg"
+                    )
+
+                    self.get_logger().warn(
+                        f"[TILTED_GRASP_X45] cls={cls} "
+                        f"reason='{tilted_grasp_reason}' "
+                        f"pre_yaw={tilted_pre_yaw_deg:.1f}deg "
+                        f"xy2_swapped={xy_info_2['xy_swapped']} "
+                        f"xy2_selected_x={xy_info_2['selected_x_from']} "
+                        f"x_tilt_before={before_x_tilt:.2f}deg "
+                        f"x_tilt_after={tilt_info_2['x_tilt_ground_deg']:.2f}deg "
+                        f"y_tilt_after={tilt_info_2['y_tilt_ground_deg']:.2f}deg "
+                        f"z_tilt_up_after={tilt_info_2['z_tilt_up_deg']:.2f}deg"
+                    )
+                    log_centered_axis_tilt(
+                        self.get_logger(),
+                        "CENTERED_OBJECT_TILTED_SAFE",
+                        cls,
+                        tilt_info_2,
+                    )
+
+                    tilt_info = tilt_info_2
+                    xy_info = {
+                        **xy_info,
+                        "tilted_xy_swapped": bool(xy_info_2["xy_swapped"]),
+                        "tilted_selected_x_from": str(xy_info_2["selected_x_from"]),
+                        "tilted_x_flatness_after": float(xy_info_2["x_flatness_after"]),
+                        "tilted_y_flatness_after": float(xy_info_2["y_flatness_after"]),
+                    }
+
                 max_flat = float(self.get_parameter("canonicalize_xy_max_flatness").value)
-                if xy_info["x_flatness_after"] > max_flat:
+                final_x_flatness = abs(float(tilt_info["x_dot_up"]))
+                if final_x_flatness > max_flat:
                     self.get_logger().warn(
                         f"[SKIP] cls={cls}: selected object +X is still too steep. "
-                        f"x_flatness_after={xy_info['x_flatness_after']:.3f} > {max_flat:.3f}"
+                        f"x_flatness_after={final_x_flatness:.3f} > {max_flat:.3f}"
                     )
                     return None
 
-            # 90도 회전 대칭 grasp 후보 생성 후, RB5 마지막 joint 제약으로 필터링
-            grasp_candidates = self._make_symmetric_grasp_candidates(center_T_tcp_nominal, symmetry)
+            # 6. symmetry.yaw_candidates_deg 후보 생성 후 J5 limit 필터링/선택.
+            grasp_candidates = self._make_symmetric_grasp_candidates(
+                center_T_tcp_nominal,
+                symmetry,
+            )
 
             best = None
+            is_cylinder = canonical_object_name(cls) == "cylinder"
+            world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+            # Cylinder-specific policy:
+            #   enable=true  → J5 통과 후보 중 object_x 평평함 우선, 비슷하면 J5 delta 최소
+            #   enable=false → J5 통과 후보 중 J5 delta 최소
+            cyl_yaw_search_enabled = bool(cylinder_yaw_cfg.get("enable", True))
+            cyl_score_axis = str(cylinder_yaw_cfg.get("score_axis", "object_x")).lower()
+            cyl_flat_tolerance_deg = float(cylinder_yaw_cfg.get("flat_tolerance_deg", 3.0))
+
+            def _axis_for_cylinder_score(
+                axis_name: str,
+                base_T_centered: np.ndarray,
+                base_T_tcp: np.ndarray,
+                yaw_deg: float,
+            ) -> np.ndarray:
+                axis_name = str(axis_name).lower()
+
+                object_axis_map = {
+                    "object_x": 0, "+object_x": 0, "center_x": 0, "+center_x": 0,
+                    "centered_object_x": 0, "+centered_object_x": 0,
+                    "object_y": 1, "+object_y": 1, "center_y": 1, "+center_y": 1,
+                    "centered_object_y": 1, "+centered_object_y": 1,
+                    "object_z": 2, "+object_z": 2, "center_z": 2, "+center_z": 2,
+                    "centered_object_z": 2, "+centered_object_z": 2,
+                }
+                tcp_axis_map = {
+                    "tcp_x": 0, "+tcp_x": 0,
+                    "tcp_y": 1, "+tcp_y": 1,
+                    "tcp_z": 2, "+tcp_z": 2,
+                }
+
+                if axis_name in object_axis_map:
+                    # 후보 yaw가 적용된 centered object frame의 축을 평가.
+                    # TCP 축이 아니라 물체/centered-object 축 기준이다.
+                    base_T_centered_yaw = base_T_centered @ T_rot_z_deg(float(yaw_deg))
+                    R_eval = orthonormalize_R(base_T_centered_yaw[:3, :3])
+                    return R_eval[:, object_axis_map[axis_name]]
+
+                if axis_name in tcp_axis_map:
+                    # 실험용 fallback: 최종 TCP frame의 축 평가.
+                    R_eval = orthonormalize_R(base_T_tcp[:3, :3])
+                    return R_eval[:, tcp_axis_map[axis_name]]
+
+                self.get_logger().warn(
+                    f"[CYL_SCORE_AXIS] unknown score_axis='{axis_name}', fallback to object_x"
+                )
+                base_T_centered_yaw = base_T_centered @ T_rot_z_deg(float(yaw_deg))
+                R_eval = orthonormalize_R(base_T_centered_yaw[:3, :3])
+                return R_eval[:, 0]
+
             for cand in grasp_candidates:
                 base_T_goal_cand = base_T_center @ cand["center_T_tcp"]
                 validate_T(base_T_goal_cand, name=f"base_T_goal[{cls}:{cand['name']}]")
 
-                estimated_j5, delta_j5, signed_delta_j5 = self._estimate_last_joint_for_goal(base_T_goal_cand, base_T_ee)
+                estimated_j5, delta_j5, signed_delta_j5 = self._estimate_last_joint_for_goal(
+                    base_T_goal_cand,
+                    base_T_ee,
+                )
 
-                # peg_camera_joint J5 기준 ±last_joint_limit_delta_deg 밖이면 제외
                 if delta_j5 > self.last_joint_limit_delta_deg + 1e-9:
                     self.get_logger().info(
                         f"[J5_SKIP] cls={cls} cand={cand['name']} "
@@ -1017,9 +1253,37 @@ class SixDPoseTransformTestNode(Node):
                     )
                     continue
 
-                # 제약 안쪽 후보 중 reference J5=34.16에 가장 가까운 후보 선택
+                axis_tilt_ground_deg = None
                 score = delta_j5
-                if best is None or score < best["score"]:
+                better = False
+
+                if is_cylinder and cyl_yaw_search_enabled:
+                    flat_axis = _axis_for_cylinder_score(
+                        cyl_score_axis,
+                        base_T_center,
+                        base_T_goal_cand,
+                        cand["yaw_deg"],
+                    )
+                    axis_dot_up = abs(float(np.dot(flat_axis, world_up)))
+                    axis_tilt_ground_deg = float(
+                        np.degrees(np.arcsin(np.clip(axis_dot_up, 0.0, 1.0)))
+                    )
+
+                    if best is None:
+                        better = True
+                    else:
+                        best_axis_tilt = float(best.get("axis_tilt_ground_deg", 999.0))
+                        if axis_tilt_ground_deg < best_axis_tilt - cyl_flat_tolerance_deg:
+                            better = True
+                        elif abs(axis_tilt_ground_deg - best_axis_tilt) <= cyl_flat_tolerance_deg:
+                            better = delta_j5 < float(best["delta_j5"])
+                else:
+                    # Non-cylinder, or cylinder_yaw_search.enable=false:
+                    # J5 limit을 통과한 후보 중 J5 delta가 가장 작은 후보 선택.
+                    if best is None or score < best["score"]:
+                        better = True
+
+                if better:
                     best = {
                         "candidate": cand,
                         "base_T_goal": base_T_goal_cand,
@@ -1027,21 +1291,47 @@ class SixDPoseTransformTestNode(Node):
                         "delta_j5": delta_j5,
                         "signed_delta_j5": signed_delta_j5,
                         "score": score,
+                        "axis_tilt_ground_deg": axis_tilt_ground_deg,
+                        "cylinder_score_axis": cyl_score_axis if is_cylinder else "",
+                        "cylinder_flat_tolerance_deg": cyl_flat_tolerance_deg if is_cylinder else 0.0,
                     }
 
-                self.get_logger().info(
-                    f"[J5_CAND] cls={cls} cand={cand['name']} "
-                    f"yaw={cand['yaw_deg']:.1f} "
-                    f"est_J5={estimated_j5:.2f} "
-                    f"signed_delta={signed_delta_j5:.2f} "
-                    f"delta={delta_j5:.2f} "
-                    f"score={score:.2f}"
-                )
+                if is_cylinder:
+                    if cyl_yaw_search_enabled:
+                        self.get_logger().info(
+                            f"[J5_CAND] cls={cls} cand={cand['name']} "
+                            f"yaw={cand['yaw_deg']:.1f} "
+                            f"est_J5={estimated_j5:.2f} "
+                            f"signed_delta={signed_delta_j5:.2f} "
+                            f"delta={delta_j5:.2f} "
+                            f"axis={cyl_score_axis} "
+                            f"axis_tilt_ground={axis_tilt_ground_deg:.2f}deg "
+                            f"flat_tol={cyl_flat_tolerance_deg:.2f}deg"
+                        )
+                    else:
+                        self.get_logger().info(
+                            f"[J5_CAND] cls={cls} cand={cand['name']} "
+                            f"yaw={cand['yaw_deg']:.1f} "
+                            f"est_J5={estimated_j5:.2f} "
+                            f"signed_delta={signed_delta_j5:.2f} "
+                            f"delta={delta_j5:.2f} "
+                            f"score={score:.2f} "
+                            f"cylinder_yaw_search=disabled"
+                        )
+                else:
+                    self.get_logger().info(
+                        f"[J5_CAND] cls={cls} cand={cand['name']} "
+                        f"yaw={cand['yaw_deg']:.1f} "
+                        f"est_J5={estimated_j5:.2f} "
+                        f"signed_delta={signed_delta_j5:.2f} "
+                        f"delta={delta_j5:.2f} "
+                        f"score={score:.2f}"
+                    )
 
             if best is None:
                 self.get_logger().warn(
-                    f"[NO_VALID_GRASP] cls={cls}: "
-                    f"all candidates exceed J5 reference {self.reference_last_joint_deg:.2f} "
+                    f"[NO_VALID_GRASP] cls={cls}: all candidates exceed "
+                    f"J5 reference {self.reference_last_joint_deg:.2f} "
                     f"±{self.last_joint_limit_delta_deg:.1f} deg"
                 )
                 return None
@@ -1049,22 +1339,42 @@ class SixDPoseTransformTestNode(Node):
             selected = best["candidate"]
             base_T_goal = best["base_T_goal"]
             pose6 = T_mm_to_pose6_mm_deg(base_T_goal)
+            p = base_T_goal[:3, 3]
+
+            output_obj_id = obj_id
+            if tilted_grasp_used and bool(tilted_grasp_cfg.get("mark_output_id_negative", True)):
+                output_obj_id = -abs(obj_id)
 
             return {
-                "class":                      cls,
-                "id":                         int(self.class_to_id[cls]),
-                "confidence":                 conf,
-                "target_pose6":               pose6,
-                "target_T":                   base_T_goal,
-                "base_T_obj_raw":             base_T_raw,
+                "class": cls,
+                "id": output_obj_id,
+                "raw_id": obj_id,
+                "tilted_grasp_used": bool(tilted_grasp_used),
+                "tilted_grasp_reason": tilted_grasp_reason,
+                "tilted_pre_yaw_deg": float(tilted_pre_yaw_deg),
+                "confidence": conf,
+                "x": float(p[0]),
+                "y": float(p[1]),
+                "z": float(p[2]),
+                "target_pose6": pose6,
+                "target_T": base_T_goal,
+                "base_T_obj_raw": base_T_obj_raw,
                 "base_T_centered_object_safe": base_T_center,
-                "axis_info":                  axis_info,
-                "xy_info":                    xy_info,
-                "selected_grasp_name":        selected["name"],
-                "selected_grasp_yaw_deg":     float(selected["yaw_deg"]),
-                "estimated_last_joint_deg":   float(best["estimated_j5"]),
-                "last_joint_delta_deg":       float(best["delta_j5"]),
+                "target_frame": "tcp_goal",
+                "axis_info": axis_info,
+                "xy_info": xy_info,
+                "selected_grasp_name": selected["name"],
+                "selected_grasp_yaw_deg": float(selected["yaw_deg"]),
+                "estimated_last_joint_deg": float(best["estimated_j5"]),
+                "last_joint_delta_deg": float(best["delta_j5"]),
                 "last_joint_signed_delta_deg": float(best["signed_delta_j5"]),
+                "selected_axis_tilt_ground_deg": (
+                    None if best.get("axis_tilt_ground_deg") is None
+                    else float(best["axis_tilt_ground_deg"])
+                ),
+                "cylinder_score_axis": str(best.get("cylinder_score_axis", "")),
+                "cylinder_flat_tolerance_deg": float(best.get("cylinder_flat_tolerance_deg", 0.0)),
+                "output_format": "viz_only_id_plus_moveL_pose6_7",
             }
 
         except Exception as e:

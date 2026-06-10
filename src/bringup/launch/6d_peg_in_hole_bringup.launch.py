@@ -1,15 +1,10 @@
 """
 Build / run example:
 
-cd ~/course/robot_manipulation-bin-picking
-rm -rf build/ install/ log/
 colcon build --symlink-install --packages-select sixd_pose_vision calib control bringup
 source /opt/ros/humble/setup.bash
 source install/setup.bash
-
 ros2 launch bringup 6d_peg_in_hole_bringup.launch.py
-
-
 
 source /opt/ros/humble/setup.bash
 python3 src/robot_ex_2026/robot_ex_2026/grip_current.py

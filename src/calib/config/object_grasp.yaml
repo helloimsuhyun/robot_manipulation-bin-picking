@@ -1,10 +1,38 @@
+# 좌표변환 로직
+# - suhyun
+# 1. FoundationPose raw object pose를 받음
+# 2. object_to_center로 raw object frame을 물체 중심 frame으로 보정
+#    - hole(사각형)은 z축 45도 회전 보정으로 x/y축을 모서리 방향에 맞춤
+
+# 3. object +Z축이 아래를 향하면 위쪽을 향하도록 flip
+
+# 4. object x/y축 중 지면과 더 평평한 축을 object +X로 선택
+
+# 5-1. hole/cross:
+#    - object +X가 threshold 이상 기울면 local +Z 기준 45도 회전 후 다시 4번 수행
+#    - 이후 +X / -X 중 J5 limit 통과 + J5 delta 최소 후보 선택
+
+# 5-2. cylinder:
+#    - yaw 후보 0~350 도를 10도 간격으로 생성
+#    - J5 limit 초과 후보 제거
+#    - 남은 후보 중 object +X가 가장 지면과 평평한 후보 선택
+#    - 평평함이 비슷하면 J5 delta 작은 후보 선택
+
+
 unit: mm
 
 objects:
   cylinder:
     symmetry:
       axis: "+z"
-      yaw_candidates_deg: [0.0, 180.0]
+      yaw_candidates_deg: [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0, 130.0, 140.0, 150.0, 160.0, 170.0, 180.0, 190.0, 200.0, 210.0, 220.0, 230.0, 240.0, 250.0, 260.0, 270.0, 280.0, 290.0, 300.0, 310.0, 320.0, 330.0, 340.0, 350.0]
+
+    cylinder_yaw_search:
+      enable: true 
+      # true: J5 limit 통과 후보 중 object_x 평평함 우선 + 비슷하면 J5 delta 최소
+      # false: J5 limit 통과 후보 중 J5 delta가 가장 작은 후보 선택
+      score_axis: "object_x"      
+      flat_tolerance_deg: 3.0
 
     object_to_center:
       unit: mm
@@ -27,7 +55,13 @@ objects:
       axis: "+z"
       yaw_candidates_deg: [0.0, 180.0]
 
-    object_to_center:
+    tilted_grasp:
+      enable: true # tilt 파지 on/off
+      x_tilt_threshold_deg: 20.0
+      pre_yaw_deg: 45.0
+      mark_output_id_negative: true # false면 id만 양수로
+
+    object_to_center: # FDpose/CAD raw object frame -> 중심으로 원점 정렬, 사각형은 모서리로 x/y축 정렬
       unit: mm
       matrix:
         - [ 0.707107, 0.707107, 0.0,  0.0]
@@ -35,7 +69,7 @@ objects:
         - [ 0.0,      0.0,      1.0, 15.0]
         - [ 0.0,      0.0,      0.0,  1.0]
 
-    centered_object_to_tcp:
+    centered_object_to_tcp: # 보정된 물체 좌표 > 패러럴 그리퍼 파지 좌표
       unit: mm
       matrix:
         - [0.707107, 0.0,  0.707107,   0.0]
@@ -47,6 +81,12 @@ objects:
     symmetry:
       axis: "+z"
       yaw_candidates_deg: [0.0, 180.0]
+
+    tilted_grasp:
+      enable: true
+      x_tilt_threshold_deg: 20.0
+      pre_yaw_deg: 45.0
+      mark_output_id_negative: true
 
     object_to_center:
       unit: mm
