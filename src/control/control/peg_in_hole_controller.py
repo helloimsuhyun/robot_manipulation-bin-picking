@@ -1060,6 +1060,8 @@ class PegInHoleController(Node):
             pose[2] = self.ctx.pick_down_target_z_mm + float(offset_mm)
         return pose
 
+    def _normalize_yaw_0_to_90_deg(self, yaw: float) -> float:
+        return float(yaw) % 90.0
 
     def make_tilted_place_pose(self) -> np.ndarray:
         """
@@ -1081,15 +1083,19 @@ class PegInHoleController(Node):
 
         target_pose = self.ctx.current_hole_place_pose.copy()
         target_pose[2] = self.ctx.place_down_target_z_mm
+        target_pose[0] -= 5
 
         base_rx = float(target_pose[3])
         base_ry = float(target_pose[4])
         tilt_deg = float(self.ctx.place_tilt_deg)
 
-        # 네모 peg/object_id=1: yaw +45 deg 보정 후 90도 대칭 범위(0~90)로 접는다.
+        # 십자가에서만 tilt 방향을 따로 쓰기 위한 변수
+        cross_tilt_yaw_deg = None
+
+        # 네모 peg/object_id=1: 기존 로직 그대로 유지
         if self.ctx.current_target_id == 1:
             raw_yaw = float(target_pose[5])
-            corrected_yaw = self._normalize_yaw_0_to_90_deg(raw_yaw + 45.0)
+            corrected_yaw = self._normalize_yaw_0_to_90_deg(raw_yaw - 45.0)
 
             target_pose[0] += 2.0
             target_pose[5] = corrected_yaw
@@ -1097,36 +1103,52 @@ class PegInHoleController(Node):
 
             self.get_logger().info(
                 f"[PLACE SQUARE] apply x offset +2.0 mm, "
-                f"yaw +45 then mod90: {raw_yaw:.3f} -> {target_pose[5]:.3f}, "
+                f"yaw -45 then mod90: {raw_yaw:.3f} -> {target_pose[5]:.3f}, "
                 f"target x={target_pose[0]:.2f}, total tilt={tilt_deg:.2f}deg"
             )
 
-        # 십자가 peg/object_id=2: 90도 대칭 범위(0~90)로 접고,
-        # yaw 방향 XY offset 및 추가 tilt를 적용한다.
+        # 십자가 peg/object_id=2:
+        # - 최종 rz는 기존처럼 raw_yaw % 90 사용
+        # - XY offset도 기존처럼 최종 rz 방향 사용
+        # - tilt 방향만 raw_yaw - 45도 사용
         if self.ctx.current_target_id == 2:
             raw_yaw = float(target_pose[5])
             corrected_yaw = self._normalize_yaw_0_to_90_deg(raw_yaw)
 
-            extra_tilt_deg = 7.0
+            extra_tilt_deg = 12.0
             offset_mm = 10.0
 
             target_pose[5] = corrected_yaw
             tilt_deg += extra_tilt_deg
 
-            yaw_rad = np.deg2rad(target_pose[5])
-            target_pose[0] += offset_mm * np.cos(yaw_rad)
-            target_pose[1] += offset_mm * np.sin(yaw_rad)
+            # 십자가만 tilt 방향을 raw_yaw - 45도로 사용
+            cross_tilt_yaw_deg = raw_yaw - 45.0
+
+            # XY offset은 기존처럼 최종 rz 방향 기준
+            xy_yaw_rad = np.deg2rad(target_pose[5])
+            target_pose[0] += offset_mm * np.cos(xy_yaw_rad)
+            target_pose[1] += offset_mm * np.sin(xy_yaw_rad)
+
+            # 십자가만 4 mm 덜 내려가게 함
             target_pose[2] += 4.0
 
             self.get_logger().info(
-                f"[PLACE CROSS] yaw mod90: {raw_yaw:.3f} -> {target_pose[5]:.3f}, "
+                f"[PLACE CROSS] rz mod90: {raw_yaw:.3f} -> {target_pose[5]:.3f}, "
+                f"tilt yaw=raw_yaw-45={cross_tilt_yaw_deg:.3f}, "
+                f"xy offset yaw={target_pose[5]:.3f}, "
                 f"apply extra tilt +{extra_tilt_deg:.2f}deg, "
                 f"xy yaw offset={offset_mm:.2f}mm, "
                 f"target x={target_pose[0]:.2f}, y={target_pose[1]:.2f}, z={target_pose[2]:.2f}, "
                 f"total tilt={tilt_deg:.2f}deg"
             )
 
-        tilt_yaw_deg = float(target_pose[5])
+        # 십자가만 tilt 방향을 raw_yaw - 45도로 사용
+        # 나머지 원/네모는 기존처럼 target_pose[5] 기준으로 tilt
+        if self.ctx.current_target_id == 2 and cross_tilt_yaw_deg is not None:
+            tilt_yaw_deg = float(cross_tilt_yaw_deg)
+        else:
+            tilt_yaw_deg = float(target_pose[5])
+
         tilt_yaw_rad = np.deg2rad(tilt_yaw_deg)
 
         target_pose[3] = base_rx - tilt_deg * np.sin(tilt_yaw_rad)
@@ -1134,7 +1156,8 @@ class PegInHoleController(Node):
 
         self.get_logger().info(
             f"[PLACE TILT] tilt={tilt_deg:.2f}deg, yaw={tilt_yaw_deg:.2f}deg, "
-            f"base_rpy=[{base_rx:.2f}, {base_ry:.2f}, {tilt_yaw_deg:.2f}], "
+            f"final_rz={target_pose[5]:.2f}deg, "
+            f"base_rpy=[{base_rx:.2f}, {base_ry:.2f}, {target_pose[5]:.2f}], "
             f"tilted_pose={np.round(target_pose, 3)}"
         )
 
