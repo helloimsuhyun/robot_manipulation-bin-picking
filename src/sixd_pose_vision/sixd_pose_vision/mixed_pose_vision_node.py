@@ -29,6 +29,7 @@ ros2 launch sixd_pose_vision mixed_pose_vision.launch.py
 
 import sys
 import json
+import shutil
 import traceback
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -324,6 +325,143 @@ def iou_score(a: np.ndarray, b: np.ndarray) -> float:
     return float(inter / union) if union > 0 else 0.0
 
 
+
+def depth_stats_in_mask(
+    depth_image: np.ndarray,
+    mask_img: np.ndarray,
+    depth_scale: float,
+) -> Dict:
+    """Return detailed depth statistics inside a binary mask.
+
+    Used only for debugging. All depth values are in meters.
+    """
+    if mask_img is None:
+        return {
+            "area_px": 0,
+            "valid_px": 0,
+            "valid_ratio": 0.0,
+            "min": None,
+            "p05": None,
+            "p10": None,
+            "p20": None,
+            "p35": None,
+            "p50": None,
+            "p75": None,
+            "max": None,
+            "spread_p50_p10": None,
+            "spread_p50_p20": None,
+        }
+
+    z = depth_image[mask_img > 0].astype(np.float32) * float(depth_scale)
+    valid_z = z[z > 0]
+
+    area_px = int(np.sum(mask_img > 0))
+    valid_px = int(len(valid_z))
+    valid_ratio = float(valid_px / area_px) if area_px > 0 else 0.0
+
+    if valid_px == 0:
+        return {
+            "area_px": area_px,
+            "valid_px": valid_px,
+            "valid_ratio": round(valid_ratio, 4),
+            "min": None,
+            "p05": None,
+            "p10": None,
+            "p20": None,
+            "p35": None,
+            "p50": None,
+            "p75": None,
+            "max": None,
+            "spread_p50_p10": None,
+            "spread_p50_p20": None,
+        }
+
+    p05 = float(np.percentile(valid_z, 5))
+    p10 = float(np.percentile(valid_z, 10))
+    p20 = float(np.percentile(valid_z, 20))
+    p35 = float(np.percentile(valid_z, 35))
+    p50 = float(np.percentile(valid_z, 50))
+    p75 = float(np.percentile(valid_z, 75))
+
+    return {
+        "area_px": area_px,
+        "valid_px": valid_px,
+        "valid_ratio": round(valid_ratio, 4),
+        "min": round(float(np.min(valid_z)), 4),
+        "p05": round(p05, 4),
+        "p10": round(p10, 4),
+        "p20": round(p20, 4),
+        "p35": round(p35, 4),
+        "p50": round(p50, 4),
+        "p75": round(p75, 4),
+        "max": round(float(np.max(valid_z)), 4),
+        "spread_p50_p10": round(float(p50 - p10), 4),
+        "spread_p50_p20": round(float(p50 - p20), 4),
+    }
+
+
+def save_mask_point_cloud_ply(
+    path: Path,
+    depth_image: np.ndarray,
+    mask_img: np.ndarray,
+    color_image: np.ndarray,
+    intrinsics,
+    depth_scale: float,
+    max_points: int = 30000,
+) -> int:
+    """Save masked RGB-D points as an ASCII PLY file.
+
+    Returns the number of saved points. Coordinates are in the camera frame, meters.
+    """
+    if mask_img is None:
+        return 0
+
+    rows, cols = np.where(mask_img > 0)
+    if len(rows) == 0:
+        return 0
+
+    z = depth_image[rows, cols].astype(np.float32) * float(depth_scale)
+    valid = z > 0
+    rows = rows[valid]
+    cols = cols[valid]
+    z = z[valid]
+
+    if len(z) == 0:
+        return 0
+
+    x = (cols.astype(np.float32) - intrinsics.ppx) * z / intrinsics.fx
+    y = (rows.astype(np.float32) - intrinsics.ppy) * z / intrinsics.fy
+    pts = np.stack([x, y, z], axis=1)
+    bgr = color_image[rows, cols].astype(np.uint8)
+
+    if len(pts) > max_points:
+        idx = np.random.choice(len(pts), size=max_points, replace=False)
+        pts = pts[idx]
+        bgr = bgr[idx]
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(path, "w") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {len(pts)}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write("property uchar red\n")
+        f.write("property uchar green\n")
+        f.write("property uchar blue\n")
+        f.write("end_header\n")
+
+        for p, c in zip(pts, bgr):
+            # color_image is BGR, PLY expects RGB.
+            b, g, r = int(c[0]), int(c[1]), int(c[2])
+            f.write(f"{p[0]:.6f} {p[1]:.6f} {p[2]:.6f} {r} {g} {b}\n")
+
+    return int(len(pts))
+
+
 def get_point_cloud(depth_image: np.ndarray, mask_img: np.ndarray, intrinsics, depth_scale: float) -> Optional[np.ndarray]:
     rows, cols = np.where(mask_img > 0)
     z_vals = depth_image[rows, cols].astype(np.float32) * float(depth_scale)
@@ -463,6 +601,13 @@ class MixedPoseVisionNode(Node):
         self.declare_parameter("fp_debug", 0)
         self.declare_parameter("fp_debug_dir", "/home/choisuhyun/course/robot_manipulation-bin-picking/FoundationPose/debug_ros")
 
+        # Priority/depth debug artifacts.
+        # priority_debug_save=True  -> save debug files every 6D trigger.
+        # priority_debug_save=False -> do not save debug files.
+        # priority_debug_dir is relative to the current execution directory by default.
+        self.declare_parameter("priority_debug_save", True)
+        self.declare_parameter("priority_debug_dir", "debug_priority")
+
         self.foundationpose_repo_path = Path(str(self.get_parameter("foundationpose_repo_path").value)).expanduser()
         self.cad_dir = Path(str(self.get_parameter("cad_dir").value)).expanduser()
         self.template_dir = Path(str(self.get_parameter("template_dir").value)).expanduser()
@@ -482,6 +627,17 @@ class MixedPoseVisionNode(Node):
 
         Path(self.fp_debug_dir).mkdir(parents=True, exist_ok=True)
         self.get_logger().info(f"[FP] debug_dir: {self.fp_debug_dir}")
+
+        self.priority_debug_save = bool(self.get_parameter("priority_debug_save").value)
+        priority_debug_dir_param = Path(str(self.get_parameter("priority_debug_dir").value)).expanduser()
+        if priority_debug_dir_param.is_absolute():
+            self.priority_debug_dir = priority_debug_dir_param
+        else:
+            self.priority_debug_dir = Path.cwd() / priority_debug_dir_param
+        self.priority_debug_dir.mkdir(parents=True, exist_ok=True)
+        self.get_logger().info(
+            f"[PRIORITY_DEBUG] save={self.priority_debug_save} dir={self.priority_debug_dir}"
+        )
 
         self.mesh_alias = {"cross_insert": "cross", "cylinder_insert": "cylinder", "hole_insert": "hole"}
         self.class_to_id = {
@@ -912,6 +1068,216 @@ class MixedPoseVisionNode(Node):
         self.get_logger().info("\n".join(lines))
 
 
+    def _draw_depth_histogram_image(
+        self,
+        z: np.ndarray,
+        title: str = "depth histogram",
+        width: int = 900,
+        height: int = 500,
+        bins: int = 80,
+    ) -> np.ndarray:
+        """Create a simple depth histogram image using only OpenCV."""
+        img = np.full((height, width, 3), 255, dtype=np.uint8)
+
+        z = np.asarray(z, dtype=np.float32)
+        z = z[np.isfinite(z)]
+        z = z[z > 0]
+
+        if len(z) == 0:
+            cv2.putText(img, "No valid depth", (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+            return img
+
+        z_min = float(np.percentile(z, 1))
+        z_max = float(np.percentile(z, 99))
+        if z_max <= z_min:
+            z_min = float(np.min(z))
+            z_max = float(np.max(z)) + 1e-6
+
+        hist, _ = np.histogram(z, bins=bins, range=(z_min, z_max))
+
+        left, right = 70, width - 30
+        top, bottom = 80, height - 70
+        plot_w = right - left
+        plot_h = bottom - top
+
+        cv2.rectangle(img, (left, top), (right, bottom), (0, 0, 0), 1)
+        max_count = int(hist.max()) if hist.max() > 0 else 1
+
+        for i, count in enumerate(hist):
+            x0 = int(left + i * plot_w / bins)
+            x1 = int(left + (i + 1) * plot_w / bins)
+            bar_h = int((count / max_count) * plot_h)
+            y0 = bottom - bar_h
+            cv2.rectangle(img, (x0, y0), (x1, bottom), (80, 80, 80), -1)
+
+        percentiles = {
+            "p05": float(np.percentile(z, 5)),
+            "p10": float(np.percentile(z, 10)),
+            "p20": float(np.percentile(z, 20)),
+            "p35": float(np.percentile(z, 35)),
+            "p50": float(np.percentile(z, 50)),
+        }
+
+        for name, value in percentiles.items():
+            x = int(left + (value - z_min) / max(z_max - z_min, 1e-6) * plot_w)
+            x = int(np.clip(x, left, right))
+            cv2.line(img, (x, top), (x, bottom), (0, 0, 255), 2)
+            cv2.putText(img, f"{name}:{value:.3f}", (x + 3, top + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
+
+        cv2.putText(img, title[:100], (30, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 0), 2)
+        cv2.putText(
+            img,
+            f"range: {z_min:.3f}m ~ {z_max:.3f}m | n={len(z)}",
+            (left, height - 25),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 0, 0),
+            1,
+        )
+        return img
+
+    def _save_priority_debug_artifacts(
+        self,
+        color: np.ndarray,
+        depth: np.ndarray,
+        display: np.ndarray,
+        detections: List[Dict],
+        trigger_seq: int,
+        selected_det: Optional[Dict] = None,
+    ) -> None:
+        """Save per-trigger mask/depth artifacts and overwrite previous files.
+
+        This function intentionally deletes priority_debug_dir every trigger so that
+        debug data does not accumulate across runs.
+        """
+        if not self.priority_debug_save:
+            return
+
+        out_dir = self.priority_debug_dir
+
+        try:
+            if out_dir.exists():
+                shutil.rmtree(out_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            masks_dir = out_dir / "masks"
+            masks_dir.mkdir(parents=True, exist_ok=True)
+
+            cv2.imwrite(str(out_dir / "color.png"), color)
+
+            depth_m = depth.astype(np.float32) * float(self.depth_scale)
+            valid = depth_m > 0
+            if np.any(valid):
+                vmin = float(np.percentile(depth_m[valid], 2))
+                vmax = float(np.percentile(depth_m[valid], 98))
+                depth_norm = np.clip((depth_m - vmin) / max(vmax - vmin, 1e-6), 0.0, 1.0)
+            else:
+                depth_norm = np.zeros_like(depth_m, dtype=np.float32)
+
+            depth_u8 = (depth_norm * 255).astype(np.uint8)
+            depth_color = cv2.applyColorMap(depth_u8, cv2.COLORMAP_JET)
+            depth_color[~valid] = (0, 0, 0)
+            cv2.imwrite(str(out_dir / "depth_colormap.png"), depth_color)
+            cv2.imwrite(str(out_dir / "overlay_priority.png"), display)
+
+            table = []
+            for rank, det in enumerate(detections, start=1):
+                cls = str(det.get("class_name", "unknown"))
+                conf = float(det.get("confidence", 0.0))
+                obj_id = int(self.class_to_id.get(cls, -1))
+                is_selected = bool(det is selected_det)
+                safe_cls = cls.replace("/", "_").replace(" ", "_")
+                prefix = f"rank{rank:02d}_{safe_cls}"
+
+                mask_img = det["mask_img"]
+                mask_bool = mask_img > 0
+
+                cv2.imwrite(str(masks_dir / f"{prefix}_mask.png"), mask_img)
+
+                mask_color = np.zeros_like(color)
+                mask_color[mask_bool] = self.class_colors.get(cls, (255, 255, 255))
+                mask_overlay = cv2.addWeighted(color, 0.65, mask_color, 0.35, 0)
+                cv2.imwrite(str(masks_dir / f"{prefix}_overlay.png"), mask_overlay)
+
+                det_depth_color = np.zeros_like(depth_color)
+                det_depth_color[mask_bool] = depth_color[mask_bool]
+                cv2.imwrite(str(masks_dir / f"{prefix}_depth_colormap.png"), det_depth_color)
+
+                z = depth[mask_bool].astype(np.float32) * float(self.depth_scale)
+                z = z[z > 0]
+                hist_path = masks_dir / f"{prefix}_hist.png"
+                if len(z) > 0:
+                    hist_img = self._draw_depth_histogram_image(
+                        z,
+                        title=(
+                            f"#{rank} {cls} "
+                            f"score={det.get('depth_score', float('inf')):.4f}m "
+                            f"med={det.get('depth_med', float('inf')):.4f}m"
+                        ),
+                    )
+                    cv2.imwrite(str(hist_path), hist_img)
+
+                ply_path = masks_dir / f"{prefix}_points.ply"
+                ply_count = save_mask_point_cloud_ply(
+                    ply_path,
+                    depth,
+                    mask_img,
+                    color,
+                    self.intrinsics,
+                    self.depth_scale,
+                )
+
+                stats = depth_stats_in_mask(depth, mask_img, self.depth_scale)
+                table.append({
+                    "rank": int(rank),
+                    "selected": is_selected,
+                    "class_name": cls,
+                    "class_id": obj_id,
+                    "confidence": round(conf, 3),
+                    "depth_score_m": round(float(det.get("depth_score", float("inf"))), 4),
+                    "depth_median_m": round(float(det.get("depth_med", float("inf"))), 4),
+                    "bbox": [int(v) for v in det.get("bbox", [0, 0, 0, 0])],
+                    "depth_stats": stats,
+                    "pointcloud_points_saved": int(ply_count),
+                    "files": {
+                        "mask": str(masks_dir / f"{prefix}_mask.png"),
+                        "overlay": str(masks_dir / f"{prefix}_overlay.png"),
+                        "depth_colormap": str(masks_dir / f"{prefix}_depth_colormap.png"),
+                        "histogram": str(hist_path),
+                        "pointcloud": str(ply_path),
+                    },
+                })
+
+            debug_json = {
+                "trigger_seq": int(trigger_seq),
+                "priority_rule": "smaller depth_score is closer and higher priority",
+                "depth_score_definition": "median of nearest 35 percent valid depth values inside each mask",
+                "depth_scale": float(self.depth_scale),
+                "debug_dir": str(out_dir),
+                "overwrite_mode": True,
+                "selected_rank": None,
+                "selected_class": None,
+                "detections": table,
+            }
+
+            if selected_det is not None:
+                for row in table:
+                    if row["selected"]:
+                        debug_json["selected_rank"] = row["rank"]
+                        debug_json["selected_class"] = row["class_name"]
+                        break
+
+            with open(out_dir / "priority_table.json", "w") as f:
+                json.dump(debug_json, f, indent=2, ensure_ascii=False)
+
+            self.get_logger().info(
+                f"[PRIORITY_DEBUG] saved trigger_seq={trigger_seq} "
+                f"candidates={len(detections)} dir={out_dir}"
+            )
+        except Exception as e:
+            self.get_logger().warn(f"[PRIORITY_DEBUG] save failed: {e}")
+            traceback.print_exc()
+
+
     def _find_detection_for_last_pose(self, detections: List[Dict]) -> Optional[Dict]:
         """Find current detection corresponding to the last successful object pose.
 
@@ -1057,6 +1423,17 @@ class MixedPoseVisionNode(Node):
         # 6) FoundationPose는 선택된 1개 target만 수행한다.
         det = target_detections[0]
         class_name = det["class_name"]
+
+        # Save per-trigger mask/depth debug artifacts.
+        # Files are overwritten every trigger in ./debug_priority by default.
+        self._save_priority_debug_artifacts(
+            color=color,
+            depth=depth,
+            display=display,
+            detections=target_detections,
+            trigger_seq=trigger_seq,
+            selected_det=det,
+        )
 
         pose_mat = None
         refined_frames = 0
