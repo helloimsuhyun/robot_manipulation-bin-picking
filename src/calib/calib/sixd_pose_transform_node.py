@@ -1114,6 +1114,45 @@ class ObjectPoseTransformNode(Node):
                     f"x_flat_after={xy_info['x_flatness_after']:.3f}"
                 )
 
+                # Debug: centered object frame after:
+                # raw object -> object_to_center -> z-up defense -> xy-flat canonicalization
+                # This is BEFORE centered_object_to_tcp.
+                R_center_safe = orthonormalize_R(base_T_centered_object[:3, :3])
+                p_center_safe = base_T_centered_object[:3, 3]
+
+                x_axis = R_center_safe[:, 0]
+                y_axis = R_center_safe[:, 1]
+                z_axis = R_center_safe[:, 2]
+                world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+                x_dot_up = float(np.dot(x_axis, world_up))
+                y_dot_up = float(np.dot(y_axis, world_up))
+                z_dot_up = float(np.dot(z_axis, world_up))
+
+                x_tilt_ground_deg = float(
+                    np.degrees(np.arcsin(np.clip(abs(x_dot_up), 0.0, 1.0)))
+                )
+                y_tilt_ground_deg = float(
+                    np.degrees(np.arcsin(np.clip(abs(y_dot_up), 0.0, 1.0)))
+                )
+                z_tilt_up_deg = float(
+                    np.degrees(np.arccos(np.clip(z_dot_up, -1.0, 1.0)))
+                )
+
+                self.get_logger().info(
+                    f"[CENTERED_OBJECT_SAFE] cls={cls} "
+                    f"p=[{p_center_safe[0]:+.1f}, {p_center_safe[1]:+.1f}, {p_center_safe[2]:+.1f}]mm "
+                    f"x=[{x_axis[0]:+.3f}, {x_axis[1]:+.3f}, {x_axis[2]:+.3f}] "
+                    f"y=[{y_axis[0]:+.3f}, {y_axis[1]:+.3f}, {y_axis[2]:+.3f}] "
+                    f"z=[{z_axis[0]:+.3f}, {z_axis[1]:+.3f}, {z_axis[2]:+.3f}] "
+                    f"x_dot_up={x_dot_up:+.3f} "
+                    f"y_dot_up={y_dot_up:+.3f} "
+                    f"z_dot_up={z_dot_up:+.3f} "
+                    f"x_tilt_ground={x_tilt_ground_deg:.2f}deg "
+                    f"y_tilt_ground={y_tilt_ground_deg:.2f}deg "
+                    f"z_tilt_up={z_tilt_up_deg:.2f}deg"
+                )
+
                 max_flat = float(self.get_parameter("canonicalize_xy_max_flatness").value)
                 if xy_info["x_flatness_after"] > max_flat:
                     self.get_logger().warn(
