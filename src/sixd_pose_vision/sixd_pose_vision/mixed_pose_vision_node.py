@@ -841,6 +841,76 @@ class MixedPoseVisionNode(Node):
 
         return available_ids, available_classes
 
+    def _make_priority_table(self, detections: List[Dict]) -> List[Dict]:
+        """Build a JSON-friendly priority table from already-sorted detections.
+
+        Current rule:
+          smaller depth_score_m -> closer to camera -> higher priority.
+
+        depth_score is not the full mask median. It is the median of the nearest
+        front-side depth subset computed in depth_front_median_score_in_mask().
+        """
+        table = []
+
+        for rank, det in enumerate(detections, start=1):
+            cls = str(det.get("class_name", "unknown"))
+            obj_id = int(self.class_to_id.get(cls, -1))
+
+            depth_score = float(det.get("depth_score", det.get("depth_med", float("inf"))))
+            depth_med = float(det.get("depth_med", float("inf")))
+            conf = float(det.get("confidence", 0.0))
+
+            x1, y1, x2, y2 = det.get("bbox", [0, 0, 0, 0])
+            area_px = int(max(0, int(x2) - int(x1)) * max(0, int(y2) - int(y1)))
+
+            table.append({
+                "rank": int(rank),
+                "selected": bool(rank == 1),
+                "class_name": cls,
+                "class_id": obj_id,
+                "confidence": round(conf, 3),
+                "depth_score_m": round(depth_score, 4),
+                "depth_median_m": round(depth_med, 4),
+                "bbox_area_px": area_px,
+                "reason": "nearest depth_score; smaller is closer",
+            })
+
+        return table
+
+    def _log_priority_table(
+        self,
+        detections: List[Dict],
+        trigger_seq: int,
+        title: str = "PRIORITY_TABLE",
+    ) -> None:
+        """Print a readable candidate ranking table to ROS log."""
+        if not detections:
+            self.get_logger().info(f"[{title}] seq={trigger_seq} no detections")
+            return
+
+        lines = [
+            f"[{title}] seq={trigger_seq} candidates={len(detections)} "
+            f"rule=sort_by_depth_score_ascending"
+        ]
+
+        for rank, det in enumerate(detections, start=1):
+            cls = str(det.get("class_name", "unknown"))
+            obj_id = int(self.class_to_id.get(cls, -1))
+            depth_score = float(det.get("depth_score", det.get("depth_med", float("inf"))))
+            depth_med = float(det.get("depth_med", float("inf")))
+            conf = float(det.get("confidence", 0.0))
+
+            tag = "SELECT" if rank == 1 else "      "
+            lines.append(
+                f"  #{rank:<2} {tag} "
+                f"class={cls:<14} id={obj_id:<2} "
+                f"depth_score={depth_score:.4f}m "
+                f"depth_med={depth_med:.4f}m "
+                f"conf={conf:.3f}"
+            )
+
+        self.get_logger().info("\n".join(lines))
+
 
     def _find_detection_for_last_pose(self, detections: List[Dict]) -> Optional[Dict]:
         """Find current detection corresponding to the last successful object pose.
@@ -888,6 +958,21 @@ class MixedPoseVisionNode(Node):
         raw_detections = self._collect_detections(self.object_model, color, depth)
         status["detected_count_raw"] = len(raw_detections)
 
+        # Show current top-priority candidate in the preview window.
+        # Current priority rule: smaller depth_score means closer object.
+        if raw_detections:
+            top = raw_detections[0]
+            top_depth = float(top.get("depth_score", top["depth_med"]))
+            cv2.putText(
+                display,
+                f"PRIORITY: #1 {top['class_name']} | nearest depth_score={top_depth:.3f}m",
+                (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 255, 255),
+                2,
+            )
+
         available_ids, available_classes = self._available_object_info(raw_detections)
         status["available_ids"] = available_ids
         status["available_classes"] = available_classes
@@ -918,13 +1003,29 @@ class MixedPoseVisionNode(Node):
         target_detections.sort(key=lambda d: d.get("depth_score", d["depth_med"]))
         status["detected_count"] = len(target_detections)
 
+        # Priority information for JSON/log debugging.
+        priority_table = self._make_priority_table(target_detections)
+        status["priority_rule"] = "smaller depth_score is closer and higher priority"
+        status["priority_table"] = priority_table
+
+        if run_fp:
+            self._log_priority_table(target_detections, trigger_seq)
+
         # 3) 우선 전체 YOLO detection을 항상 그림.
         #    last pose가 붙을 detection은 중복으로 그리지 않고 뒤에서 pose overlay와 함께 강조한다.
         last_pose_det = self._find_detection_for_last_pose(raw_detections)
-        for det_vis in raw_detections:
+        for rank, det_vis in enumerate(raw_detections, start=1):
             if (last_pose_det is not None) and (det_vis is last_pose_det) and (not run_fp):
                 continue
-            self._draw_detection(display, det_vis, None, "detected")
+
+            depth_score = float(det_vis.get("depth_score", det_vis["depth_med"]))
+            depth_med = float(det_vis["depth_med"])
+            source_text = (
+                f"#{rank} "
+                f"{'SELECT' if rank == 1 else 'candidate'} | "
+                f"d_score:{depth_score:.3f}m med:{depth_med:.3f}m"
+            )
+            self._draw_detection(display, det_vis, None, source_text)
 
         # 4) trigger가 없으면 마지막 성공 pose만 현재 detection 위에 유지 표시한다.
         if not run_fp:
@@ -1052,16 +1153,25 @@ class MixedPoseVisionNode(Node):
         # 8) trigger 대상은 pose axis + 3D CAD bbox로 다시 강조해서 그림.
         self._draw_detection(display, det, pose_mat, f"TRIGGERED reg+track({refined_frames})")
 
+        selected_rank = target_detections.index(det) + 1
+
         status["status"] = "success"
         status["selected_class"] = class_name
         status["selected_id"] = int(self.class_to_id[class_name])
+        status["selected_rank"] = int(selected_rank)
         status["selected_depth_m"] = round(float(det.get("depth_score", det["depth_med"])), 4)
         status["selected_depth_median_m"] = round(float(det["depth_med"]), 4)
         self.get_logger().info(
-            f"[OBJECT_6D] seq={trigger_seq} success class={class_name} "
+            f"[OBJECT_6D_SELECTED] seq={trigger_seq} "
+            f"rank=#{selected_rank} "
+            f"class={class_name} id={self.class_to_id[class_name]} "
+            f"reason=nearest_depth_score "
             f"depth_score={det.get('depth_score', det['depth_med']):.4f}m "
-            f"depth_med={det['depth_med']:.4f}m register_iter={register_iter} "
-            f"track_iter={track_iter} refined_frames={refined_frames}"
+            f"depth_med={det['depth_med']:.4f}m "
+            f"conf={det['confidence']:.3f} "
+            f"register_iter={register_iter} "
+            f"track_iter={track_iter} "
+            f"refined_frames={refined_frames}"
         )
         return [obj], status
 
