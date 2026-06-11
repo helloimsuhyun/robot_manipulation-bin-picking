@@ -1063,6 +1063,25 @@ class PegInHoleController(Node):
     def _normalize_yaw_0_to_90_deg(self, yaw: float) -> float:
         return float(yaw) % 90.0
 
+    def _normalize_place_yaw_minus90_to_0_deg(self, yaw: float) -> float:
+        """
+        90도 대칭인 place yaw를 -90 <= rz <= 0 deg 범위로 접는다.
+
+        원형 place rz=-45 deg를 기준으로 사각형/십자가도 -45 deg 주변에서
+        움직이게 하려는 용도다.
+
+        예:
+             10 -> -80
+             45 -> -45
+             80 -> -10
+            -10 -> -10
+             90 ->   0
+        """
+        folded = -((-float(yaw)) % 90.0)
+        if abs(folded) < 1e-9:
+            return 0.0
+        return folded
+
     def make_tilted_place_pose(self) -> np.ndarray:
         """
         hole place pose를 기준으로 삽입 직전 tilt pose를 만든다.
@@ -1070,7 +1089,7 @@ class PegInHoleController(Node):
         - 접근 MOVE_L은 기존처럼 tilt 없이 수행한다.
         - 이 함수는 place_down_target_z_mm까지 내려갈 때만 사용한다.
         - yaw 방향으로 place_tilt_deg만큼 tilt를 주기 위해 rx/ry에 분배한다.
-        - 네모/object_id=1, 십자가/object_id=2는 90도 대칭이므로 place rz를 0~90도 범위로 접는다.
+        - 네모/object_id=1, 십자가/object_id=2는 90도 대칭이므로 place rz를 -90~0도 범위로 접는다.
 
         식:
             rx = base_rx - tilt * sin(yaw)
@@ -1092,10 +1111,10 @@ class PegInHoleController(Node):
         # 십자가에서만 tilt 방향을 따로 쓰기 위한 변수
         cross_tilt_yaw_deg = None
 
-        # 네모 peg/object_id=1: 기존 로직 그대로 유지
+        # 네모 peg/object_id=1: 기존 보정식은 유지하되 최종 rz는 -90~0도 범위로 접는다.
         if self.ctx.current_target_id == 1:
             raw_yaw = float(target_pose[5])
-            corrected_yaw = self._normalize_yaw_0_to_90_deg(raw_yaw - 45.0)
+            corrected_yaw = self._normalize_place_yaw_minus90_to_0_deg(raw_yaw - 45.0)
 
             target_pose[0] += 2.0
             target_pose[5] = corrected_yaw
@@ -1103,17 +1122,17 @@ class PegInHoleController(Node):
 
             self.get_logger().info(
                 f"[PLACE SQUARE] apply x offset +2.0 mm, "
-                f"yaw -45 then mod90: {raw_yaw:.3f} -> {target_pose[5]:.3f}, "
+                f"yaw -45 then fold[-90,0]: {raw_yaw:.3f} -> {target_pose[5]:.3f}, "
                 f"target x={target_pose[0]:.2f}, total tilt={tilt_deg:.2f}deg"
             )
 
         # 십자가 peg/object_id=2:
-        # - 최종 rz는 기존처럼 raw_yaw % 90 사용
+        # - 최종 rz는 raw_yaw와 90도 대칭인 값 중 -90~0도 범위를 사용
         # - XY offset도 기존처럼 최종 rz 방향 사용
-        # - tilt 방향만 raw_yaw - 45도 사용
+        # - tilt 방향도 최종 rz 기준으로 final_rz - 45도 사용
         if self.ctx.current_target_id == 2:
             raw_yaw = float(target_pose[5])
-            corrected_yaw = self._normalize_yaw_0_to_90_deg(raw_yaw)
+            corrected_yaw = self._normalize_place_yaw_minus90_to_0_deg(raw_yaw)
 
             extra_tilt_deg = 12.0
             offset_mm = 10.0
@@ -1121,8 +1140,9 @@ class PegInHoleController(Node):
             target_pose[5] = corrected_yaw
             tilt_deg += extra_tilt_deg
 
-            # 십자가만 tilt 방향을 raw_yaw - 45도로 사용
-            cross_tilt_yaw_deg = raw_yaw - 45.0
+            # 십자가 tilt 방향도 최종 rz 기준으로 계산한다.
+            # raw_yaw를 그대로 쓰면 yaw가 -90~0으로 접히는 구간에서 tilt 방향이 90도 어긋날 수 있다.
+            cross_tilt_yaw_deg = corrected_yaw - 45.0
 
             # XY offset은 기존처럼 최종 rz 방향 기준
             xy_yaw_rad = np.deg2rad(target_pose[5])
@@ -1133,8 +1153,8 @@ class PegInHoleController(Node):
             target_pose[2] += 4.0
 
             self.get_logger().info(
-                f"[PLACE CROSS] rz mod90: {raw_yaw:.3f} -> {target_pose[5]:.3f}, "
-                f"tilt yaw=raw_yaw-45={cross_tilt_yaw_deg:.3f}, "
+                f"[PLACE CROSS] rz fold[-90,0]: {raw_yaw:.3f} -> {target_pose[5]:.3f}, "
+                f"tilt yaw=final_rz-45={cross_tilt_yaw_deg:.3f}, "
                 f"xy offset yaw={target_pose[5]:.3f}, "
                 f"apply extra tilt +{extra_tilt_deg:.2f}deg, "
                 f"xy yaw offset={offset_mm:.2f}mm, "
@@ -1142,7 +1162,7 @@ class PegInHoleController(Node):
                 f"total tilt={tilt_deg:.2f}deg"
             )
 
-        # 십자가만 tilt 방향을 raw_yaw - 45도로 사용
+        # 십자가만 tilt 방향을 final_rz - 45도로 사용
         # 나머지 원/네모는 기존처럼 target_pose[5] 기준으로 tilt
         if self.ctx.current_target_id == 2 and cross_tilt_yaw_deg is not None:
             tilt_yaw_deg = float(cross_tilt_yaw_deg)
@@ -1391,22 +1411,22 @@ class PegInHoleController(Node):
 
             target_pose = self.ctx.current_hole_place_pose.copy()
 
-            # 네모/십자가는 90도 대칭이므로 place rz를 0~90도 범위로 접는다.
+            # 네모/십자가는 90도 대칭이므로 place rz를 -90~0도 범위로 접는다.
             if self.ctx.current_target_id == 1:
                 raw_yaw = float(target_pose[5])
                 target_pose[0] += 2.0
-                target_pose[5] = self._normalize_yaw_0_to_90_deg(raw_yaw + 45.0)
+                target_pose[5] = self._normalize_place_yaw_minus90_to_0_deg(raw_yaw + 45.0)
                 self.get_logger().info(
                     f"[PLACE SQUARE APPROACH] apply x offset +2.0 mm, "
-                    f"yaw +45 then mod90: {raw_yaw:.3f} -> {target_pose[5]:.3f}, "
+                    f"yaw +45 then fold[-90,0]: {raw_yaw:.3f} -> {target_pose[5]:.3f}, "
                     f"target x = {target_pose[0]:.2f}"
                 )
 
             elif self.ctx.current_target_id == 2:
                 raw_yaw = float(target_pose[5])
-                target_pose[5] = self._normalize_yaw_0_to_90_deg(raw_yaw)
+                target_pose[5] = self._normalize_place_yaw_minus90_to_0_deg(raw_yaw)
                 self.get_logger().info(
-                    f"[PLACE CROSS APPROACH] yaw mod90: "
+                    f"[PLACE CROSS APPROACH] yaw fold[-90,0]: "
                     f"{raw_yaw:.3f} -> {target_pose[5]:.3f}"
                 )
 
@@ -1467,10 +1487,10 @@ class PegInHoleController(Node):
             if self.ctx.current_target_id == 1:
                 raw_yaw = float(target_pose[5])
                 target_pose[0] += 2.0
-                target_pose[5] = self._normalize_yaw_deg(raw_yaw + 45.0)
+                target_pose[5] = self._normalize_place_yaw_minus90_to_0_deg(raw_yaw + 45.0)
                 self.get_logger().info(
                     f"[PLACE OFFSET] square descend. apply x offset +2.0 mm, "
-                    f"yaw +45.0 deg: {raw_yaw:.3f} -> {target_pose[5]:.3f}, "
+                    f"yaw +45 then fold[-90,0]: {raw_yaw:.3f} -> {target_pose[5]:.3f}, "
                     f"target x = {target_pose[0]:.2f}"
                 )
 

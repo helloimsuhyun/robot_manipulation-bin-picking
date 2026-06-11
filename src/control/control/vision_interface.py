@@ -793,8 +793,12 @@ class VisionInterface:
 
             elif object_id == 2:
                 # 십자가 hole:
-                # 여기에 성현님이 원하는 hole 전용 yaw 계산식을 넣으면 됨.
-                corrected_yaw = (yaw % 90.0) - 45.0
+                # vision 단계에서는 90도 대칭 범위로만 접는다.
+                # 실제 place rz 범위(-90~0) 및 tilt 방향(final_rz-45)은
+                # peg_in_hole_controller.make_tilted_place_pose()에서 한 번만 처리한다.
+                # 여기서 -45도를 미리 빼면 controller에서 다시 보정되어
+                # 특정 yaw 구간에서 tilt 방향이 90도 어긋날 수 있다.
+                corrected_yaw = (yaw % 90.0)
 
             else:
                 self.node.get_logger().warn(
