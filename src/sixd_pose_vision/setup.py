@@ -67,6 +67,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'realsense_keyboard_capture_node = sixd_pose_vision.realsense_keyboard_capture_node:main',
             'mixed_pose_vision_node = sixd_pose_vision.mixed_pose_vision_node:main',
             'keyboard_object_trigger_node = sixd_pose_vision.keyboard_object_trigger_node:main',
         ],
