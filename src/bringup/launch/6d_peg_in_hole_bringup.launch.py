@@ -209,8 +209,8 @@ def generate_launch_description():
             # 물체와 멀수록 좋음 + 원래 pose6 위치와 가까울수록 좋음을 동시에 고려.
             "empty_space_w_clearance": 2.2,
             "empty_space_w_pose6_proximity": 1.5,
-            "empty_space_w_roi_edge": 1.8,
-            "empty_space_w_vision_score": 0.5,
+            "empty_space_w_roi_edge": 1.5,
+            "empty_space_w_vision_score": 0.0,
 
             # normalization saturation 값.
             # clearance가 150mm 이상이면 norm_clearance=1.0

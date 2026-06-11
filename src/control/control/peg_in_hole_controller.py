@@ -1145,12 +1145,18 @@ class PegInHoleController(Node):
         주의:
             target_pose[5]는 실제 로봇 place rz이다.
             custom_tilt_yaw_deg는 tilt 방향 계산 전용 yaw이다.
+
+        십자가 offset 방향 안정화:
+            십자가는 대칭 형상이라 vision yaw가 같은 물체를 반대 방향으로 잡을 수 있다.
+            따라서 XY offset 방향은 기준 방향과 dot product 비교 후,
+            반대 방향이면 offset vector를 180도 뒤집는다.
         """
         if self.ctx.current_hole_place_pose is None:
             raise RuntimeError("No selected hole target")
 
         target_pose = self.ctx.current_hole_place_pose.copy()
         target_pose[2] = self.ctx.place_down_target_z_mm
+
         # 필요 시 전역 x 보정이 필요하면 아래 줄을 다시 활성화한다.
         # target_pose[0] -= 5.0
 
@@ -1163,6 +1169,7 @@ class PegInHoleController(Node):
 
         # ------------------------------------------------------------
         # 사각형 peg/object_id=1
+        # - 기존 로직 유지
         # - 최종 place rz: (raw_yaw - 45)를 -90~0 범위로 접음
         # - tilt 방향: raw_yaw 기준 유지
         # ------------------------------------------------------------
@@ -1185,9 +1192,8 @@ class PegInHoleController(Node):
 
         # ------------------------------------------------------------
         # 십자가 peg/object_id=2
-        # - 최종 place rz: raw_yaw를 -90~0 범위로 접음
-        # - XY offset: 최종 rz 방향 기준
-        # - tilt 방향: 최종 rz 방향 기준
+        # - 기존 tilt 로직 유지
+        # - XY offset 방향만 안정화
         # ------------------------------------------------------------
         if self.ctx.current_target_id == 2:
             raw_yaw = float(target_pose[5])
@@ -1199,12 +1205,54 @@ class PegInHoleController(Node):
             target_pose[5] = corrected_yaw
             tilt_deg += extra_tilt_deg
 
+            # 기존 tilt 방향 유지
             custom_tilt_yaw_deg = corrected_yaw
 
-            # XY offset도 최종 rz 방향 기준
-            xy_yaw_rad = np.deg2rad(target_pose[5])
-            target_pose[0] += offset_mm * np.cos(xy_yaw_rad)
-            target_pose[1] += offset_mm * np.sin(xy_yaw_rad)
+            # --------------------------------------------------------
+            # 십자가 XY offset 방향 안정화
+            # --------------------------------------------------------
+            # 기존에는 target_pose[5] 방향으로 바로 offset을 줬다.
+            # 그런데 십자가는 대칭이라 yaw가 반대 방향으로 잡히면 offset도 반대로 간다.
+            # 따라서 offset_vec와 기준 방향 ref_vec를 비교해서 반대면 뒤집는다.
+            offset_source_yaw_deg = float(target_pose[5])
+            offset_source_yaw_rad = np.deg2rad(offset_source_yaw_deg)
+
+            offset_vec = np.array(
+                [
+                    np.cos(offset_source_yaw_rad),
+                    np.sin(offset_source_yaw_rad),
+                ],
+                dtype=float,
+            )
+
+            # 기준 방향:
+            # 십자가가 잘 들어가던 offset 방향을 여기에 둔다.
+            # 현재 코드 기준으로 보통 -45도 방향이 기준이다.
+            # 만약 이 방향 자체가 반대라면 -45.0을 135.0으로 바꾸면 된다.
+            cross_offset_ref_yaw_deg = -45.0
+            cross_offset_ref_yaw_rad = np.deg2rad(cross_offset_ref_yaw_deg)
+
+            ref_vec = np.array(
+                [
+                    np.cos(cross_offset_ref_yaw_rad),
+                    np.sin(cross_offset_ref_yaw_rad),
+                ],
+                dtype=float,
+            )
+
+            offset_flipped = False
+
+            # offset_vec가 기준 방향의 반대쪽을 보고 있으면 180도 뒤집는다.
+            if float(np.dot(offset_vec, ref_vec)) < 0.0:
+                offset_vec *= -1.0
+                offset_source_yaw_deg = self._normalize_yaw_deg(offset_source_yaw_deg + 180.0)
+                offset_flipped = True
+
+            dx = offset_mm * offset_vec[0]
+            dy = offset_mm * offset_vec[1]
+
+            target_pose[0] += dx
+            target_pose[1] += dy
 
             # 십자가만 4 mm 덜 내려가게 함
             target_pose[2] += 4.0
@@ -1212,9 +1260,11 @@ class PegInHoleController(Node):
             self.get_logger().info(
                 f"[PLACE CROSS] rz fold[-90,0]: {raw_yaw:.3f} -> {target_pose[5]:.3f}, "
                 f"tilt_yaw=corrected_yaw={custom_tilt_yaw_deg:.3f}, "
-                f"xy offset yaw={target_pose[5]:.3f}, "
+                f"offset_ref_yaw={cross_offset_ref_yaw_deg:.3f}, "
+                f"offset_selected_yaw={offset_source_yaw_deg:.3f}, "
+                f"offset_flipped={offset_flipped}, "
+                f"offset dx={dx:.2f}mm, dy={dy:.2f}mm, "
                 f"apply extra tilt +{extra_tilt_deg:.2f}deg, "
-                f"xy yaw offset={offset_mm:.2f}mm, "
                 f"target x={target_pose[0]:.2f}, y={target_pose[1]:.2f}, z={target_pose[2]:.2f}, "
                 f"total tilt={tilt_deg:.2f}deg"
             )
