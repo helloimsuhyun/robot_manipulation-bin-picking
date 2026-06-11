@@ -164,13 +164,13 @@ class PegInHoleController(Node):
 
                 # -1/-2 safe grasp 후 임시로 평평하게 내려놓는 pose
                 # x/y는 /vision/peg_targets len=9의 마지막 두 값(empty_x, empty_y)을 사용한다.
-                ("regrasp_temp_place_z_mm", 81.0),
+                ("regrasp_temp_place_z_mm", 90.0),
                 ("regrasp_temp_approach_z_offset_mm", 50.0),
                 ("regrasp_temp_lift_z_offset_mm", 50.0),
                 ("regrasp_temp_flat_rx_deg", 90.0),
                 ("regrasp_temp_flat_ry_deg", 0.0),
-                ("regrasp_temp_flat_rz_deg", -45.0),
-                ("regrasp_max_attempts", 1),
+                ("regrasp_temp_flat_rz_deg", 135.0),
+                ("regrasp_max_attempts", 100),
 
             ],
         )
@@ -1154,8 +1154,8 @@ class PegInHoleController(Node):
         # 필요 시 전역 x 보정이 필요하면 아래 줄을 다시 활성화한다.
         # target_pose[0] -= 5.0
 
-        base_rx = float(target_pose[3])
-        base_ry = float(target_pose[4])
+        base_rx = float(self.ctx.flat_tcp_rx_deg)
+        base_ry = float(self.ctx.flat_tcp_ry_deg)
         tilt_deg = float(self.ctx.place_tilt_deg)
 
         # 사각형/십자가처럼 place rz와 tilt 방향을 분리해야 하는 경우 사용
@@ -1194,7 +1194,7 @@ class PegInHoleController(Node):
             corrected_yaw = self._normalize_yaw_minus90_to_0_deg(raw_yaw)
 
             extra_tilt_deg = 17.0
-            offset_mm = 10.0
+            offset_mm = 17.0
 
             target_pose[5] = corrected_yaw
             tilt_deg += extra_tilt_deg

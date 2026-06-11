@@ -1,5 +1,5 @@
 {
-  "trigger_seq": 3,
+  "trigger_seq": 1,
   "priority_rule": "position-first tie-break: compare mask center distance first; if center dist <= 50.0px, then compare depth diff <= 0.010m; only then prefer square class",
   "priority_depth_tie_m": 0.01,
   "priority_position_tie_px": 50.0,
@@ -9,44 +9,44 @@
   "debug_dir": "/home/chu/robot_manipulation-bin-picking/debug_priority",
   "overwrite_mode": true,
   "selected_rank": 1,
-  "selected_class": "hole",
+  "selected_class": "cross",
   "detections": [
     {
       "rank": 1,
       "selected": true,
-      "class_name": "hole",
-      "class_id": 1,
-      "confidence": 0.924,
-      "depth_score_m": 0.554,
-      "depth_median_m": 0.558,
+      "class_name": "cross",
+      "class_id": 2,
+      "confidence": 0.917,
+      "depth_score_m": 0.55,
+      "depth_median_m": 0.551,
       "bbox": [
-        352,
-        262,
-        435,
-        349
+        430,
+        214,
+        498,
+        282
       ],
       "depth_stats": {
-        "area_px": 2219,
-        "valid_px": 2216,
-        "valid_ratio": 0.9986,
+        "area_px": 2628,
+        "valid_px": 2623,
+        "valid_ratio": 0.9981,
         "min": 0.548,
-        "p05": 0.551,
-        "p10": 0.552,
-        "p20": 0.554,
-        "p35": 0.556,
-        "p50": 0.558,
-        "p75": 0.564,
-        "max": 0.579,
-        "spread_p50_p10": 0.006,
-        "spread_p50_p20": 0.004
+        "p05": 0.549,
+        "p10": 0.55,
+        "p20": 0.55,
+        "p35": 0.551,
+        "p50": 0.551,
+        "p75": 0.555,
+        "max": 0.578,
+        "spread_p50_p10": 0.001,
+        "spread_p50_p20": 0.001
       },
-      "pointcloud_points_saved": 2216,
+      "pointcloud_points_saved": 2623,
       "files": {
-        "mask": "/home/chu/robot_manipulation-bin-picking/debug_priority/masks/rank01_hole_mask.png",
-        "overlay": "/home/chu/robot_manipulation-bin-picking/debug_priority/masks/rank01_hole_overlay.png",
-        "depth_colormap": "/home/chu/robot_manipulation-bin-picking/debug_priority/masks/rank01_hole_depth_colormap.png",
-        "histogram": "/home/chu/robot_manipulation-bin-picking/debug_priority/masks/rank01_hole_hist.png",
-        "pointcloud": "/home/chu/robot_manipulation-bin-picking/debug_priority/masks/rank01_hole_points.ply"
+        "mask": "/home/chu/robot_manipulation-bin-picking/debug_priority/masks/rank01_cross_mask.png",
+        "overlay": "/home/chu/robot_manipulation-bin-picking/debug_priority/masks/rank01_cross_overlay.png",
+        "depth_colormap": "/home/chu/robot_manipulation-bin-picking/debug_priority/masks/rank01_cross_depth_colormap.png",
+        "histogram": "/home/chu/robot_manipulation-bin-picking/debug_priority/masks/rank01_cross_hist.png",
+        "pointcloud": "/home/chu/robot_manipulation-bin-picking/debug_priority/masks/rank01_cross_points.ply"
       }
     },
     {
@@ -54,75 +54,37 @@
       "selected": false,
       "class_name": "hole",
       "class_id": 1,
-      "confidence": 0.94,
-      "depth_score_m": 0.555,
-      "depth_median_m": 0.564,
+      "confidence": 0.533,
+      "depth_score_m": 1.284,
+      "depth_median_m": 1.296,
       "bbox": [
-        516,
-        229,
-        586,
-        296
+        0,
+        348,
+        115,
+        480
       ],
       "depth_stats": {
-        "area_px": 5106,
-        "valid_px": 5069,
-        "valid_ratio": 0.9928,
-        "min": 0.55,
-        "p05": 0.553,
-        "p10": 0.554,
-        "p20": 0.556,
-        "p35": 0.56,
-        "p50": 0.564,
-        "p75": 0.574,
-        "max": 0.58,
-        "spread_p50_p10": 0.01,
-        "spread_p50_p20": 0.008
+        "area_px": 2365,
+        "valid_px": 2365,
+        "valid_ratio": 1.0,
+        "min": 1.261,
+        "p05": 1.272,
+        "p10": 1.277,
+        "p20": 1.284,
+        "p35": 1.291,
+        "p50": 1.296,
+        "p75": 1.301,
+        "max": 1.324,
+        "spread_p50_p10": 0.019,
+        "spread_p50_p20": 0.012
       },
-      "pointcloud_points_saved": 5069,
+      "pointcloud_points_saved": 2365,
       "files": {
         "mask": "/home/chu/robot_manipulation-bin-picking/debug_priority/masks/rank02_hole_mask.png",
         "overlay": "/home/chu/robot_manipulation-bin-picking/debug_priority/masks/rank02_hole_overlay.png",
         "depth_colormap": "/home/chu/robot_manipulation-bin-picking/debug_priority/masks/rank02_hole_depth_colormap.png",
         "histogram": "/home/chu/robot_manipulation-bin-picking/debug_priority/masks/rank02_hole_hist.png",
         "pointcloud": "/home/chu/robot_manipulation-bin-picking/debug_priority/masks/rank02_hole_points.ply"
-      }
-    },
-    {
-      "rank": 3,
-      "selected": false,
-      "class_name": "hole",
-      "class_id": 1,
-      "confidence": 0.922,
-      "depth_score_m": 0.555,
-      "depth_median_m": 0.564,
-      "bbox": [
-        241,
-        126,
-        336,
-        220
-      ],
-      "depth_stats": {
-        "area_px": 4998,
-        "valid_px": 4984,
-        "valid_ratio": 0.9972,
-        "min": 0.549,
-        "p05": 0.553,
-        "p10": 0.554,
-        "p20": 0.556,
-        "p35": 0.56,
-        "p50": 0.564,
-        "p75": 0.574,
-        "max": 0.584,
-        "spread_p50_p10": 0.01,
-        "spread_p50_p20": 0.008
-      },
-      "pointcloud_points_saved": 4984,
-      "files": {
-        "mask": "/home/chu/robot_manipulation-bin-picking/debug_priority/masks/rank03_hole_mask.png",
-        "overlay": "/home/chu/robot_manipulation-bin-picking/debug_priority/masks/rank03_hole_overlay.png",
-        "depth_colormap": "/home/chu/robot_manipulation-bin-picking/debug_priority/masks/rank03_hole_depth_colormap.png",
-        "histogram": "/home/chu/robot_manipulation-bin-picking/debug_priority/masks/rank03_hole_hist.png",
-        "pointcloud": "/home/chu/robot_manipulation-bin-picking/debug_priority/masks/rank03_hole_points.ply"
       }
     }
   ]

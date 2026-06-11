@@ -549,7 +549,14 @@ class RobotMotion:
 
     def run_servo_t_level_j4_j5_until_reached(self) -> bool:
         """
-        4번/5번 조인트만 외부 토크로 자세 복귀한다.
+        4번/5번 조인트는 기존 외부 토크로 자세 복귀한다.
+        십자가(object_id=2) 삽입 중에는 마지막 조인트(J6)에만
+        1 Hz sin 토크를 추가한다.
+
+        핵심:
+            - J4/J5 토크: 기존 smoothing/rate-limit 유지
+            - J6 위글링 토크: smoothing 이후 target_torque[5]에 직접 대입
+            → tau6가 j6_wiggle_raw를 실제로 따라가게 함
 
         종료 조건:
             abs(q4_err) <= servo_level_j4_tol_deg
@@ -557,7 +564,7 @@ class RobotMotion:
             위 조건이 servo_level_target_stable_count번 연속 유지되면 성공 종료.
 
         안전 조건:
-            servo_level_max_duration_sec를 넘으면 timeout 종료 후 다음 상태로 넘어갈 수 있도록 False 반환.
+            servo_level_max_duration_sec를 넘으면 timeout 종료 후 False 반환.
         """
         max_duration = float(self.ctx.servo_level_max_duration_sec)
         stable_required = int(self.ctx.servo_level_target_stable_count)
@@ -581,6 +588,12 @@ class RobotMotion:
         last_log_time = 0.0
         stable_count = 0
         reached = False
+
+        # J6 위글링 설정
+        # 안 돌면 7.0 유지, 너무 세면 5.0 / 3.0으로 낮추면 됨.
+        j6_wiggle_amp = 1.5
+        j6_wiggle_freq_hz = 2.0
+        j6_wiggle_limit = 1.5
 
         try:
             while rclpy.ok():
@@ -630,8 +643,38 @@ class RobotMotion:
                     q5_err_cmd,
                 ) = self._make_level_j4_j5_torque(jpos, jvel)
 
+                # ------------------------------------------------------------
+                # 1) 기존 J4/J5 토크는 그대로 smoothing/rate-limit 적용
+                #    여기서는 J6에 아무것도 더하지 않는다.
+                # ------------------------------------------------------------
                 target_torque = self._smooth_servo_torque(raw_torque, prev_target_torque)
+
+                # prev_target_torque는 J4/J5 smoothing용으로만 유지한다.
+                # J6 위글링은 아래에서 직접 덮어쓰기 때문에 prev값에 누적시키지 않는다.
                 prev_target_torque = target_torque.copy()
+                prev_target_torque[5] = 0.0
+
+                # ------------------------------------------------------------
+                # 2) 십자가(object_id=2)일 때만 J6 위글링을 smoothing 이후 직접 추가
+                #    이렇게 해야 tau6가 j6_wiggle_raw를 실제로 따라간다.
+                # ------------------------------------------------------------
+                j6_wiggle_raw = 0.0
+                j6_wiggle_cmd = 0.0
+
+                if int(getattr(self.ctx, "current_target_id", -1)) in (1, 2):
+                    j6_wiggle_raw = float(j6_wiggle_amp) * np.sin(
+                        2.0 * np.pi * float(j6_wiggle_freq_hz) * elapsed
+                    )
+
+                    j6_wiggle_cmd = float(
+                        np.clip(
+                            j6_wiggle_raw,
+                            -float(j6_wiggle_limit),
+                            float(j6_wiggle_limit),
+                        )
+                    )
+
+                    target_torque[5] = j6_wiggle_cmd
 
                 q4_ok = abs(q4_err) <= float(self.ctx.servo_level_j4_tol_deg)
                 q5_ok = abs(q5_err) <= float(self.ctx.servo_level_j5_tol_deg)
@@ -657,11 +700,15 @@ class RobotMotion:
                         "[SERVO_LEVEL_J4_J5] "
                         f"remain={max_duration - elapsed:.2f}s, "
                         f"q2={jpos[1]:.2f}, q3={jpos[2]:.2f}, "
-                        f"q4={jpos[3]:.2f}, q5={jpos[4]:.2f}, "
+                        f"q4={jpos[3]:.2f}, q5={jpos[4]:.2f}, q6={jpos[5]:.2f}, "
                         f"q4_des={q4_des:.2f}, q5_des={q5_des:.2f}, "
                         f"q4_err={q4_err:.2f}, q5_err={q5_err:.2f}, "
                         f"q4_err_cmd={q4_err_cmd:.2f}, q5_err_cmd={q5_err_cmd:.2f}, "
-                        f"tau4={target_torque[3]:.3f}, tau5={target_torque[4]:.3f}, "
+                        f"tau4={target_torque[3]:.3f}, "
+                        f"tau5={target_torque[4]:.3f}, "
+                        f"tau6={target_torque[5]:.3f}, "
+                        f"j6_wiggle_raw={j6_wiggle_raw:.3f}, "
+                        f"j6_wiggle_cmd={j6_wiggle_cmd:.3f}, "
                         f"stable={stable_count}/{stable_required}"
                     )
 
