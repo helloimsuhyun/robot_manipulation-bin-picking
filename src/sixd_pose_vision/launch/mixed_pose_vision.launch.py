@@ -31,7 +31,7 @@ def generate_launch_description():
     pkg_share = FindPackageShare("sixd_pose_vision")
 
     # 단독 실행 시 사용할 기본 FoundationPose 경로
-    default_foundationpose_repo_path = "/home/choisuhyun/FoundationPose"
+    default_foundationpose_repo_path = "/home/chu/FoundationPose"
 
     return LaunchDescription([
         # ============================================================

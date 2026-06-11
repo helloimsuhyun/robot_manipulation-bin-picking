@@ -106,12 +106,12 @@ def generate_launch_description():
 
             # empty-space 후보 탐색 ROI.
             # x_max/y_max=-1이면 image_width-right_margin, image_height-bottom_margin 사용.
-            "empty_roi_x_min": "70",
-            "empty_roi_y_min": "60",
-            "empty_roi_x_max": "-1",
-            "empty_roi_y_max": "-1",
-            "empty_roi_right_margin": "70",
-            "empty_roi_bottom_margin": "50",
+            "empty_roi_x_min": "198",
+            "empty_roi_y_min": "70",
+            "empty_roi_x_max": "663",
+            "empty_roi_y_max": "429",
+            "empty_roi_right_margin": "0",
+            "empty_roi_bottom_margin": "0",
 
             # YOLO object mask 주변 제외 영역.
             # 물체 가까운 후보가 많이 잡히면 30~40으로 증가.
@@ -198,12 +198,12 @@ def generate_launch_description():
             # 최종 world filtering safety margin.
             # 최종 reject_radius = 42.4 + safety_margin
             # 기본 10mm면 약 52.4mm 이내 후보 제거.
-            "empty_space_safety_margin_mm": 30.0,
+            "empty_space_safety_margin_mm": 35.0,
 
             # ROI 가장자리 reject.
             # 0이면 hard reject 거의 없음.
             # 가장자리 후보가 선택되면 20~40으로 증가.
-            "empty_space_roi_edge_reject_px": 0.0,
+            "empty_space_roi_edge_reject_px": 30.0,
 
             # weighted score 가중치.
             # 물체와 멀수록 좋음 + 원래 pose6 위치와 가까울수록 좋음을 동시에 고려.

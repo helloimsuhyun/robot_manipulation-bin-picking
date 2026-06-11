@@ -94,7 +94,7 @@ class PegInHoleController(Node):
                 ("servo_insert_down_torque", [0.0, 0.0, 0.5, 0.0, 0.0, 0.0]),
 
                 # 4/5번 조인트 자세 복귀 servo_t
-                ("servo_level_max_duration_sec", 3.0),
+                ("servo_level_max_duration_sec", 5.0),
                 ("servo_level_target_stable_count", 10),
                 ("servo_level_j4_tol_deg", 1.0),
                 ("servo_level_j5_tol_deg", 1.0),
