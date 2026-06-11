@@ -732,6 +732,14 @@ class MixedPoseVisionNode(Node):
         self.declare_parameter("priority_debug_save", True)
         self.declare_parameter("priority_debug_dir", "debug_priority")
 
+        # Priority tie-break parameters.
+        # 기본 우선순위는 depth_score가 작은 물체, 즉 카메라에 더 가까운 물체입니다.
+        # 단, mask 중심 위치도 비슷하고 depth_score 차이도 priority_depth_tie_m 이하이면
+        # priority_square_class를 먼저 선택합니다. 현재 사각형 클래스는 hole입니다.
+        self.declare_parameter("priority_depth_tie_m", 0.015)
+        self.declare_parameter("priority_position_tie_px", 60.0)
+        self.declare_parameter("priority_square_class", "hole")
+
         self.foundationpose_repo_path = Path(str(self.get_parameter("foundationpose_repo_path").value)).expanduser()
         self.cad_dir = Path(str(self.get_parameter("cad_dir").value)).expanduser()
         self.template_dir = Path(str(self.get_parameter("template_dir").value)).expanduser()
@@ -761,6 +769,16 @@ class MixedPoseVisionNode(Node):
         self.priority_debug_dir.mkdir(parents=True, exist_ok=True)
         self.get_logger().info(
             f"[PRIORITY_DEBUG] save={self.priority_debug_save} dir={self.priority_debug_dir}"
+        )
+
+        self.priority_depth_tie_m = float(self.get_parameter("priority_depth_tie_m").value)
+        self.priority_position_tie_px = float(self.get_parameter("priority_position_tie_px").value)
+        self.priority_square_class = str(self.get_parameter("priority_square_class").value).strip()
+        self.get_logger().info(
+            f"[PRIORITY] rule=nearest_depth_score_with_position_and_square_tie_break "
+            f"depth_tie_m={self.priority_depth_tie_m:.3f} "
+            f"position_tie_px={self.priority_position_tie_px:.1f} "
+            f"square_class={self.priority_square_class}"
         )
 
         self.mesh_alias = {"cross_insert": "cross", "cylinder_insert": "cylinder", "hole_insert": "hole"}
@@ -1104,9 +1122,107 @@ class MixedPoseVisionNode(Node):
                 "bbox": results.boxes.xyxy[i].cpu().numpy().astype(int),
             })
 
-        # allowed-id nearest 선택과 preview 대표 detection 모두 depth_score 기준으로 정렬.
-        detections.sort(key=lambda d: d.get("depth_score", d["depth_med"]))
+        # allowed-id nearest 선택과 preview 대표 detection 모두 priority rule 기준으로 정렬.
+        detections = self._sort_detections_with_square_tie_break(detections)
         return detections
+
+    def _depth_value_for_priority(self, det: Dict) -> float:
+        return float(det.get("depth_score", det.get("depth_med", float("inf"))))
+
+    def _mask_center_for_priority(self, det: Dict) -> Tuple[float, float]:
+        """Return mask centroid in image pixel coordinates.
+
+        Falls back to bbox center if mask moments are invalid.
+        """
+        mask_img = det.get("mask_img")
+        if mask_img is not None:
+            m = cv2.moments((mask_img > 0).astype(np.uint8))
+            if abs(float(m.get("m00", 0.0))) > 1e-6:
+                return float(m["m10"] / m["m00"]), float(m["m01"] / m["m00"])
+
+        x1, y1, x2, y2 = det.get("bbox", [0, 0, 0, 0])
+        return 0.5 * (float(x1) + float(x2)), 0.5 * (float(y1) + float(y2))
+
+    def _mask_center_distance_px(self, a: Dict, b: Dict) -> float:
+        ax, ay = self._mask_center_for_priority(a)
+        bx, by = self._mask_center_for_priority(b)
+        return float(np.hypot(ax - bx, ay - by))
+
+    def _sort_detections_with_square_tie_break(self, detections: List[Dict]) -> List[Dict]:
+        """Sort detections with position-first square tie-break.
+
+        Priority rule:
+          1) Start from the nearest-depth candidate as the anchor.
+          2) First make a local group whose mask centers are close to the anchor.
+             - center distance <= priority_position_tie_px
+          3) Inside only that local-position group, check whether depth is also similar.
+             - depth difference <= priority_depth_tie_m
+          4) Only inside the local-position + similar-depth group, prefer the square class.
+          5) Candidates outside the local-position group keep normal depth priority.
+
+        In the current object set, the square object class is usually "hole".
+        """
+        if not detections:
+            return detections
+
+        depth_tie_m = max(0.0, float(getattr(self, "priority_depth_tie_m", 0.015)))
+        position_tie_px = max(0.0, float(getattr(self, "priority_position_tie_px", 80.0)))
+        square_cls = str(getattr(self, "priority_square_class", "hole"))
+
+        # 기본 anchor는 전체 후보 중 가장 가까운 depth_score 후보.
+        depth_sorted = sorted(detections, key=lambda d: self._depth_value_for_priority(d))
+        anchor = depth_sorted[0]
+        anchor_depth = self._depth_value_for_priority(anchor)
+
+        # 1) 먼저 mask 중심 위치가 비슷한 후보만 local group으로 묶는다.
+        local_position_group = []
+        nonlocal_group = []
+        for det in depth_sorted:
+            center_dist = self._mask_center_distance_px(det, anchor)
+            depth_diff = abs(self._depth_value_for_priority(det) - anchor_depth)
+
+            det["priority_depth_diff_from_nearest_m"] = float(depth_diff)
+            det["priority_center_dist_from_nearest_px"] = float(center_dist)
+            det["priority_position_gate"] = bool(center_dist <= position_tie_px)
+            det["priority_depth_gate"] = bool(depth_diff <= depth_tie_m)
+            det["priority_square_tie_applied"] = False
+
+            if center_dist <= position_tie_px:
+                local_position_group.append(det)
+            else:
+                nonlocal_group.append(det)
+
+        # 2) 위치가 비슷한 그룹 안에서만 depth 유사성을 본다.
+        local_depth_tie_group = []
+        local_depth_other_group = []
+        for det in local_position_group:
+            if det["priority_depth_gate"]:
+                local_depth_tie_group.append(det)
+            else:
+                local_depth_other_group.append(det)
+
+        # 3) 위치도 비슷하고 depth도 비슷한 경우에만 hole/square 우선.
+        if len(local_depth_tie_group) >= 2:
+            for det in local_depth_tie_group:
+                det["priority_square_tie_applied"] = True
+
+            local_depth_tie_group.sort(
+                key=lambda det: (
+                    0 if str(det.get("class_name", "")) == square_cls else 1,
+                    -float(det.get("confidence", 0.0)),
+                    self._depth_value_for_priority(det),
+                )
+            )
+        else:
+            local_depth_tie_group.sort(key=lambda d: self._depth_value_for_priority(d))
+
+        # 위치는 비슷하지만 depth가 확실히 다르면 depth 우선 유지.
+        local_depth_other_group.sort(key=lambda d: self._depth_value_for_priority(d))
+
+        # 위치가 다른 후보도 depth 우선 유지.
+        nonlocal_group.sort(key=lambda d: self._depth_value_for_priority(d))
+
+        return local_depth_tie_group + local_depth_other_group + nonlocal_group
 
     def _available_object_info(self, detections: List[Dict]) -> Tuple[List[int], List[str]]:
         """Return unique currently detected object ids/classes in nearest-depth order."""
@@ -1132,6 +1248,7 @@ class MixedPoseVisionNode(Node):
 
         Current rule:
           smaller depth_score_m -> closer to camera -> higher priority.
+          if depth_score values are similar, priority_square_class is preferred.
 
         depth_score is not the full mask median. It is the median of the nearest
         front-side depth subset computed in depth_front_median_score_in_mask().
@@ -1158,7 +1275,20 @@ class MixedPoseVisionNode(Node):
                 "depth_score_m": round(depth_score, 4),
                 "depth_median_m": round(depth_med, 4),
                 "bbox_area_px": area_px,
-                "reason": "nearest depth_score; smaller is closer",
+                "priority_depth_diff_from_nearest_m": round(
+                    float(det.get("priority_depth_diff_from_nearest_m", 0.0)), 4
+                ),
+                "priority_center_dist_from_nearest_px": round(
+                    float(det.get("priority_center_dist_from_nearest_px", 0.0)), 1
+                ),
+                "priority_position_gate": bool(det.get("priority_position_gate", False)),
+                "priority_depth_gate": bool(det.get("priority_depth_gate", False)),
+                "priority_square_tie_applied": bool(det.get("priority_square_tie_applied", False)),
+                "reason": (
+                    f"position-first tie-break: square is preferred only when "
+                    f"mask center dist <= {self.priority_position_tie_px:.1f}px first, "
+                    f"then depth diff <= {self.priority_depth_tie_m:.3f}m"
+                ),
             })
 
         return table
@@ -1176,7 +1306,10 @@ class MixedPoseVisionNode(Node):
 
         lines = [
             f"[{title}] seq={trigger_seq} candidates={len(detections)} "
-            f"rule=sort_by_depth_score_ascending"
+            f"rule=position_first_then_depth_square_tie_break "
+            f"pos_tie_px={self.priority_position_tie_px:.1f} "
+            f"depth_tie_m={self.priority_depth_tie_m:.3f} "
+            f"square_class={self.priority_square_class}"
         ]
 
         for rank, det in enumerate(detections, start=1):
@@ -1192,7 +1325,12 @@ class MixedPoseVisionNode(Node):
                 f"class={cls:<14} id={obj_id:<2} "
                 f"depth_score={depth_score:.4f}m "
                 f"depth_med={depth_med:.4f}m "
-                f"conf={conf:.3f}"
+                f"conf={conf:.3f} "
+                f"center_dist={float(det.get('priority_center_dist_from_nearest_px', 0.0)):.1f}px "
+                f"d_diff={float(det.get('priority_depth_diff_from_nearest_m', 0.0)):.4f}m "
+                f"pos_gate={bool(det.get('priority_position_gate', False))} "
+                f"depth_gate={bool(det.get('priority_depth_gate', False))} "
+                f"square_tie={bool(det.get('priority_square_tie_applied', False))}"
             )
 
         self.get_logger().info("\n".join(lines))
@@ -1379,7 +1517,15 @@ class MixedPoseVisionNode(Node):
 
             debug_json = {
                 "trigger_seq": int(trigger_seq),
-                "priority_rule": "smaller depth_score is closer and higher priority",
+                "priority_rule": (
+                    f"position-first tie-break: compare mask center distance first; "
+                    f"if center dist <= {self.priority_position_tie_px:.1f}px, "
+                    f"then compare depth diff <= {self.priority_depth_tie_m:.3f}m; "
+                    f"only then prefer square class"
+                ),
+                "priority_depth_tie_m": float(self.priority_depth_tie_m),
+                "priority_position_tie_px": float(self.priority_position_tie_px),
+                "priority_square_class": str(self.priority_square_class),
                 "depth_score_definition": "median of nearest 35 percent valid depth values inside each mask",
                 "depth_scale": float(self.depth_scale),
                 "debug_dir": str(out_dir),
@@ -1419,7 +1565,7 @@ class MixedPoseVisionNode(Node):
         candidates = [d for d in detections if d["class_name"] == self.last_object_class_name]
         if not candidates:
             return None
-        candidates.sort(key=lambda d: d.get("depth_score", d["depth_med"]))
+        candidates = self._sort_detections_with_square_tie_break(candidates)
         return candidates[0]
 
     def _get_empty_space_roi_mask(self, image_shape: Tuple[int, int, int]) -> Tuple[np.ndarray, Dict]:
@@ -1917,7 +2063,7 @@ class MixedPoseVisionNode(Node):
             top_depth = float(top.get("depth_score", top["depth_med"]))
             cv2.putText(
                 display,
-                f"PRIORITY: #1 {top['class_name']} | nearest depth_score={top_depth:.3f}m",
+                f"PRIORITY: #1 {top['class_name']} | d_score={top_depth:.3f}m | pos+depth tie={self.priority_square_class}",
                 (10, 60),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
@@ -1951,13 +2097,17 @@ class MixedPoseVisionNode(Node):
                 if d["class_name"] == requested_class
             ]
 
-        # raw_detections is already sorted by depth, but sort again after filtering.
-        target_detections.sort(key=lambda d: d.get("depth_score", d["depth_med"]))
+        # raw_detections is already sorted by priority, but sort again after filtering.
+        target_detections = self._sort_detections_with_square_tie_break(target_detections)
         status["detected_count"] = len(target_detections)
 
         # Priority information for JSON/log debugging.
         priority_table = self._make_priority_table(target_detections)
-        status["priority_rule"] = "smaller depth_score is closer and higher priority"
+        status["priority_rule"] = (
+            f"smaller depth_score is closer and higher priority; "
+            f"if within {self.priority_depth_tie_m:.3f}m, "
+            f"{self.priority_square_class} is preferred"
+        )
         status["priority_table"] = priority_table
 
         if run_fp:
@@ -2091,10 +2241,17 @@ class MixedPoseVisionNode(Node):
             "priority": {
                 "selected": True,
                 "reason": (
-                    "allowed_ids_nearest_depth"
+                    "allowed_ids_nearest_depth_with_square_tie_break"
                     if requested_allowed_ids is not None
-                    else ("nearest_depth" if requested_class is None else "requested_class_nearest_depth")
+                    else (
+                        "nearest_depth_with_square_tie_break"
+                        if requested_class is None
+                        else "requested_class_nearest_depth_with_square_tie_break"
+                    )
                 ),
+                "priority_depth_tie_m": round(float(self.priority_depth_tie_m), 4),
+                "priority_position_tie_px": round(float(self.priority_position_tie_px), 1),
+                "priority_square_class": str(self.priority_square_class),
                 "allowed_ids": requested_allowed_ids,
                 "depth_median_m": round(float(det["depth_med"]), 4),
                 "depth_score_m": round(float(det.get("depth_score", det["depth_med"])), 4),
@@ -2128,7 +2285,7 @@ class MixedPoseVisionNode(Node):
             f"[OBJECT_6D_SELECTED] seq={trigger_seq} "
             f"rank=#{selected_rank} "
             f"class={class_name} id={self.class_to_id[class_name]} "
-            f"reason=nearest_depth_score "
+            f"reason=nearest_depth_score_with_square_tie_break "
             f"depth_score={det.get('depth_score', det['depth_med']):.4f}m "
             f"depth_med={det['depth_med']:.4f}m "
             f"conf={det['confidence']:.3f} "

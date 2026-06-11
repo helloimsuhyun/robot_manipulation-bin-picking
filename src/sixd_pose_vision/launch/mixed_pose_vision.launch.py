@@ -167,6 +167,12 @@ def generate_launch_description():
         DeclareLaunchArgument("priority_debug_save", default_value="true"),
         DeclareLaunchArgument("priority_debug_dir", default_value="debug_priority"),
 
+        # depth_score가 거의 같은 후보들 사이에서 특정 class를 우선 선택.
+        # 예: hole이 사각형 물체라면, 15mm 이내 거리 차이에서는 hole 우선.
+        DeclareLaunchArgument("priority_depth_tie_m", default_value="0.015"),
+        DeclareLaunchArgument("priority_position_tie_px", default_value="80.0"),
+        DeclareLaunchArgument("priority_square_class", default_value="hole"),
+
         # ============================================================
         # Topic arguments
         # ============================================================
@@ -360,6 +366,18 @@ def generate_launch_description():
                 ),
 
                 "priority_debug_dir": LaunchConfiguration("priority_debug_dir"),
+
+                "priority_depth_tie_m": ParameterValue(
+                    LaunchConfiguration("priority_depth_tie_m"),
+                    value_type=float,
+                ),
+
+                "priority_position_tie_px": ParameterValue(
+                    LaunchConfiguration("priority_position_tie_px"),
+                    value_type=float,
+                ),
+
+                "priority_square_class": LaunchConfiguration("priority_square_class"),
 
                 # ----------------------------
                 # Topics
