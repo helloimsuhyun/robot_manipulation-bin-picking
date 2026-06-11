@@ -734,11 +734,12 @@ class MixedPoseVisionNode(Node):
 
         # Priority tie-break parameters.
         # 기본 우선순위는 depth_score가 작은 물체, 즉 카메라에 더 가까운 물체입니다.
-        # 단, mask 중심 위치도 비슷하고 depth_score 차이도 priority_depth_tie_m 이하이면
-        # priority_square_class를 먼저 선택합니다. 현재 사각형 클래스는 hole입니다.
-        self.declare_parameter("priority_depth_tie_m", 0.015)
-        self.declare_parameter("priority_position_tie_px", 60.0)
-        self.declare_parameter("priority_square_class", "hole")
+        # 단, 카메라 좌표계 XY 위치가 비슷하고 depth_score 차이도 priority_depth_tie_m 이하이면
+        # tie group으로 묶습니다. 그 안에서 hole confidence가 비교 후보보다 높으면 hole을 우선합니다.
+        self.declare_parameter("priority_depth_tie_m", 0.010)
+        self.declare_parameter("priority_xy_tie_m", 0.040)
+        self.declare_parameter("priority_hole_class", "hole")
+        self.declare_parameter("priority_hole_conf_margin", 0.03)
 
         self.foundationpose_repo_path = Path(str(self.get_parameter("foundationpose_repo_path").value)).expanduser()
         self.cad_dir = Path(str(self.get_parameter("cad_dir").value)).expanduser()
@@ -772,13 +773,15 @@ class MixedPoseVisionNode(Node):
         )
 
         self.priority_depth_tie_m = float(self.get_parameter("priority_depth_tie_m").value)
-        self.priority_position_tie_px = float(self.get_parameter("priority_position_tie_px").value)
-        self.priority_square_class = str(self.get_parameter("priority_square_class").value).strip()
+        self.priority_xy_tie_m = float(self.get_parameter("priority_xy_tie_m").value)
+        self.priority_hole_class = str(self.get_parameter("priority_hole_class").value).strip()
+        self.priority_hole_conf_margin = float(self.get_parameter("priority_hole_conf_margin").value)
         self.get_logger().info(
-            f"[PRIORITY] rule=nearest_depth_score_with_position_and_square_tie_break "
+            f"[PRIORITY] rule=nearest_depth_score_with_camera_xy_depth_hole_conf_compare_tie_break "
             f"depth_tie_m={self.priority_depth_tie_m:.3f} "
-            f"position_tie_px={self.priority_position_tie_px:.1f} "
-            f"square_class={self.priority_square_class}"
+            f"xy_tie_m={self.priority_xy_tie_m:.3f} "
+            f"hole_class={self.priority_hole_class} "
+            f"hole_conf_margin={self.priority_hole_conf_margin:.3f}"
         )
 
         self.mesh_alias = {"cross_insert": "cross", "cylinder_insert": "cylinder", "hole_insert": "hole"}
@@ -1148,79 +1151,163 @@ class MixedPoseVisionNode(Node):
         bx, by = self._mask_center_for_priority(b)
         return float(np.hypot(ax - bx, ay - by))
 
+    def _camera_xy_center_for_priority(self, det: Dict) -> Optional[np.ndarray]:
+        """Return mask center as camera-frame XY position in meters.
+
+        The image mask center is deprojected using the detection's priority depth.
+        This is only for priority grouping, not for final 6D pose estimation.
+        """
+        u, v = self._mask_center_for_priority(det)
+        z = self._depth_value_for_priority(det)
+
+        p_cam = deproject_pixel_to_camera(
+            u=float(u),
+            v=float(v),
+            z_m=float(z),
+            intrinsics=self.intrinsics,
+        )
+
+        if p_cam is None:
+            return None
+
+        return p_cam[:2].astype(np.float64)
+
+    def _camera_xy_distance_for_priority_m(self, a: Dict, b: Dict) -> float:
+        """Distance between two detection mask centers in camera-frame XY meters."""
+        pa = self._camera_xy_center_for_priority(a)
+        pb = self._camera_xy_center_for_priority(b)
+
+        if pa is None or pb is None:
+            return float("inf")
+
+        return float(np.linalg.norm(pa - pb))
+
     def _sort_detections_with_square_tie_break(self, detections: List[Dict]) -> List[Dict]:
-        """Sort detections with position-first square tie-break.
+        """Sort detections with camera-XY + depth + hole-confidence comparison.
 
         Priority rule:
-          1) Start from the nearest-depth candidate as the anchor.
-          2) First make a local group whose mask centers are close to the anchor.
-             - center distance <= priority_position_tie_px
-          3) Inside only that local-position group, check whether depth is also similar.
-             - depth difference <= priority_depth_tie_m
-          4) Only inside the local-position + similar-depth group, prefer the square class.
-          5) Candidates outside the local-position group keep normal depth priority.
-
-        In the current object set, the square object class is usually "hole".
+          1) Start from the nearest depth_score candidate as the anchor.
+          2) Candidates whose camera-frame XY centers are close to the anchor
+             become comparison targets.
+          3) Inside that local camera-XY group, if depth_score difference is small,
+             apply tie-break.
+          4) In the tie group, prefer hole only when the best hole confidence is
+             higher than the best non-hole confidence by priority_hole_conf_margin.
+          5) Otherwise keep normal nearest-depth priority.
         """
         if not detections:
             return detections
 
-        depth_tie_m = max(0.0, float(getattr(self, "priority_depth_tie_m", 0.015)))
-        position_tie_px = max(0.0, float(getattr(self, "priority_position_tie_px", 80.0)))
-        square_cls = str(getattr(self, "priority_square_class", "hole"))
+        depth_tie_m = max(0.0, float(getattr(self, "priority_depth_tie_m", 0.010)))
+        xy_tie_m = max(0.0, float(getattr(self, "priority_xy_tie_m", 0.040)))
+        hole_cls = str(getattr(self, "priority_hole_class", "hole"))
+        hole_conf_margin = max(0.0, float(getattr(self, "priority_hole_conf_margin", 0.03)))
 
         # 기본 anchor는 전체 후보 중 가장 가까운 depth_score 후보.
         depth_sorted = sorted(detections, key=lambda d: self._depth_value_for_priority(d))
         anchor = depth_sorted[0]
         anchor_depth = self._depth_value_for_priority(anchor)
 
-        # 1) 먼저 mask 중심 위치가 비슷한 후보만 local group으로 묶는다.
-        local_position_group = []
+        local_xy_group = []
         nonlocal_group = []
+
         for det in depth_sorted:
-            center_dist = self._mask_center_distance_px(det, anchor)
+            xy_dist_m = self._camera_xy_distance_for_priority_m(det, anchor)
+            px_dist = self._mask_center_distance_px(det, anchor)
             depth_diff = abs(self._depth_value_for_priority(det) - anchor_depth)
 
             det["priority_depth_diff_from_nearest_m"] = float(depth_diff)
-            det["priority_center_dist_from_nearest_px"] = float(center_dist)
-            det["priority_position_gate"] = bool(center_dist <= position_tie_px)
+            det["priority_xy_dist_from_nearest_m"] = float(xy_dist_m)
+            det["priority_center_dist_from_nearest_px"] = float(px_dist)  # debug/backward compatibility
+            det["priority_xy_gate"] = bool(xy_dist_m <= xy_tie_m)
+            det["priority_position_gate"] = bool(det["priority_xy_gate"])  # debug/backward compatibility
             det["priority_depth_gate"] = bool(depth_diff <= depth_tie_m)
-            det["priority_square_tie_applied"] = False
+            det["priority_hole_conf_best"] = None
+            det["priority_non_hole_conf_best"] = None
+            det["priority_hole_conf_margin"] = float(hole_conf_margin)
+            det["priority_hole_conf_win"] = False
+            det["priority_hole_tie_applied"] = False
+            det["priority_square_tie_applied"] = False  # debug/backward compatibility
 
-            if center_dist <= position_tie_px:
-                local_position_group.append(det)
+            if det["priority_xy_gate"]:
+                local_xy_group.append(det)
             else:
                 nonlocal_group.append(det)
 
-        # 2) 위치가 비슷한 그룹 안에서만 depth 유사성을 본다.
+        # 카메라 XY 위치가 비슷한 후보 안에서만 depth tie를 판단.
         local_depth_tie_group = []
         local_depth_other_group = []
-        for det in local_position_group:
+
+        for det in local_xy_group:
             if det["priority_depth_gate"]:
                 local_depth_tie_group.append(det)
             else:
                 local_depth_other_group.append(det)
 
-        # 3) 위치도 비슷하고 depth도 비슷한 경우에만 hole/square 우선.
+        # XY도 비슷하고 depth도 비슷할 때만 confidence 비교 기반 hole tie-break.
         if len(local_depth_tie_group) >= 2:
-            for det in local_depth_tie_group:
-                det["priority_square_tie_applied"] = True
+            holes = [
+                det for det in local_depth_tie_group
+                if str(det.get("class_name", "")) == hole_cls
+            ]
+            non_holes = [
+                det for det in local_depth_tie_group
+                if str(det.get("class_name", "")) != hole_cls
+            ]
 
-            local_depth_tie_group.sort(
-                key=lambda det: (
-                    0 if str(det.get("class_name", "")) == square_cls else 1,
-                    -float(det.get("confidence", 0.0)),
-                    self._depth_value_for_priority(det),
+            best_hole_conf = max(
+                [float(det.get("confidence", 0.0)) for det in holes],
+                default=-1.0,
+            )
+            best_non_hole_conf = max(
+                [float(det.get("confidence", 0.0)) for det in non_holes],
+                default=-1.0,
+            )
+
+            hole_conf_wins = (
+                len(holes) > 0
+                and (
+                    len(non_holes) == 0
+                    or best_hole_conf >= best_non_hole_conf + hole_conf_margin
                 )
             )
+
+            for det in local_depth_tie_group:
+                cls = str(det.get("class_name", ""))
+                is_hole = cls == hole_cls
+                det["priority_hole_conf_best"] = float(best_hole_conf)
+                det["priority_non_hole_conf_best"] = float(best_non_hole_conf)
+                det["priority_hole_conf_win"] = bool(hole_conf_wins)
+                det["priority_hole_tie_applied"] = bool(hole_conf_wins and is_hole)
+                det["priority_square_tie_applied"] = bool(hole_conf_wins and is_hole)
+
+            if hole_conf_wins:
+                local_depth_tie_group.sort(
+                    key=lambda det: (
+                        0 if str(det.get("class_name", "")) == hole_cls else 1,
+                        -float(det.get("confidence", 0.0)),
+                        self._depth_value_for_priority(det),
+                    )
+                )
+            else:
+                # hole confidence가 비교 후보보다 충분히 높지 않으면 depth 우선.
+                local_depth_tie_group.sort(
+                    key=lambda det: self._depth_value_for_priority(det)
+                )
         else:
-            local_depth_tie_group.sort(key=lambda d: self._depth_value_for_priority(d))
+            local_depth_tie_group.sort(
+                key=lambda det: self._depth_value_for_priority(det)
+            )
 
-        # 위치는 비슷하지만 depth가 확실히 다르면 depth 우선 유지.
-        local_depth_other_group.sort(key=lambda d: self._depth_value_for_priority(d))
+        # 같은 XY 그룹이지만 depth 차이가 확실하면 depth 우선.
+        local_depth_other_group.sort(
+            key=lambda det: self._depth_value_for_priority(det)
+        )
 
-        # 위치가 다른 후보도 depth 우선 유지.
-        nonlocal_group.sort(key=lambda d: self._depth_value_for_priority(d))
+        # XY 위치가 다른 후보도 depth 우선.
+        nonlocal_group.sort(
+            key=lambda det: self._depth_value_for_priority(det)
+        )
 
         return local_depth_tie_group + local_depth_other_group + nonlocal_group
 
@@ -1248,7 +1335,8 @@ class MixedPoseVisionNode(Node):
 
         Current rule:
           smaller depth_score_m -> closer to camera -> higher priority.
-          if depth_score values are similar, priority_square_class is preferred.
+          if camera XY distance and depth_score difference are small, hole is preferred
+          only when its YOLO confidence is higher than comparison candidates.
 
         depth_score is not the full mask median. It is the median of the nearest
         front-side depth subset computed in depth_front_median_score_in_mask().
@@ -1278,16 +1366,30 @@ class MixedPoseVisionNode(Node):
                 "priority_depth_diff_from_nearest_m": round(
                     float(det.get("priority_depth_diff_from_nearest_m", 0.0)), 4
                 ),
+                "priority_xy_dist_from_nearest_m": round(
+                    float(det.get("priority_xy_dist_from_nearest_m", 0.0)), 4
+                ),
                 "priority_center_dist_from_nearest_px": round(
                     float(det.get("priority_center_dist_from_nearest_px", 0.0)), 1
                 ),
+                "priority_xy_gate": bool(det.get("priority_xy_gate", False)),
                 "priority_position_gate": bool(det.get("priority_position_gate", False)),
                 "priority_depth_gate": bool(det.get("priority_depth_gate", False)),
+                "priority_hole_conf_best": det.get("priority_hole_conf_best"),
+                "priority_non_hole_conf_best": det.get("priority_non_hole_conf_best"),
+                "priority_hole_conf_margin": round(
+                    float(det.get("priority_hole_conf_margin", 0.0)), 3
+                ),
+                "priority_hole_conf_win": bool(det.get("priority_hole_conf_win", False)),
+                "priority_hole_tie_applied": bool(det.get("priority_hole_tie_applied", False)),
                 "priority_square_tie_applied": bool(det.get("priority_square_tie_applied", False)),
                 "reason": (
-                    f"position-first tie-break: square is preferred only when "
-                    f"mask center dist <= {self.priority_position_tie_px:.1f}px first, "
-                    f"then depth diff <= {self.priority_depth_tie_m:.3f}m"
+                    f"camera-XY tie-break: compare candidates only when "
+                    f"camera XY dist <= {self.priority_xy_tie_m:.3f}m, "
+                    f"then depth diff <= {self.priority_depth_tie_m:.3f}m; "
+                    f"inside that tie group, {self.priority_hole_class} is preferred only when "
+                    f"its YOLO confidence >= best non-hole confidence + "
+                    f"{self.priority_hole_conf_margin:.3f}"
                 ),
             })
 
@@ -1306,10 +1408,11 @@ class MixedPoseVisionNode(Node):
 
         lines = [
             f"[{title}] seq={trigger_seq} candidates={len(detections)} "
-            f"rule=position_first_then_depth_square_tie_break "
-            f"pos_tie_px={self.priority_position_tie_px:.1f} "
+            f"rule=camera_xy_then_depth_hole_conf_compare_tie_break "
+            f"xy_tie_m={self.priority_xy_tie_m:.3f} "
             f"depth_tie_m={self.priority_depth_tie_m:.3f} "
-            f"square_class={self.priority_square_class}"
+            f"hole_class={self.priority_hole_class} "
+            f"hole_conf_margin={self.priority_hole_conf_margin:.3f}"
         ]
 
         for rank, det in enumerate(detections, start=1):
@@ -1326,11 +1429,15 @@ class MixedPoseVisionNode(Node):
                 f"depth_score={depth_score:.4f}m "
                 f"depth_med={depth_med:.4f}m "
                 f"conf={conf:.3f} "
-                f"center_dist={float(det.get('priority_center_dist_from_nearest_px', 0.0)):.1f}px "
+                f"xy_dist={float(det.get('priority_xy_dist_from_nearest_m', 0.0)):.4f}m "
+                f"px_dist={float(det.get('priority_center_dist_from_nearest_px', 0.0)):.1f}px "
                 f"d_diff={float(det.get('priority_depth_diff_from_nearest_m', 0.0)):.4f}m "
-                f"pos_gate={bool(det.get('priority_position_gate', False))} "
+                f"xy_gate={bool(det.get('priority_xy_gate', False))} "
                 f"depth_gate={bool(det.get('priority_depth_gate', False))} "
-                f"square_tie={bool(det.get('priority_square_tie_applied', False))}"
+                f"hole_best={det.get('priority_hole_conf_best')} "
+                f"nonhole_best={det.get('priority_non_hole_conf_best')} "
+                f"hole_win={bool(det.get('priority_hole_conf_win', False))} "
+                f"hole_tie={bool(det.get('priority_hole_tie_applied', False))}"
             )
 
         self.get_logger().info("\n".join(lines))
@@ -1518,14 +1625,17 @@ class MixedPoseVisionNode(Node):
             debug_json = {
                 "trigger_seq": int(trigger_seq),
                 "priority_rule": (
-                    f"position-first tie-break: compare mask center distance first; "
-                    f"if center dist <= {self.priority_position_tie_px:.1f}px, "
+                    f"camera-XY tie-break: compare camera XY distance first; "
+                    f"if XY dist <= {self.priority_xy_tie_m:.3f}m, "
                     f"then compare depth diff <= {self.priority_depth_tie_m:.3f}m; "
-                    f"only then prefer square class"
+                    f"inside that tie group, prefer {self.priority_hole_class} only when "
+                    f"hole confidence >= best non-hole confidence + "
+                    f"{self.priority_hole_conf_margin:.3f}"
                 ),
                 "priority_depth_tie_m": float(self.priority_depth_tie_m),
-                "priority_position_tie_px": float(self.priority_position_tie_px),
-                "priority_square_class": str(self.priority_square_class),
+                "priority_xy_tie_m": float(self.priority_xy_tie_m),
+                "priority_hole_class": str(self.priority_hole_class),
+                "priority_hole_conf_margin": float(self.priority_hole_conf_margin),
                 "depth_score_definition": "median of nearest 35 percent valid depth values inside each mask",
                 "depth_scale": float(self.depth_scale),
                 "debug_dir": str(out_dir),
@@ -2063,7 +2173,7 @@ class MixedPoseVisionNode(Node):
             top_depth = float(top.get("depth_score", top["depth_med"]))
             cv2.putText(
                 display,
-                f"PRIORITY: #1 {top['class_name']} | d_score={top_depth:.3f}m | pos+depth tie={self.priority_square_class}",
+                f"PRIORITY: #1 {top['class_name']} | d_score={top_depth:.3f}m | XY+depth+conf tie={self.priority_hole_class}",
                 (10, 60),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
@@ -2105,8 +2215,10 @@ class MixedPoseVisionNode(Node):
         priority_table = self._make_priority_table(target_detections)
         status["priority_rule"] = (
             f"smaller depth_score is closer and higher priority; "
-            f"if within {self.priority_depth_tie_m:.3f}m, "
-            f"{self.priority_square_class} is preferred"
+            f"if camera XY dist <= {self.priority_xy_tie_m:.3f}m and "
+            f"depth diff <= {self.priority_depth_tie_m:.3f}m, "
+            f"{self.priority_hole_class} is preferred only when its confidence >= "
+            f"best non-hole confidence + {self.priority_hole_conf_margin:.3f}"
         )
         status["priority_table"] = priority_table
 
@@ -2241,17 +2353,18 @@ class MixedPoseVisionNode(Node):
             "priority": {
                 "selected": True,
                 "reason": (
-                    "allowed_ids_nearest_depth_with_square_tie_break"
+                    "allowed_ids_nearest_depth_with_camera_xy_depth_hole_conf_compare_tie_break"
                     if requested_allowed_ids is not None
                     else (
-                        "nearest_depth_with_square_tie_break"
+                        "nearest_depth_with_camera_xy_depth_hole_conf_compare_tie_break"
                         if requested_class is None
-                        else "requested_class_nearest_depth_with_square_tie_break"
+                        else "requested_class_nearest_depth_with_camera_xy_depth_hole_conf_compare_tie_break"
                     )
                 ),
                 "priority_depth_tie_m": round(float(self.priority_depth_tie_m), 4),
-                "priority_position_tie_px": round(float(self.priority_position_tie_px), 1),
-                "priority_square_class": str(self.priority_square_class),
+                "priority_xy_tie_m": round(float(self.priority_xy_tie_m), 4),
+                "priority_hole_class": str(self.priority_hole_class),
+                "priority_hole_conf_margin": round(float(self.priority_hole_conf_margin), 4),
                 "allowed_ids": requested_allowed_ids,
                 "depth_median_m": round(float(det["depth_med"]), 4),
                 "depth_score_m": round(float(det.get("depth_score", det["depth_med"])), 4),
@@ -2285,7 +2398,7 @@ class MixedPoseVisionNode(Node):
             f"[OBJECT_6D_SELECTED] seq={trigger_seq} "
             f"rank=#{selected_rank} "
             f"class={class_name} id={self.class_to_id[class_name]} "
-            f"reason=nearest_depth_score_with_square_tie_break "
+            f"reason=nearest_depth_score_with_camera_xy_depth_hole_conf_compare_tie_break "
             f"depth_score={det.get('depth_score', det['depth_med']):.4f}m "
             f"depth_med={det['depth_med']:.4f}m "
             f"conf={det['confidence']:.3f} "
