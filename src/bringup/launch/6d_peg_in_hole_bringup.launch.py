@@ -72,7 +72,7 @@ def generate_launch_description():
 
             "default_mode": "object",
             "enable_visualization": "true",
-            "conf_thresh": "0.60",
+            "conf_thresh": "0.5",
 
             "fp_register_iter": "5",
             "fp_track_iter": "2",
@@ -99,10 +99,10 @@ def generate_launch_description():
 
             # 이미지 grid 후보 간격.
             # 작을수록 촘촘하지만 연산량 증가.
-            "empty_grid_step_px": "40",
+            "empty_grid_step_px": "80",
 
             # vision node가 object JSON에 포함할 최대 후보 개수.
-            "empty_max_candidates": "30",
+            "empty_max_candidates": "40",
 
             # empty-space 후보 탐색 ROI.
             # x_max/y_max=-1이면 image_width-right_margin, image_height-bottom_margin 사용.
@@ -116,7 +116,7 @@ def generate_launch_description():
             # YOLO object mask 주변 제외 영역.
             # 물체 가까운 후보가 많이 잡히면 30~40으로 증가.
             # 후보가 너무 적으면 10~18로 감소.
-            "empty_mask_dilate_px": "22",
+            "empty_mask_dilate_px": "15",
 
             # 후보 주변 depth patch 검사.
             "empty_depth_patch_radius_px": "6",
@@ -124,10 +124,10 @@ def generate_launch_description():
             "empty_depth_spread_max_m": "0.030",
 
             # OpenCV 시각화 유지 시간.
-            "empty_space_vis_hold_sec": "2.0",
+            "empty_space_vis_hold_sec": "3.5",
 
             # priority debug 저장.
-            "priority_debug_save": "true",
+            "priority_debug_save": "false",
             "priority_debug_dir": "debug_priority",
         }.items(),
     )
@@ -207,18 +207,18 @@ def generate_launch_description():
 
             # weighted score 가중치.
             # 물체와 멀수록 좋음 + 원래 pose6 위치와 가까울수록 좋음을 동시에 고려.
-            "empty_space_w_clearance": 2.0,
-            "empty_space_w_pose6_proximity": 2.0,
-            "empty_space_w_roi_edge": 1.0,
+            "empty_space_w_clearance": 2.2,
+            "empty_space_w_pose6_proximity": 1.5,
+            "empty_space_w_roi_edge": 1.5,
             "empty_space_w_vision_score": 0.5,
 
             # normalization saturation 값.
             # clearance가 150mm 이상이면 norm_clearance=1.0
             # 원래 pose6에서 200mm 이상 떨어지면 norm_pose6_proximity=0.0
             # ROI edge가 120px 이상이면 norm_roi_edge=1.0
-            "empty_space_clearance_norm_mm": 150.0,
+            "empty_space_clearance_norm_mm": 180.0,
             "empty_space_pose6_proximity_norm_mm": 200.0,
-            "empty_space_roi_edge_norm_px": 120.0,
+            "empty_space_roi_edge_norm_px": 180.0,
 
             # 실제 제어 노드 구조는 유지하고, publish 직후 preview만 띄움
             "visualize_pose6_target": False,
