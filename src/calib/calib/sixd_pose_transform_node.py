@@ -1,769 +1,690 @@
-#!/usr/bin/env python3
 """
-Mixed 6D pose vision node.
+1. 제어부 트리거 (촬영 위치 TCP 좌표)
+peg trigger input:
+[
+  use_cylinder, use_hole, use_cross,
+  tcp_x_mm, tcp_y_mm, tcp_z_mm, tcp_rx_deg, tcp_ry_deg, tcp_rz_deg
+]
 
-object mode: RealSense RGB-D -> YOLO-seg preview -> trigger topic -> allowed-id nearest object -> FoundationPose register + short tracking refinement 6D pose
-insert mode: RealSense RGB-D -> YOLO-seg -> existing depth PCA + template yaw
+Object id mapping:
+  0: cylinder
+  1: hole
+  2: cross
 
-Important paths are ROS parameters:
-  foundationpose_repo_path, cad_dir, template_dir, object_yolo_path, insert_yolo_path
+The first three values are 0/1 flags.
+Objects with flag 0 are excluded.
+Among objects with flag 1, the vision node runs 6D pose only for the nearest detected object.
+
+hole trigger input remains unchanged:
+[
+  tcp_x_mm, tcp_y_mm, tcp_z_mm, tcp_rx_deg, tcp_ry_deg, tcp_rz_deg
+]
+
+2. vision 부에서 정보 구독
+
+peg output:
+peg output:
+Success, len(data) == 7:
+[
+  object_id,
+  tcp_x_mm,
+  tcp_y_mm,
+  tcp_z_mm,
+  tcp_rx_deg,
+  tcp_ry_deg,
+  tcp_rz_deg
+]
+
+Failure / requested object pose not available, len(data) != 7:
+[
+  currently_visible_object_id_0,
+  currently_visible_object_id_1,
+  ...
+]
+
+insert / hole output:
+[
+  x_mm,
+  y_mm,
+  yaw_deg,
+  id
+]
+
+좌표 변환 관계 
+vision object -> centerd object -> safe centored object (+z축 바닥 방지 , x,y축 변환) -> tcp goal 파지자세 변환
+
+- Final object pose:
+      base_T_centered_object =
+          base_T_raw_object
+          @ raw_object_T_centered_object
+      base_T_centered_object_safe =
+          defend_centered_object_z_up(base_T_centered_object)
+      base_T_tcp_goal =
+          base_T_centered_object_safe
+          @ centered_object_T_tcp_goal
+    output = [object_id, x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg] or [-object_id, pose6..., empty_x_mm, empty_y_mm]
+
+    """
 
 
-cd /home/choisuhyun/course/robot_manipulation-bin-picking
 
-rm -rf build/sixd_pose_vision install/sixd_pose_vision
-
-source /opt/ros/humble/setup.bash
-conda activate cource
-
-export CUDA_HOME="$CONDA_PREFIX"
-export PATH="$CONDA_PREFIX/bin:$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib:$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
-export PYTHONPATH="/home/choisuhyun/course/robot_manipulation-bin-picking/sFoundationPose:${PYTHONPATH:-}"
-
-python -m colcon build --packages-select sixd_pose_vision
-source install/setup.bash
-
-ros2 launch sixd_pose_vision mixed_pose_vision.launch.py
-"""
-
-import sys
 import json
-import shutil
-import traceback
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 
-import cv2
 import numpy as np
-import pyrealsense2 as rs
+import yaml
+
 import rclpy
-import trimesh
-from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
-from scipy.spatial.transform import Rotation
-from std_msgs.msg import String
-from ultralytics import YOLO
+
+from std_msgs.msg import String, Float64MultiArray
+from ament_index_python.packages import get_package_share_directory
 
 
-# =============================================================================
-# Common geometry utilities
-# =============================================================================
+# ============================================================
+# Rotation / Transform util
+
+#  rot3 to R
+def euler_zyx_deg_to_R(rx_deg: float, ry_deg: float, rz_deg: float) -> np.ndarray:
+    rx, ry, rz = np.radians([rx_deg, ry_deg, rz_deg])
+
+    Rx = np.array([
+        [1.0, 0.0, 0.0],
+        [0.0, np.cos(rx), -np.sin(rx)],
+        [0.0, np.sin(rx),  np.cos(rx)],
+    ], dtype=np.float64)
+
+    Ry = np.array([
+        [ np.cos(ry), 0.0, np.sin(ry)],
+        [0.0,         1.0, 0.0],
+        [-np.sin(ry), 0.0, np.cos(ry)],
+    ], dtype=np.float64)
+
+    Rz = np.array([
+        [np.cos(rz), -np.sin(rz), 0.0],
+        [np.sin(rz),  np.cos(rz), 0.0],
+        [0.0,         0.0,        1.0],
+    ], dtype=np.float64)
+
+    return Rz @ Ry @ Rx
+
+# R to rot3
+def R_to_euler_zyx_deg(R: np.ndarray) -> np.ndarray:
+
+    R = orthonormalize_R(np.asarray(R, dtype=np.float64).reshape(3, 3))
+
+    sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
+
+    if sy >= 1e-9:
+        rx = np.arctan2(R[2, 1], R[2, 2])
+        ry = np.arctan2(-R[2, 0], sy)
+        rz = np.arctan2(R[1, 0], R[0, 0])
+    else:
+        rx = np.arctan2(-R[1, 2], R[1, 1])
+        ry = np.arctan2(-R[2, 0], sy)
+        rz = 0.0
+
+    return np.degrees([rx, ry, rz])
+
+# Q to R
+def quat_xyzw_to_R(q_xyzw: List[float]) -> np.ndarray:
+
+    q = np.asarray(q_xyzw, dtype=np.float64).reshape(4)
+    x, y, z, w = q
+
+    n = np.linalg.norm(q)
+    if n < 1e-12:
+        raise ValueError("Invalid quaternion: norm is zero.")
+    x, y, z, w = q / n
+
+    R = np.array([
+        [1.0 - 2.0 * (y*y + z*z),       2.0 * (x*y - z*w),       2.0 * (x*z + y*w)],
+        [      2.0 * (x*y + z*w), 1.0 - 2.0 * (x*x + z*z),       2.0 * (y*z - x*w)],
+        [      2.0 * (x*z - y*w),       2.0 * (y*z + x*w), 1.0 - 2.0 * (x*x + y*y)],
+    ], dtype=np.float64)
+
+    return orthonormalize_R(R)
+
 
 def orthonormalize_R(R: np.ndarray) -> np.ndarray:
+    """
+    Project a nearly-rotation matrix to SO(3).
+    """
     R = np.asarray(R, dtype=np.float64).reshape(3, 3)
+
     U, _, Vt = np.linalg.svd(R)
-    S = np.eye(3)
+    S = np.eye(3, dtype=np.float64)
     S[2, 2] = np.linalg.det(U @ Vt)
     return U @ S @ Vt
 
 
-def build_K(intrinsics) -> np.ndarray:
-    return np.array(
-        [
-            [intrinsics.fx, 0.0, intrinsics.ppx],
-            [0.0, intrinsics.fy, intrinsics.ppy],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float64,
-    )
+def validate_T(T: np.ndarray, name: str = "T", atol: float = 1e-3):
+    T = np.asarray(T, dtype=np.float64).reshape(4, 4)
+
+    if not np.allclose(T[3], np.array([0.0, 0.0, 0.0, 1.0]), atol=1e-8):
+        raise ValueError(f"{name}: last row must be [0, 0, 0, 1]. got {T[3]}")
+
+    R = T[:3, :3]
+    det = float(np.linalg.det(R))
+    if not np.isclose(det, 1.0, atol=atol):
+        raise ValueError(f"{name}: det(R) must be close to 1. det={det}")
+
+    if not np.allclose(R.T @ R, np.eye(3), atol=atol):
+        raise ValueError(f"{name}: R.T @ R must be close to I.")
 
 
-def mask_from_polygon(mask_xy: np.ndarray, shape: Tuple[int, int, int]) -> np.ndarray:
-    mask = np.zeros(shape[:2], dtype=np.uint8)
-    if mask_xy is not None and len(mask_xy) > 0:
-        cv2.fillPoly(mask, [mask_xy.astype(np.int32)], 255)
-    return mask
-
-
-def depth_median_in_mask(depth_image: np.ndarray, mask: np.ndarray, depth_scale: float) -> float:
-    z = depth_image[mask > 0].astype(np.float32) * float(depth_scale)
-    z = z[z > 0]
-    return float(np.median(z)) if len(z) > 0 else float("inf")
-
-
-def depth_front_median_score_in_mask(
-    depth_image: np.ndarray,
-    mask: np.ndarray,
-    depth_scale: float,
-    front_ratio: float = 0.35,
-    min_valid_pixels: int = 30,
-) -> float:
+def pose6_mm_deg_to_T_mm(pose6) -> np.ndarray:
     """
-    Nearest-object selection용 robust depth score.
-
-    전체 mask median(p50)이 아니라, 가까운 쪽 depth subset의 median을 사용한다.
-
-    절차:
-      1. mask 내부 valid depth만 수집
-      2. invalid depth 0 제거
-      3. depth 오름차순 정렬
-      4. 가까운 쪽 front_ratio만 선택
-      5. 그 subset의 median 반환
+    [x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg] -> 4x4 transform in mm.
     """
-    if mask is None:
-        return float("inf")
+    pose6 = np.asarray(pose6, dtype=np.float64).reshape(-1)
+    if pose6.size < 6:
+        raise ValueError(
+            f"pose6 must have at least 6 values: "
+            f"[x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg], got {pose6.size}"
+        )
+
+    x, y, z, rx, ry, rz = pose6[:6]
 
-    z = depth_image[mask > 0].astype(np.float32) * float(depth_scale)
-    z = z[z > 0]
-
-    if len(z) < min_valid_pixels:
-        return float("inf")
-
-    z_sorted = np.sort(z)
-
-    front_count = int(round(len(z_sorted) * float(front_ratio)))
-    front_count = max(min_valid_pixels, front_count)
-    front_count = min(front_count, len(z_sorted))
-
-    z_front = z_sorted[:front_count]
-
-    return float(np.median(z_front))
-
-
-def deproject_pixel_to_camera(
-    u: float,
-    v: float,
-    z_m: float,
-    intrinsics,
-) -> Optional[np.ndarray]:
-    """Deproject one image pixel and depth into camera coordinates.
-
-    Returns [x, y, z] in meters in the camera optical frame.
-    """
-    z_m = float(z_m)
-    if not np.isfinite(z_m) or z_m <= 0.0:
-        return None
-
-    x = (float(u) - float(intrinsics.ppx)) * z_m / float(intrinsics.fx)
-    y = (float(v) - float(intrinsics.ppy)) * z_m / float(intrinsics.fy)
-    return np.array([x, y, z_m], dtype=np.float64)
-
-
-def patch_depth_stats_at_pixel(
-    depth_image: np.ndarray,
-    u: int,
-    v: int,
-    depth_scale: float,
-    radius_px: int = 5,
-) -> Dict:
-    """Robust depth stats around an image-plane proposal point.
-
-    Used for empty-space candidates. Depth values are in meters.
-    """
-    h, w = depth_image.shape[:2]
-    r = max(1, int(radius_px))
-    x0, x1 = max(0, int(u) - r), min(w, int(u) + r + 1)
-    y0, y1 = max(0, int(v) - r), min(h, int(v) + r + 1)
-
-    patch = depth_image[y0:y1, x0:x1].astype(np.float32) * float(depth_scale)
-    total_px = int(patch.size)
-    valid = patch[patch > 0]
-
-    if total_px <= 0 or len(valid) == 0:
-        return {
-            "valid": False,
-            "median_m": None,
-            "valid_ratio": 0.0,
-            "spread_p90_p10_m": None,
-            "valid_px": 0,
-            "total_px": total_px,
-        }
-
-    p10 = float(np.percentile(valid, 10))
-    p50 = float(np.percentile(valid, 50))
-    p90 = float(np.percentile(valid, 90))
-
-    return {
-        "valid": True,
-        "median_m": p50,
-        "valid_ratio": float(len(valid) / max(total_px, 1)),
-        "spread_p90_p10_m": float(p90 - p10),
-        "valid_px": int(len(valid)),
-        "total_px": total_px,
-    }
-
-
-def estimate_mask_translation_camera(
-    depth_image: np.ndarray,
-    mask_img: np.ndarray,
-    intrinsics,
-    depth_scale: float,
-    z_reject_m: float = 0.05,
-) -> Optional[np.ndarray]:
-    """Estimate only translation [x,y,z] of a detected object in camera frame.
-
-    This is not a 6D pose. It is a robust median of masked RGB-D points, useful
-    for downstream empty-space/world collision filtering before FoundationPose.
-    """
-    if mask_img is None:
-        return None
-
-    rows, cols = np.where(mask_img > 0)
-    if len(rows) < 10:
-        return None
-
-    z = depth_image[rows, cols].astype(np.float32) * float(depth_scale)
-    valid = z > 0
-    rows = rows[valid]
-    cols = cols[valid]
-    z = z[valid]
-
-    if len(z) < 10:
-        return None
-
-    z_med = float(np.median(z))
-    keep = np.abs(z - z_med) < float(z_reject_m)
-    rows = rows[keep]
-    cols = cols[keep]
-    z = z[keep]
-
-    if len(z) < 10:
-        return None
-
-    x = (cols.astype(np.float32) - float(intrinsics.ppx)) * z / float(intrinsics.fx)
-    y = (rows.astype(np.float32) - float(intrinsics.ppy)) * z / float(intrinsics.fy)
-    pts = np.stack([x, y, z], axis=1)
-
-    return np.median(pts, axis=0).astype(np.float64)
-
-
-def pose_to_dict(pose_mat: np.ndarray, class_name: str, confidence: float, extra: Optional[Dict] = None) -> Dict:
-    pose_mat = np.asarray(pose_mat, dtype=np.float64).reshape(4, 4)
-    R = orthonormalize_R(pose_mat[:3, :3])
-    t = pose_mat[:3, 3]
-    quat = Rotation.from_matrix(R).as_quat()  # [x, y, z, w]
-    out = {
-        "class": class_name,
-        "confidence": round(float(confidence), 3),
-        "position": {
-            "x": round(float(t[0]), 4),
-            "y": round(float(t[1]), 4),
-            "z": round(float(t[2]), 4),
-        },
-        "orientation": {
-            "x": round(float(quat[0]), 6),
-            "y": round(float(quat[1]), 6),
-            "z": round(float(quat[2]), 6),
-            "w": round(float(quat[3]), 6),
-        },
-        "pose_matrix": pose_mat.tolist(),
-    }
-    if extra:
-        out.update(extra)
-    return out
-
-
-def pca_pose_to_dict(
-    pose_mat: np.ndarray,
-    class_name: str,
-    confidence: float,
-    yaw_deg: float,
-    yaw_score: float,
-    yaw_source: str,
-) -> Dict:
-    pose_mat = np.asarray(pose_mat, dtype=np.float64).reshape(4, 4)
-    R = orthonormalize_R(pose_mat[:3, :3])
-    t = pose_mat[:3, 3]
-    return {
-        "class": class_name,
-        "confidence": round(float(confidence), 3),
-        "position": {
-            "x": round(float(t[0]), 4),
-            "y": round(float(t[1]), 4),
-            "z": round(float(t[2]), 4),
-        },
-        "orientation": {
-            "axis_x": [round(float(v), 4) for v in R[:, 0]],
-            "axis_y": [round(float(v), 4) for v in R[:, 1]],
-            "axis_z": [round(float(v), 4) for v in R[:, 2]],
-        },
-        "yaw_deg": round(float(yaw_deg), 2),
-        "yaw_score": round(float(yaw_score), 3),
-        "yaw_source": yaw_source,
-        "pose_matrix": pose_mat.tolist(),
-    }
-
-
-def make_pose_stamped(pose_mat: np.ndarray, frame_id: str) -> PoseStamped:
-    pose_mat = np.asarray(pose_mat, dtype=np.float64).reshape(4, 4)
-    R = orthonormalize_R(pose_mat[:3, :3])
-    t = pose_mat[:3, 3]
-    q = Rotation.from_matrix(R).as_quat()
-    msg = PoseStamped()
-    msg.header.frame_id = frame_id
-    msg.pose.position.x = float(t[0])
-    msg.pose.position.y = float(t[1])
-    msg.pose.position.z = float(t[2])
-    msg.pose.orientation.x = float(q[0])
-    msg.pose.orientation.y = float(q[1])
-    msg.pose.orientation.z = float(q[2])
-    msg.pose.orientation.w = float(q[3])
-    return msg
-
-
-def draw_pose_axis(image: np.ndarray, pose_mat: np.ndarray, K: np.ndarray, axis_len: float = 0.10) -> None:
-    pose_mat = np.asarray(pose_mat, dtype=np.float64).reshape(4, 4)
-    R = pose_mat[:3, :3]
-    t = pose_mat[:3, 3]
-    fx, fy = K[0, 0], K[1, 1]
-    cx, cy = K[0, 2], K[1, 2]
-
-    def proj(pt3d):
-        x, y, z = pt3d
-        if z <= 0:
-            return None
-        return (int(x * fx / z + cx), int(y * fy / z + cy))
-
-    origin = proj(t)
-    if origin is None:
-        return
-    for axis_vec, color in [(R[:, 0], (0, 0, 255)), (R[:, 1], (0, 255, 0)), (R[:, 2], (255, 0, 0))]:
-        p = proj(t + axis_vec * axis_len)
-        if p is not None:
-            cv2.arrowedLine(image, origin, p, color, 2, tipLength=0.2)
-
-
-def draw_projected_3d_bbox(
-    image: np.ndarray,
-    ob_in_cam: np.ndarray,
-    K: np.ndarray,
-    bbox: np.ndarray,
-    color: Tuple[int, int, int] = (255, 255, 255),
-    thickness: int = 2,
-) -> None:
-    """Project and draw a CAD 3D bounding box.
-
-    bbox format:
-      [[xmin, ymin, zmin],
-       [xmax, ymax, zmax]]
-    ob_in_cam:
-      4x4 transform from object/bbox coordinate to camera coordinate.
-    """
-    ob_in_cam = np.asarray(ob_in_cam, dtype=np.float64).reshape(4, 4)
-    bbox = np.asarray(bbox, dtype=np.float64).reshape(2, 3)
-
-    xmin, ymin, zmin = bbox[0]
-    xmax, ymax, zmax = bbox[1]
-
-    corners = np.array(
-        [
-            [xmin, ymin, zmin],
-            [xmax, ymin, zmin],
-            [xmax, ymax, zmin],
-            [xmin, ymax, zmin],
-            [xmin, ymin, zmax],
-            [xmax, ymin, zmax],
-            [xmax, ymax, zmax],
-            [xmin, ymax, zmax],
-        ],
-        dtype=np.float64,
-    )
-
-    corners_h = np.concatenate([corners, np.ones((8, 1), dtype=np.float64)], axis=1)
-    pts_cam = (ob_in_cam @ corners_h.T).T[:, :3]
-
-    fx, fy = K[0, 0], K[1, 1]
-    cx, cy = K[0, 2], K[1, 2]
-
-    pts_2d = []
-    for x, y, z in pts_cam:
-        if z <= 0:
-            pts_2d.append(None)
-        else:
-            pts_2d.append((int(x * fx / z + cx), int(y * fy / z + cy)))
-
-    edges = [
-        (0, 1), (1, 2), (2, 3), (3, 0),
-        (4, 5), (5, 6), (6, 7), (7, 4),
-        (0, 4), (1, 5), (2, 6), (3, 7),
-    ]
-
-    for a, b in edges:
-        if pts_2d[a] is not None and pts_2d[b] is not None:
-            cv2.line(image, pts_2d[a], pts_2d[b], color, thickness, cv2.LINE_AA)
-
-
-# =============================================================================
-# Insert mode: existing template yaw + PCA pose
-# =============================================================================
-
-def normalize_binary(img: Optional[np.ndarray], match_size: int) -> Optional[np.ndarray]:
-    if img is None:
-        return None
-    if len(img.shape) == 3:
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    img = cv2.resize(img, (match_size, match_size), interpolation=cv2.INTER_NEAREST)
-    _, img = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY)
-    return img.astype(np.uint8)
-
-
-def rotate_keep_size(img: np.ndarray, angle_deg: float) -> np.ndarray:
-    h, w = img.shape[:2]
-    M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle_deg, 1.0)
-    return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_NEAREST, borderValue=0)
-
-
-def crop_mask_to_square(mask_img: np.ndarray, pad_ratio: float = 0.2) -> Optional[np.ndarray]:
-    ys, xs = np.where(mask_img > 0)
-    if len(xs) < 10:
-        return None
-    x0, x1 = xs.min(), xs.max()
-    y0, y1 = ys.min(), ys.max()
-    side = max(x1 - x0 + 1, y1 - y0 + 1)
-    side += 2 * int(round(side * pad_ratio))
-    cx = (x0 + x1) // 2
-    cy = (y0 + y1) // 2
-    x0, y0 = cx - side // 2, cy - side // 2
-    x1, y1 = x0 + side, y0 + side
-    out = np.zeros((side, side), dtype=np.uint8)
-    sx0, sy0 = max(0, x0), max(0, y0)
-    sx1, sy1 = min(mask_img.shape[1], x1), min(mask_img.shape[0], y1)
-    dx0, dy0 = sx0 - x0, sy0 - y0
-    dx1, dy1 = dx0 + (sx1 - sx0), dy0 + (sy1 - sy0)
-    out[dy0:dy1, dx0:dx1] = mask_img[sy0:sy1, sx0:sx1]
-    return out
-
-
-def iou_score(a: np.ndarray, b: np.ndarray) -> float:
-    a_bin, b_bin = a > 0, b > 0
-    inter = np.logical_and(a_bin, b_bin).sum()
-    union = np.logical_or(a_bin, b_bin).sum()
-    return float(inter / union) if union > 0 else 0.0
-
-
-
-def depth_stats_in_mask(
-    depth_image: np.ndarray,
-    mask_img: np.ndarray,
-    depth_scale: float,
-) -> Dict:
-    """Return detailed depth statistics inside a binary mask.
-
-    Used only for debugging. All depth values are in meters.
-    """
-    if mask_img is None:
-        return {
-            "area_px": 0,
-            "valid_px": 0,
-            "valid_ratio": 0.0,
-            "min": None,
-            "p05": None,
-            "p10": None,
-            "p20": None,
-            "p35": None,
-            "p50": None,
-            "p75": None,
-            "max": None,
-            "spread_p50_p10": None,
-            "spread_p50_p20": None,
-        }
-
-    z = depth_image[mask_img > 0].astype(np.float32) * float(depth_scale)
-    valid_z = z[z > 0]
-
-    area_px = int(np.sum(mask_img > 0))
-    valid_px = int(len(valid_z))
-    valid_ratio = float(valid_px / area_px) if area_px > 0 else 0.0
-
-    if valid_px == 0:
-        return {
-            "area_px": area_px,
-            "valid_px": valid_px,
-            "valid_ratio": round(valid_ratio, 4),
-            "min": None,
-            "p05": None,
-            "p10": None,
-            "p20": None,
-            "p35": None,
-            "p50": None,
-            "p75": None,
-            "max": None,
-            "spread_p50_p10": None,
-            "spread_p50_p20": None,
-        }
-
-    p05 = float(np.percentile(valid_z, 5))
-    p10 = float(np.percentile(valid_z, 10))
-    p20 = float(np.percentile(valid_z, 20))
-    p35 = float(np.percentile(valid_z, 35))
-    p50 = float(np.percentile(valid_z, 50))
-    p75 = float(np.percentile(valid_z, 75))
-
-    return {
-        "area_px": area_px,
-        "valid_px": valid_px,
-        "valid_ratio": round(valid_ratio, 4),
-        "min": round(float(np.min(valid_z)), 4),
-        "p05": round(p05, 4),
-        "p10": round(p10, 4),
-        "p20": round(p20, 4),
-        "p35": round(p35, 4),
-        "p50": round(p50, 4),
-        "p75": round(p75, 4),
-        "max": round(float(np.max(valid_z)), 4),
-        "spread_p50_p10": round(float(p50 - p10), 4),
-        "spread_p50_p20": round(float(p50 - p20), 4),
-    }
-
-
-def save_mask_point_cloud_ply(
-    path: Path,
-    depth_image: np.ndarray,
-    mask_img: np.ndarray,
-    color_image: np.ndarray,
-    intrinsics,
-    depth_scale: float,
-    max_points: int = 30000,
-) -> int:
-    """Save masked RGB-D points as an ASCII PLY file.
-
-    Returns the number of saved points. Coordinates are in the camera frame, meters.
-    """
-    if mask_img is None:
-        return 0
-
-    rows, cols = np.where(mask_img > 0)
-    if len(rows) == 0:
-        return 0
-
-    z = depth_image[rows, cols].astype(np.float32) * float(depth_scale)
-    valid = z > 0
-    rows = rows[valid]
-    cols = cols[valid]
-    z = z[valid]
-
-    if len(z) == 0:
-        return 0
-
-    x = (cols.astype(np.float32) - intrinsics.ppx) * z / intrinsics.fx
-    y = (rows.astype(np.float32) - intrinsics.ppy) * z / intrinsics.fy
-    pts = np.stack([x, y, z], axis=1)
-    bgr = color_image[rows, cols].astype(np.uint8)
-
-    if len(pts) > max_points:
-        idx = np.random.choice(len(pts), size=max_points, replace=False)
-        pts = pts[idx]
-        bgr = bgr[idx]
-
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(path, "w") as f:
-        f.write("ply\n")
-        f.write("format ascii 1.0\n")
-        f.write(f"element vertex {len(pts)}\n")
-        f.write("property float x\n")
-        f.write("property float y\n")
-        f.write("property float z\n")
-        f.write("property uchar red\n")
-        f.write("property uchar green\n")
-        f.write("property uchar blue\n")
-        f.write("end_header\n")
-
-        for p, c in zip(pts, bgr):
-            # color_image is BGR, PLY expects RGB.
-            b, g, r = int(c[0]), int(c[1]), int(c[2])
-            f.write(f"{p[0]:.6f} {p[1]:.6f} {p[2]:.6f} {r} {g} {b}\n")
-
-    return int(len(pts))
-
-
-def get_point_cloud(depth_image: np.ndarray, mask_img: np.ndarray, intrinsics, depth_scale: float) -> Optional[np.ndarray]:
-    rows, cols = np.where(mask_img > 0)
-    z_vals = depth_image[rows, cols].astype(np.float32) * float(depth_scale)
-    valid = z_vals > 0
-    rows, cols, z_vals = rows[valid], cols[valid], z_vals[valid]
-    if len(z_vals) < 10:
-        return None
-    z_med = np.median(z_vals)
-    valid = np.abs(z_vals - z_med) < 0.05
-    rows, cols, z_vals = rows[valid], cols[valid], z_vals[valid]
-    if len(z_vals) < 10:
-        return None
-    x = (cols - intrinsics.ppx) * z_vals / intrinsics.fx
-    y = (rows - intrinsics.ppy) * z_vals / intrinsics.fy
-    return np.stack([x, y, z_vals], axis=1)
-
-
-def estimate_pca_pose(points: np.ndarray) -> np.ndarray:
-    centroid = np.median(points, axis=0)
-    cov = np.cov((points - centroid).T)
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    order = np.argsort(eigvals)[::-1]
-    R = orthonormalize_R(eigvecs[:, order])
     T = np.eye(4, dtype=np.float64)
-    T[:3, :3] = R
-    T[:3, 3] = centroid
+    T[:3, :3] = euler_zyx_deg_to_R(rx, ry, rz)
+    T[:3, 3] = [x, y, z]
     return T
 
 
-# =============================================================================
-# Object mode: FoundationPose wrapper
-# =============================================================================
+def T_mm_to_pose6_mm_deg(T: np.ndarray) -> np.ndarray:
+    """
+    4x4 transform in mm -> [x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg].
+    """
+    T = np.asarray(T, dtype=np.float64).reshape(4, 4)
+    validate_T(T, name="T_mm_to_pose6 input")
 
-class FPEstimator:
-    def __init__(self, class_name, mesh, foundationpose_cls, glctx, scorer, refiner, debug=0, debug_dir=""):
-        self.class_name = class_name
-        kwargs = dict(
-            model_pts=mesh.vertices,
-            model_normals=mesh.vertex_normals,
-            mesh=mesh,
-            scorer=scorer,
-            refiner=refiner,
-            glctx=glctx,
-            debug=int(debug),
+    R = orthonormalize_R(T[:3, :3])
+    rpy = R_to_euler_zyx_deg(R)
+    p = T[:3, 3]
+
+    return np.array([p[0], p[1], p[2], rpy[0], rpy[1], rpy[2]], dtype=np.float64)
+
+
+def T_m_to_T_mm(T_m: np.ndarray) -> np.ndarray:
+    T = np.asarray(T_m, dtype=np.float64).reshape(4, 4).copy()
+    T[:3, 3] *= 1000.0
+    return T
+
+
+def T_mm_to_T_m(T_mm: np.ndarray) -> np.ndarray:
+    T = np.asarray(T_mm, dtype=np.float64).reshape(4, 4).copy()
+    T[:3, 3] /= 1000.0
+    return T
+
+
+def matrix_from_data(data, unit: str = "mm") -> np.ndarray:
+    """
+    4x4 matrix with translation unit either mm or m.
+    Return transform in mm.
+    """
+    T = np.asarray(data, dtype=np.float64).reshape(4, 4).copy()
+    T[:3, :3] = orthonormalize_R(T[:3, :3])
+
+    if unit == "m":
+        T[:3, 3] *= 1000.0
+    elif unit == "mm":
+        pass
+    else:
+        raise ValueError(f"Unsupported unit: {unit}. Use 'm' or 'mm'.")
+
+    validate_T(T, name="matrix_from_data")
+    return T
+
+
+def normalize_vec(v: np.ndarray, name: str = "vector") -> np.ndarray:
+    v = np.asarray(v, dtype=np.float64).reshape(3)
+    n = float(np.linalg.norm(v))
+    if n < 1e-12:
+        raise ValueError(f"{name}: norm is too small.")
+    return v / n
+
+
+# object z축 바닥 방지 함수
+def defend_centered_object_z_up(
+    T: np.ndarray,
+    up: np.ndarray = np.array([0, 0, 1], dtype=np.float64),
+    z_flip_margin: float = 0.05,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    object +Z가 world +Z에 더 가깝도록 보정한다.
+    """
+    T = np.asarray(T, dtype=np.float64).reshape(4, 4).copy()
+    validate_T(T, name="z_defense_in")
+
+    up = normalize_vec(up, name="z_defense_up")
+    R = orthonormalize_R(T[:3, :3])
+
+    def _make_right_handed_from_xz(x_raw: np.ndarray, z_raw: np.ndarray, tag: str) -> np.ndarray:
+        z = normalize_vec(z_raw, name=f"{tag}_z")
+
+        # x를 z에 수직인 평면으로 투영
+        x = np.asarray(x_raw, dtype=np.float64).reshape(3)
+        x = x - z * float(np.dot(x, z))
+        x = normalize_vec(x, name=f"{tag}_x_proj")
+
+        # 오른손 좌표계 유지: x × y = z 가 되려면 y = z × x
+        y = normalize_vec(np.cross(z, x), name=f"{tag}_y")
+
+        return orthonormalize_R(np.column_stack([x, y, z]))
+
+    R_keep = _make_right_handed_from_xz(
+        R[:, 0],
+        R[:, 2],
+        tag="keep",
+    )
+    keep_dot = float(np.dot(R_keep[:, 2], up))
+
+    R_flip = _make_right_handed_from_xz(
+        -R[:, 0],
+        -R[:, 2],
+        tag="flip",
+    )
+    flip_dot = float(np.dot(R_flip[:, 2], up))
+
+    z_flipped = flip_dot > keep_dot + float(z_flip_margin)
+
+    if z_flipped:
+        T[:3, :3] = R_flip
+    else:
+        T[:3, :3] = R_keep
+
+    validate_T(T, name="z_defense_out")
+
+    info = {
+        "z_flipped": bool(z_flipped),
+
+        "before_dot_up": {
+            "x": float(np.dot(R_keep[:, 0], up)),
+            "y": float(np.dot(R_keep[:, 1], up)),
+            "z": float(keep_dot),
+        },
+
+        "keep_dot_up": {
+            "x": float(np.dot(R_keep[:, 0], up)),
+            "y": float(np.dot(R_keep[:, 1], up)),
+            "z": float(keep_dot),
+        },
+        "flip_dot_up": {
+            "x": float(np.dot(R_flip[:, 0], up)),
+            "y": float(np.dot(R_flip[:, 1], up)),
+            "z": float(flip_dot),
+        },
+
+        "after_dot_up": {
+            "x": float(np.dot(T[:3, 0], up)),
+            "y": float(np.dot(T[:3, 1], up)),
+            "z": float(np.dot(T[:3, 2], up)),
+        },
+    }
+
+    return T, info
+
+# center/object frame의 X/Y 축 중 월드 XY 평면에 더 평행한 축을 새 object +X로 선택
+
+def canonicalize_xy_flatter_as_x(
+    T: np.ndarray,
+    up: np.ndarray = np.array([0, 0, 1], dtype=np.float64),
+    swap_margin: float = 0.03,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+
+    T = np.asarray(T, dtype=np.float64).reshape(4, 4).copy()
+    validate_T(T, name="xy_flatten_in")
+
+    up = normalize_vec(up, name="xy_flatten_up")
+    R = orthonormalize_R(T[:3, :3])
+
+    x_old = normalize_vec(R[:, 0], "xy_x_old")
+    y_old = normalize_vec(R[:, 1], "xy_y_old")
+    z = normalize_vec(R[:, 2], "xy_z")
+
+    x_flatness = abs(float(np.dot(x_old, up)))
+    y_flatness = abs(float(np.dot(y_old, up)))
+
+    # y축이 x축보다 충분히 더 수평이면 y를 새 x로 채택
+    swapped_xy = y_flatness + float(swap_margin) < x_flatness
+
+    if swapped_xy:
+        x_new = y_old.copy()
+        # 오른손 좌표계 유지: y = z × x
+        y_new = normalize_vec(np.cross(z, x_new), "xy_y_new")
+    else:
+        x_new = x_old.copy()
+        y_new = normalize_vec(np.cross(z, x_new), "xy_y_keep")
+
+    # 수치오차 방지: x를 z에 수직으로 재투영 후 y 재계산
+    x_new = normalize_vec(x_new - z * float(np.dot(x_new, z)), "xy_x_proj")
+    y_new = normalize_vec(np.cross(z, x_new), "xy_y_final")
+
+    T[:3, :3] = orthonormalize_R(np.column_stack([x_new, y_new, z]))
+    validate_T(T, name="xy_flatten_out")
+
+    info = {
+        "xy_swapped": bool(swapped_xy),
+        "x_flatness_before": float(x_flatness),
+        "y_flatness_before": float(y_flatness),
+        "selected_x_from": "old_y" if swapped_xy else "old_x",
+        "x_flatness_after": abs(float(np.dot(T[:3, 0], up))),
+        "y_flatness_after": abs(float(np.dot(T[:3, 1], up))),
+        "z_dot_up_after": float(np.dot(T[:3, 2], up)),
+    }
+    return T, info
+
+
+def compute_centered_axis_tilt_info(
+    T: np.ndarray,
+    up: np.ndarray = np.array([0, 0, 1], dtype=np.float64),
+) -> Dict[str, Any]:
+    """
+    centered/safe object frame의 각 축이 world XY 평면 또는 world +Z와 이루는 각도를 계산한다.
+
+    x_tilt_ground_deg / y_tilt_ground_deg:
+        각 축이 world XY 평면에서 얼마나 들렸는지 [deg].
+        0 deg이면 완전히 XY 평면에 평행하고, 90 deg이면 world Z 방향이다.
+
+    z_tilt_up_deg:
+        object +Z가 world +Z에서 얼마나 기울었는지 [deg].
+    """
+    T = np.asarray(T, dtype=np.float64).reshape(4, 4)
+    validate_T(T, name="compute_centered_axis_tilt_info")
+
+    up = normalize_vec(up, name="tilt_info_up")
+    R = orthonormalize_R(T[:3, :3])
+    p = T[:3, 3]
+
+    x_axis = R[:, 0]
+    y_axis = R[:, 1]
+    z_axis = R[:, 2]
+
+    x_dot_up = float(np.dot(x_axis, up))
+    y_dot_up = float(np.dot(y_axis, up))
+    z_dot_up = float(np.dot(z_axis, up))
+
+    x_tilt_ground_deg = float(
+        np.degrees(np.arcsin(np.clip(abs(x_dot_up), 0.0, 1.0)))
+    )
+    y_tilt_ground_deg = float(
+        np.degrees(np.arcsin(np.clip(abs(y_dot_up), 0.0, 1.0)))
+    )
+    z_tilt_up_deg = float(
+        np.degrees(np.arccos(np.clip(z_dot_up, -1.0, 1.0)))
+    )
+
+    return {
+        "p": p,
+        "x_axis": x_axis,
+        "y_axis": y_axis,
+        "z_axis": z_axis,
+        "x_dot_up": x_dot_up,
+        "y_dot_up": y_dot_up,
+        "z_dot_up": z_dot_up,
+        "x_tilt_ground_deg": x_tilt_ground_deg,
+        "y_tilt_ground_deg": y_tilt_ground_deg,
+        "z_tilt_up_deg": z_tilt_up_deg,
+    }
+
+
+def log_centered_axis_tilt(logger, label: str, cls: str, tilt_info: Dict[str, Any]):
+    p = tilt_info["p"]
+    x_axis = tilt_info["x_axis"]
+    y_axis = tilt_info["y_axis"]
+    z_axis = tilt_info["z_axis"]
+    logger.info(
+        f"[{label}] cls={cls} "
+        f"p=[{p[0]:+.1f}, {p[1]:+.1f}, {p[2]:+.1f}]mm "
+        f"x=[{x_axis[0]:+.3f}, {x_axis[1]:+.3f}, {x_axis[2]:+.3f}] "
+        f"y=[{y_axis[0]:+.3f}, {y_axis[1]:+.3f}, {y_axis[2]:+.3f}] "
+        f"z=[{z_axis[0]:+.3f}, {z_axis[1]:+.3f}, {z_axis[2]:+.3f}] "
+        f"x_dot_up={tilt_info['x_dot_up']:+.3f} "
+        f"y_dot_up={tilt_info['y_dot_up']:+.3f} "
+        f"z_dot_up={tilt_info['z_dot_up']:+.3f} "
+        f"x_tilt_ground={tilt_info['x_tilt_ground_deg']:.2f}deg "
+        f"y_tilt_ground={tilt_info['y_tilt_ground_deg']:.2f}deg "
+        f"z_tilt_up={tilt_info['z_tilt_up_deg']:.2f}deg"
+    )
+
+
+# json을 4x4 mat로 변환하는 util
+def object_json_to_cam_T_obj_mm(obj: Dict[str, Any]) -> np.ndarray:
+    """
+    Convert object pose JSON from FoundationPose / detector node to camera_T_object in mm.
+
+    Supported formats:
+    1) Preferred:
+        obj["pose_matrix"] = 4x4 camera_T_object, translation in meters.
+
+    2) Position + quaternion:
+        obj["position"] = {"x": m, "y": m, "z": m}
+        obj["orientation"] = {"x": qx, "y": qy, "z": qz, "w": qw}
+
+    3) Legacy axis format:
+        obj["position"] = {"x": m, "y": m, "z": m}
+        obj["orientation"] = {
+            "axis_x": [...],
+            "axis_y": [...],
+            "axis_z": [...]
+        }
+    """
+    if "pose_matrix" in obj:
+        T_cam_obj_m = np.asarray(obj["pose_matrix"], dtype=np.float64).reshape(4, 4)
+        T_cam_obj_m[:3, :3] = orthonormalize_R(T_cam_obj_m[:3, :3])
+        validate_T(T_cam_obj_m, name="obj.pose_matrix")
+        return T_m_to_T_mm(T_cam_obj_m)
+
+    if "position" not in obj or "orientation" not in obj:
+        raise KeyError("object must contain either 'pose_matrix' or both 'position' and 'orientation'.")
+
+    pos = obj["position"]
+    ori = obj["orientation"]
+
+    p_cam_obj_mm = np.array([
+        float(pos["x"]),
+        float(pos["y"]),
+        float(pos["z"]),
+    ], dtype=np.float64) * 1000.0
+
+    if all(k in ori for k in ("x", "y", "z", "w")):
+        R_cam_obj = quat_xyzw_to_R([
+            float(ori["x"]),
+            float(ori["y"]),
+            float(ori["z"]),
+            float(ori["w"]),
+        ])
+    elif all(k in ori for k in ("axis_x", "axis_y", "axis_z")):
+        R_cam_obj = np.column_stack([
+            np.asarray(ori["axis_x"], dtype=np.float64).reshape(3),
+            np.asarray(ori["axis_y"], dtype=np.float64).reshape(3),
+            np.asarray(ori["axis_z"], dtype=np.float64).reshape(3),
+        ])
+        R_cam_obj = orthonormalize_R(R_cam_obj)
+    else:
+        raise KeyError(
+            "orientation must be quaternion keys x/y/z/w or axis_x/axis_y/axis_z."
         )
-        if debug_dir:
-            kwargs["debug_dir"] = debug_dir
-        self.estimator = foundationpose_cls(**kwargs)
-        self.registered = False
-        self.last_score = 1.0
 
-    def estimate(
-        self,
-        rgb_bgr,
-        depth_uint16,
-        mask_uint8,
-        K,
-        register_iter,
-        track_iter,
-        track_loss_thr,
-        use_tracking,
-        depth_scale: float = 0.001,
-    ):
-        rgb = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2RGB).astype(np.uint8)
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = R_cam_obj
+    T[:3, 3] = p_cam_obj_mm
 
-        depth_scale = float(depth_scale)
-        if depth_scale <= 0.0:
-            raise ValueError(f"Invalid depth_scale={depth_scale}. It must be positive.")
-
-        depth = depth_uint16.astype(np.float32) * depth_scale
-        need_register = (not use_tracking) or (not self.registered) or (self.last_score < track_loss_thr)
-        if need_register:
-            pose = self.estimator.register(K=K, rgb=rgb, depth=depth, ob_mask=(mask_uint8 > 0), iteration=int(register_iter))
-            self.registered = True
-        else:
-            pose = self.estimator.track_one(rgb=rgb, depth=depth, K=K, iteration=int(track_iter))
-        if hasattr(self.estimator, "last_score"):
-            try:
-                self.last_score = float(self.estimator.last_score)
-            except Exception:
-                pass
-        return np.asarray(pose, dtype=np.float64).reshape(4, 4)
-
-    def reset(self):
-        self.registered = False
-        self.last_score = 1.0
+    validate_T(T, name="cam_T_obj")
+    return T
 
 
-# =============================================================================
-# ROS2 node
-# =============================================================================
 
-class MixedPoseVisionNode(Node):
+def canonical_object_name(cls: str) -> str:
+    """
+    Insert class shares object CAD/grasp config by default.
+    """
+    alias = {
+        "cross_insert": "cross",
+        "cylinder_insert": "cylinder",
+        "hole_insert": "hole",
+    }
+    return alias.get(cls, cls)
+
+
+
+# ============================================================
+# ROS2 Node
+# ============================================================
+
+
+def wrap_deg(a: float) -> float:
+    """각도를 [-180, 180) 범위로 정규화."""
+    return float((float(a) + 180.0) % 360.0 - 180.0)
+
+def T_rot_z_deg(deg: float) -> np.ndarray:
+    """object/center local +Z 기준 yaw 회전 4x4."""
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = euler_zyx_deg_to_R(0.0, 0.0, float(deg))
+    return T
+
+def signed_angle_about_axis_deg(v_from: np.ndarray, v_to: np.ndarray, axis: np.ndarray) -> float:
+    """axis 기준 v_from -> v_to signed angle [deg]."""
+    axis = normalize_vec(axis, name="signed_angle_axis")
+    a = np.asarray(v_from, dtype=np.float64).reshape(3)
+    b = np.asarray(v_to, dtype=np.float64).reshape(3)
+
+    # axis에 수직인 평면으로 projection
+    a = a - axis * float(np.dot(a, axis))
+    b = b - axis * float(np.dot(b, axis))
+    a = normalize_vec(a, name="signed_angle_from_proj")
+    b = normalize_vec(b, name="signed_angle_to_proj")
+
+    s = float(np.dot(axis, np.cross(a, b)))
+    c = float(np.clip(np.dot(a, b), -1.0, 1.0))
+    return float(np.degrees(np.arctan2(s, c)))
+
+
+# ============================================================
+# rbpodo TCP 쿼리 헬퍼 (handeye_sampler 코드 참고)
+# ============================================================
+
+
+class ObjectPoseTransformNode(Node):
+    """
+    Mixed output transform node.
+
+    Input:
+        /manipulation/trigger_peg:
+            std_msgs/Float64MultiArray
+            data = [use_cylinder, use_hole, use_cross, x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg]
+            The first three values are 0/1 flags for object ids:
+                0: cylinder, 1: hole, 2: cross.
+            Objects with flag 0 are excluded.
+            The allowed ids are relayed to the 6D pose trigger topic.
+
+        /object_poses:
+            Object detections from mixed_pose_vision_node.
+            Object mode is expected to use FoundationPose pose_matrix.
+
+        /manipulation/trigger_hole:
+            std_msgs/Float64MultiArray
+            data = [x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg]
+            This keeps the old hole/insert behavior.
+
+        /insert_poses:
+            Insert detections from mixed_pose_vision_node.
+            Insert mode keeps the old output convention: [x, y, yaw, id].
+
+    Output:
+        /vision/peg_targets:
+            Success: 7 floats:
+                [selected_object_id, tcp_x_mm, tcp_y_mm, tcp_z_mm, tcp_rx_deg, tcp_ry_deg, tcp_rz_deg]
+
+            Failure / requested/allowed object pose not available: variable-length id list:
+                [currently_visible_object_id_0, currently_visible_object_id_1, ...]
+
+            Therefore the controller can branch by len(data):
+                len(data) == 7 -> success [object_id, moveL pose6] response
+                len(data) != 7 -> failure/fallback visible-id response
+
+            The published pose6 part, data[1:7], is intended to be sent directly to robot moveL.
+
+        /vision/hole_targets:
+            insert target, legacy format. 4 floats per target:
+            [x_mm, y_mm, yaw_deg, id]
+    """
+
     def __init__(self):
-        super().__init__("mixed_pose_vision_node")
+        super().__init__("sixd_pose_transform_node")
 
-        # Path parameters
-        self.declare_parameter("foundationpose_repo_path", str(Path.home() / "FoundationPose"))
-        self.declare_parameter("cad_dir", "")
-        self.declare_parameter("template_dir", "")
-        self.declare_parameter("object_yolo_path", "")
-        self.declare_parameter("insert_yolo_path", "")
-        self.declare_parameter("mesh_scale", 0.001)
+        # ----------------------------
+        # Parameters
+        self.declare_parameter("handeye_result_path", "")
+        self.declare_parameter("object_grasp_yaml_path", "")
 
-        # Topic parameters
+        # Final spec:
+        #   raw object -> YAML centered object -> Z-up defense -> TCP grasp -> pose6.
+        # Z defense only flips +Z/+X when centered object +Z points toward world -Z.
+        # It does NOT swap X/Y because object X is used as the gripper alignment axis.
+        self.declare_parameter("canonicalize_object_axes", True)
+        self.declare_parameter("canonicalize_z_flip_margin", 0.05)
+
+        # X/Y 중 더 수평인 축을 object +X로 canonicalize.
+        self.declare_parameter("canonicalize_xy_flatter_as_x", True)
+        self.declare_parameter("canonicalize_xy_swap_margin", 0.03)
+        self.declare_parameter("canonicalize_xy_max_flatness", 0.85)
+
+        # Symmetry yaw candidates 중 RB5 마지막 joint 제한 고려 기준으로 안전한 grasp 후보 선택
+        self.declare_parameter("reference_last_joint_deg", 34.16)
+        self.declare_parameter("last_joint_limit_delta_deg", 95.0)
+
+        self.declare_parameter("min_confidence", 0.3)
+
+        # topic names
         self.declare_parameter("object_topic", "/object_poses")
         self.declare_parameter("insert_topic", "/insert_poses")
-        self.declare_parameter("object_pose_topic", "/object_pose_stamped")
-        self.declare_parameter("insert_pose_topic", "/insert_pose_stamped")
         self.declare_parameter("detect_mode_topic", "/detect_mode")
-        self.declare_parameter("object_trigger_topic", "/manipulation/object_6d_trigger")
+        self.declare_parameter("peg_trigger_topic", "/manipulation/trigger_peg")
+        self.declare_parameter("hole_trigger_topic", "/manipulation/trigger_hole")
+        self.declare_parameter("object_6d_trigger_topic", "/manipulation/object_6d_trigger")
+        self.declare_parameter("peg_output_topic", "/vision/peg_targets")
+        self.declare_parameter("hole_output_topic", "/vision/hole_targets")
+
+        # Empty-space candidates from mixed_pose_vision_node.
+        # Used when tilted_grasp marks the output object id negative.
+        # The transform node converts candidate/object camera translations to
+        # base/world coordinates and chooses a safe empty XY.
         self.declare_parameter("empty_space_topic", "/empty_space_candidates")
+        self.declare_parameter("empty_space_override_on_negative_tilted_id", True)
+        self.declare_parameter("empty_space_candidate_max_age_sec", 5.0)
+        # Full object footprint size. World filtering uses a circular exclusion
+        # radius = hypot(size_x/2, size_y/2) + safety_margin.
+        # For 60x60 mm object, base radius is about 42.4 mm.
+        self.declare_parameter("empty_space_object_size_x_mm", 60.0)
+        self.declare_parameter("empty_space_object_size_y_mm", 60.0)
+        self.declare_parameter("empty_space_safety_margin_mm", 10.0)
+        self.declare_parameter("empty_space_roi_edge_reject_px", 0.0)
+        # Weighted selection after hard filtering.
+        # clearance: far from occupied objects; pose6_proximity: close to original tilted pose6 XY.
+        self.declare_parameter("empty_space_w_clearance", 2.0)
+        self.declare_parameter("empty_space_w_pose6_proximity", 2.0)
+        self.declare_parameter("empty_space_w_roi_edge", 1.0)
+        self.declare_parameter("empty_space_w_vision_score", 0.5)
+        # Saturation values for score normalization. Values above these become 1.0.
+        self.declare_parameter("empty_space_clearance_norm_mm", 150.0)
+        self.declare_parameter("empty_space_pose6_proximity_norm_mm", 200.0)
+        self.declare_parameter("empty_space_roi_edge_norm_px", 120.0)
 
-        # Empty-space proposal parameters
-        self.declare_parameter("empty_space_enable", True)
-        self.declare_parameter("empty_grid_step_px", 40)
-        self.declare_parameter("empty_max_candidates", 30)
-        self.declare_parameter("empty_roi_x_min", 70)
-        self.declare_parameter("empty_roi_y_min", 60)
-        self.declare_parameter("empty_roi_x_max", -1)  # -1 means image_width - margin
-        self.declare_parameter("empty_roi_y_max", -1)  # -1 means image_height - margin
-        self.declare_parameter("empty_roi_right_margin", 70)
-        self.declare_parameter("empty_roi_bottom_margin", 50)
-        self.declare_parameter("empty_mask_dilate_px", 22)
-        self.declare_parameter("empty_depth_patch_radius_px", 6)
-        self.declare_parameter("empty_depth_valid_ratio_min", 0.50)
-        self.declare_parameter("empty_depth_spread_max_m", 0.030)
-        self.declare_parameter("empty_space_vis_hold_sec", 3.0)
+        self.declare_parameter("detect_mode_settle_sec", 0.5)
 
-        # Runtime parameters
-        self.declare_parameter("default_mode", "object")
-        self.declare_parameter("enable_visualization", True)
-        self.declare_parameter("frame_id", "camera_color_optical_frame")
-        self.declare_parameter("conf_thresh", 0.4)
-        # 템플릿 매칭
-        self.declare_parameter("angle_step_deg", 1)
-        self.declare_parameter("match_size", 160)
-        
-        # 리얼센스
-        self.declare_parameter("color_width", 848)
-        self.declare_parameter("color_height", 480)
-        self.declare_parameter("fps", 30)
+        # matplt debug
+        self.declare_parameter("visualize_pose6_target", True)
+        self.declare_parameter("visualize_axes_length_mm", 50.0)
+        self.declare_parameter("visualize_approach_length_mm", 80.0)
+        self.declare_parameter("visualize_blocking", False)
+        self.declare_parameter("visualize_save_dir", "")
 
-        # FoundationPose parameters
-        self.declare_parameter("fp_register_iter", 5)
-        self.declare_parameter("fp_track_iter", 2)
-        self.declare_parameter("fp_track_loss_thr", 0.2)
+        self._viz_fig = None
+        self._viz_ax = None
 
-        # Trigger one-shot refinement:
-        #   0 -> old behavior: register-only and publish immediately.
-        #   N -> fresh register once, then track_one for N additional frames, publish final pose, reset.
-        self.declare_parameter("fp_trigger_track_frames", 10)
-        self.declare_parameter("fp_trigger_track_use_new_frames", True)
-        self.declare_parameter("fp_debug", 0)
-        self.declare_parameter("fp_debug_dir", "/home/choisuhyun/course/robot_manipulation-bin-picking/FoundationPose/debug_ros")
-
-        # Priority/depth debug artifacts.
-        # priority_debug_save=True  -> save debug files every 6D trigger.
-        # priority_debug_save=False -> do not save debug files.
-        # priority_debug_dir is relative to the current execution directory by default.
-        self.declare_parameter("priority_debug_save", True)
-        self.declare_parameter("priority_debug_dir", "debug_priority")
-
-        self.foundationpose_repo_path = Path(str(self.get_parameter("foundationpose_repo_path").value)).expanduser()
-        self.cad_dir = Path(str(self.get_parameter("cad_dir").value)).expanduser()
-        self.template_dir = Path(str(self.get_parameter("template_dir").value)).expanduser()
-        self.object_yolo_path = Path(str(self.get_parameter("object_yolo_path").value)).expanduser()
-        self.insert_yolo_path = Path(str(self.get_parameter("insert_yolo_path").value)).expanduser()
-        self.mesh_scale = float(self.get_parameter("mesh_scale").value)
-        self.conf_thresh = float(self.get_parameter("conf_thresh").value)
-        self.angle_step_deg = max(1, int(self.get_parameter("angle_step_deg").value))
-        self.match_size = int(self.get_parameter("match_size").value)
-        self.enable_visualization = bool(self.get_parameter("enable_visualization").value)
-        self.frame_id = str(self.get_parameter("frame_id").value)
-
-        self.fp_debug = int(self.get_parameter("fp_debug").value)
-        self.fp_debug_dir = str(self.get_parameter("fp_debug_dir").value).strip()
-        if not self.fp_debug_dir:
-            self.fp_debug_dir = str(self.foundationpose_repo_path / "debug_ros")
-
-        Path(self.fp_debug_dir).mkdir(parents=True, exist_ok=True)
-        self.get_logger().info(f"[FP] debug_dir: {self.fp_debug_dir}")
-
-        self.priority_debug_save = bool(self.get_parameter("priority_debug_save").value)
-        priority_debug_dir_param = Path(str(self.get_parameter("priority_debug_dir").value)).expanduser()
-        if priority_debug_dir_param.is_absolute():
-            self.priority_debug_dir = priority_debug_dir_param
-        else:
-            self.priority_debug_dir = Path.cwd() / priority_debug_dir_param
-        self.priority_debug_dir.mkdir(parents=True, exist_ok=True)
-        self.get_logger().info(
-            f"[PRIORITY_DEBUG] save={self.priority_debug_save} dir={self.priority_debug_dir}"
-        )
-
-        self.mesh_alias = {"cross_insert": "cross", "cylinder_insert": "cylinder", "hole_insert": "hole"}
         self.class_to_id = {
             "cylinder": 0,
             "cylinder_insert": 0,
@@ -772,1486 +693,1908 @@ class MixedPoseVisionNode(Node):
             "cross": 2,
             "cross_insert": 2,
         }
-        self.class_colors = {
-            "cross": (0, 220, 0), "cylinder": (0, 140, 255), "hole": (220, 0, 220),
-            "cross_insert": (0, 220, 0), "cylinder_insert": (0, 140, 255), "hole_insert": (220, 0, 220),
+        self.id_to_class = {
+            -1: "nearest",
+            0: "cylinder",
+            1: "hole",
+            2: "cross",
         }
-        self.template_files = {
-            "cross": "cross_top.png", "cylinder": "circle_top.png", "hole": "square_top.png",
-            "cross_insert": "cross_insert_top.png", "cylinder_insert": "circle_insert_top.png", "hole_insert": "square_insert_top.png",
-        }
-        self.no_yaw_classes = {"cylinder", "cylinder_insert"}
-        self.rotated_templates = {}
-        self._fp_estimators = {}
-        self._mesh_vis_info = {}
 
-        # Last successful FoundationPose result for persistent object visualization.
-        self.last_object_pose_mat = None
-        self.last_object_class_name = None
-        self.last_object_status_text = ""
+        self.min_confidence = float(self.get_parameter("min_confidence").value)
+        self.reference_last_joint_deg = float(self.get_parameter("reference_last_joint_deg").value)
+        self.last_joint_limit_delta_deg = float(self.get_parameter("last_joint_limit_delta_deg").value)
 
-        # Last empty-space candidates for visualization hold after a trigger.
-        self.last_empty_space_debug = None
-        self.last_empty_space_debug_stamp_sec = None
+        self.object_topic = str(self.get_parameter("object_topic").value)
+        self.insert_topic = str(self.get_parameter("insert_topic").value)
+        self.detect_mode_topic = str(self.get_parameter("detect_mode_topic").value)
+        self.object_6d_trigger_topic = str(self.get_parameter("object_6d_trigger_topic").value)
+        self.peg_output_topic = str(self.get_parameter("peg_output_topic").value)
+        self.hole_output_topic = str(self.get_parameter("hole_output_topic").value)
+        self.empty_space_topic = str(self.get_parameter("empty_space_topic").value)
 
-        # Publishers/subscribers
-        self.object_pub = self.create_publisher(String, str(self.get_parameter("object_topic").value), 10)
-        self.insert_pub = self.create_publisher(String, str(self.get_parameter("insert_topic").value), 10)
-        self.empty_space_pub = self.create_publisher(String, str(self.get_parameter("empty_space_topic").value), 10)
-        self.object_pose_pub = self.create_publisher(PoseStamped, str(self.get_parameter("object_pose_topic").value), 10)
-        self.insert_pose_pub = self.create_publisher(PoseStamped, str(self.get_parameter("insert_pose_topic").value), 10)
-        self.create_subscription(String, str(self.get_parameter("detect_mode_topic").value), self._mode_callback, 10)
-        self.create_subscription(String, str(self.get_parameter("object_trigger_topic").value), self._object_trigger_callback, 10)
+        # ----------------------------
+        # Load transforms/config
+        # ----------------------------
+        self.ee_T_cam = self.load_handeye_result_as_mm()
+        self.grasp_cfg = self.load_object_grasp_config()
 
-        # Object 6D is computed only when a trigger message arrives.
-        # Trigger payload examples:
-        #   "" or "nearest"                       -> nearest detected object
-        #   "cross"                               -> nearest detected cross only
-        #   '{"class":"cylinder"}'              -> nearest detected cylinder only
-        #   '{"allowed_ids":[0,2]}'              -> nearest detected cylinder/cross only
-        #   '{"allowed_classes":["cylinder"]}' -> nearest detected cylinder only
-        self._object_trigger_pending = False
-        self._object_trigger_class: Optional[str] = None
-        self._object_trigger_allowed_ids: Optional[List[int]] = None
-        self._object_trigger_seq = 0
+        # ----------------------------
+        # Runtime state
+        # ----------------------------
+        self.latest_objects = []
+        self.latest_object_available_ids = []
+        self.latest_object_status = ""
+        self.latest_inserts = []
 
-        self.object_model = self._load_yolo(self.object_yolo_path, "object")
-        self.insert_model = self._load_yolo(self.insert_yolo_path, "insert")
+        self.latest_empty_space_payload = None
+        self.latest_empty_space_stamp_sec = None
 
-        self.mode = str(self.get_parameter("default_mode").value).strip().lower()
-        if self.mode not in {"object", "insert"}:
-            self.mode = "object"
+        self.pending_task = None
+        self.pending_trigger_msg = None
+        self.pending_object_idx = None
 
-        self.fp_available = False
-        self.FoundationPose = None
-        self.glctx = None
-        self.scorer = None
-        self.refiner = None
-        self._init_foundationpose()
-        self._load_rotated_templates()
+        self.object_trigger_delay_timer = None
+        self.insert_settle_timer = None
 
-        # RealSense direct capture
-        self.pipeline = rs.pipeline()
-        cfg = rs.config()
-        width = int(self.get_parameter("color_width").value)
-        height = int(self.get_parameter("color_height").value)
-        fps = int(self.get_parameter("fps").value)
-        cfg.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
-        cfg.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
-        self.pipeline.start(cfg)
-        profile = self.pipeline.get_active_profile()
-        self.intrinsics = rs.video_stream_profile(profile.get_stream(rs.stream.color)).get_intrinsics()
-        self.K = build_K(self.intrinsics)
-        self.depth_scale = float(profile.get_device().first_depth_sensor().get_depth_scale())
-        self.align = rs.align(rs.stream.color)
+        # ----------------------------
+        # ROS I/O
+        # ----------------------------
+        self.detect_mode_pub = self.create_publisher(String, self.detect_mode_topic, 10)
+        self.object_6d_trigger_pub = self.create_publisher(String, self.object_6d_trigger_topic, 10)
 
-        self.timer = self.create_timer(0.1, self._timer_callback)
-        self.get_logger().info(
-            f"MixedPoseVisionNode ready | mode={self.mode} | object=triggered FoundationPose register+short-track | insert=PCA+template | "
-            f"depth_scale={self.depth_scale:.6f}"
+        self.object_sub = self.create_subscription(
+            String, self.object_topic, self.object_callback, 10
+        )
+        self.insert_sub = self.create_subscription(
+            String, self.insert_topic, self.insert_callback, 10
+        )
+        self.empty_space_sub = self.create_subscription(
+            String, self.empty_space_topic, self.empty_space_callback, 10
         )
 
-    def _load_yolo(self, path: Path, name: str):
-        if not str(path) or str(path) == ".":
-            self.get_logger().warn(f"[YOLO] {name}_yolo_path is empty")
-            return None
+        self.peg_trigger_sub = self.create_subscription(
+            Float64MultiArray,
+            str(self.get_parameter("peg_trigger_topic").value),
+            self.peg_trigger_callback,
+            10,
+        )
+        self.hole_trigger_sub = self.create_subscription(
+            Float64MultiArray,
+            str(self.get_parameter("hole_trigger_topic").value),
+            self.hole_trigger_callback,
+            10,
+        )
+
+        self.peg_pub = self.create_publisher(Float64MultiArray, self.peg_output_topic, 10)
+        self.hole_pub = self.create_publisher(Float64MultiArray, self.hole_output_topic, 10)
+
+        self.get_logger().info(
+            "ObjectPoseTransformNode ready. "
+            "peg trigger=/manipulation/trigger_peg: [use_cylinder, use_hole, use_cross, tcp_pose6]; "
+            "object output=/vision/peg_targets: success len=7 [selected_object_id, tcp_moveL_pose6] or len=9 [-id, original_pose6, empty_space_world_xy], failure len!=7 [visible_ids]; "
+            "insert output=/vision/hole_targets: [x_mm, y_mm, yaw_deg, id]. "
+            f"empty_space_topic={self.empty_space_topic}."
+        )
+
+    # ============================================================
+    # State helpers
+    # ============================================================
+
+    def cancel_timer_if_alive(self, timer_attr: str):
+        timer = getattr(self, timer_attr, None)
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+            setattr(self, timer_attr, None)
+
+    def reset_pending(self):
+        self.cancel_timer_if_alive("object_trigger_delay_timer")
+        self.cancel_timer_if_alive("insert_settle_timer")
+        self.pending_task = None
+        self.pending_trigger_msg = None
+        self.pending_object_idx = None
+
+    def publish_detect_mode(self, mode):
+        msg = String()
+        msg.data = mode
+        self.detect_mode_pub.publish(msg)
+        self.get_logger().info(f"request detect_mode: {mode}")
+
+    def publish_object_6d_trigger(self, allowed_object_ids: List[int]):
+        allowed_object_ids = [int(v) for v in allowed_object_ids]
+        allowed_classes = [self.class_name_from_id(v) for v in allowed_object_ids]
+
+        msg = String()
+        msg.data = json.dumps(
+            {
+                "allowed_ids": allowed_object_ids,
+                "allowed_classes": allowed_classes,
+            },
+            ensure_ascii=False,
+        )
+        self.object_6d_trigger_pub.publish(msg)
+
+        self.get_logger().info(
+            f"request object 6D pose: topic={self.object_6d_trigger_topic}, "
+            f"allowed_ids={allowed_object_ids}, allowed_classes={allowed_classes}"
+        )
+        return allowed_classes
+
+    def class_name_from_id(self, object_idx: int) -> str:
+        if int(object_idx) not in self.id_to_class:
+            raise ValueError(
+                f"unknown object_id={object_idx}. "
+                f"valid ids={sorted(self.id_to_class.keys())}"
+            )
+        return self.id_to_class[int(object_idx)]
+
+    # ============================================================
+    # Config loading
+    # ============================================================
+
+    def load_handeye_result_as_mm(self) -> np.ndarray:
+        param_path = str(self.get_parameter("handeye_result_path").value)
+
+        if param_path:
+            result_path = Path(param_path)
+        else:
+            result_path = (
+                Path(get_package_share_directory("calib"))
+                / "config"
+                / "handeye_capture_rs"
+                / "handeye_result.json"
+            )
+
+        if not result_path.exists():
+            raise FileNotFoundError(f"handeye_result.json not found: {result_path}")
+
+        with open(result_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if "ee_T_cam" not in data:
+            raise KeyError(f"'ee_T_cam' not found in {result_path}")
+
+        ee_T_cam_m = np.asarray(data["ee_T_cam"], dtype=np.float64).reshape(4, 4)
+        ee_T_cam_m[:3, :3] = orthonormalize_R(ee_T_cam_m[:3, :3])
+        validate_T(ee_T_cam_m, name="ee_T_cam_m")
+
+        ee_T_cam_mm = T_m_to_T_mm(ee_T_cam_m)
+        validate_T(ee_T_cam_mm, name="ee_T_cam_mm")
+
+        self.get_logger().info(f"loaded hand-eye: {result_path}")
+        return ee_T_cam_mm
+
+    def load_object_grasp_config(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Load object-frame YAML.
+
+        Preferred YAML format after final spec change:
+
+        unit: mm
+        objects:
+          cylinder:
+            # RAW/CAD object frame -> centered/canonical object frame.
+            # Legacy key object_to_grasp is accepted as the same meaning.
+            object_to_center:
+              unit: mm
+              matrix:
+                - [1, 0, 0, 0]
+                - [0, 1, 0, 0]
+                - [0, 0, 1, 0]
+                - [0, 0, 0, 1]
+
+            # Centered object frame -> final robot TCP frame for moveL.
+            # If omitted, identity is used, meaning object_to_center already
+            # defines the final TCP frame.
+            centered_object_to_tcp:
+              unit: mm
+              matrix:
+                - [1, 0, 0, 0]
+                - [0, 1, 0, 0]
+                - [0, 0, 1, 0]
+                - [0, 0, 0, 1]
+        """
+        yaml_path_str = str(self.get_parameter("object_grasp_yaml_path").value)
+        cfg: Dict[str, Dict[str, Any]] = {}
+
+        if not yaml_path_str:
+            self.get_logger().warn(
+                "object_grasp_yaml_path is empty. "
+                "Using identity raw_object_T_centered_object and centered_object_T_tcp_goal."
+            )
+            return cfg
+
+        path = Path(yaml_path_str)
         if not path.exists():
-            self.get_logger().warn(f"[YOLO] {name} model not found: {path}")
-            return None
-        self.get_logger().info(f"[YOLO] {name} model loaded: {path}")
-        return YOLO(str(path))
+            raise FileNotFoundError(f"object_grasp_yaml_path not found: {path}")
 
-    def _init_foundationpose(self):
-        if not self.foundationpose_repo_path.exists():
-            self.get_logger().warn(f"[FP] repo path not found: {self.foundationpose_repo_path}")
-            return
-        sys.path.insert(0, str(self.foundationpose_repo_path))
-        try:
-            from estimater import FoundationPose, ScorePredictor, PoseRefinePredictor
-            import nvdiffrast.torch as dr
-            self.FoundationPose = FoundationPose
-            self.glctx = dr.RasterizeCudaContext()
-            self.scorer = ScorePredictor()
-            self.refiner = PoseRefinePredictor()
-            self.fp_available = True
-            self.get_logger().info("[FP] initialized. object mode uses FoundationPose.")
-        except Exception as e:
-            self.fp_available = False
-            self.get_logger().warn(f"[FP] initialization failed: {e}")
-            traceback.print_exc()
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
 
-    def _load_rotated_templates(self):
-        self.rotated_templates.clear()
-        if not self.template_dir.exists():
-            self.get_logger().warn(f"[TEMPLATE] template_dir not found: {self.template_dir}")
-            return
-        for cls, fname in self.template_files.items():
-            path = self.template_dir / fname
-            img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-            if img is None:
-                self.get_logger().warn(f"[TEMPLATE] missing: {path}")
-                continue
-            img = normalize_binary(img, self.match_size)
-            if img is None:
-                continue
-            self.rotated_templates[cls] = []
-            for angle in range(0, 180, self.angle_step_deg):
-                self.rotated_templates[cls].append((float(angle), rotate_keep_size(img, float(angle))))
-            self.get_logger().info(f"[TEMPLATE] loaded: {cls} from {path}")
+        global_unit = data.get("unit", "mm")
+        objects = data.get("objects", {})
+        if not isinstance(objects, dict):
+            raise ValueError("object_grasp_yaml: 'objects' must be a dict.")
 
-    def _load_mesh(self, class_name: str) -> trimesh.Trimesh:
-        if not self.cad_dir.exists():
-            raise FileNotFoundError(f"cad_dir not found: {self.cad_dir}")
-        base = self.mesh_alias.get(class_name, class_name)
-        candidates = [self.cad_dir / f"{base}{ext}" for ext in [".stl", ".obj", ".ply"]]
-        path = next((p for p in candidates if p.exists()), None)
-        if path is None:
-            raise FileNotFoundError("mesh not found: " + ", ".join(str(p) for p in candidates))
-        mesh = trimesh.load(str(path), force="mesh")
-        if self.mesh_scale != 1.0:
-            mesh.apply_scale(self.mesh_scale)
-        return mesh
+        def _load_T_from_keys(obj_data: Dict[str, Any], keys: List[str], default_T: np.ndarray) -> np.ndarray:
+            for key in keys:
+                block = obj_data.get(key, None)
+                if isinstance(block, dict):
+                    unit = block.get("unit", obj_data.get("unit", global_unit))
+                    if "matrix" in block:
+                        return matrix_from_data(block["matrix"], unit=unit)
+                elif block is not None:
+                    # Allow direct 4x4 matrix under the key.
+                    unit = obj_data.get("unit", global_unit)
+                    return matrix_from_data(block, unit=unit)
 
-    def _get_fp_estimator(self, class_name: str) -> Optional[FPEstimator]:
-        if class_name in self._fp_estimators:
-            return self._fp_estimators[class_name]
-        if not self.fp_available:
-            return None
-        mesh = self._load_mesh(class_name)
+            return default_T.copy()
 
-        # Precompute CAD oriented bbox visualization data.
-        # FoundationPose pose is object_in_camera for the original mesh frame.
-        # For the oriented bounds, use center_pose = pose @ inv(to_origin), same as the official demo.
-        if class_name not in self._mesh_vis_info:
-            to_origin, extents = trimesh.bounds.oriented_bounds(mesh)
-            bbox = np.stack([-extents / 2.0, extents / 2.0], axis=0).reshape(2, 3)
-            self._mesh_vis_info[class_name] = {
-                "to_origin": to_origin,
-                "bbox": bbox,
+        for name, obj_data in objects.items():
+            if obj_data is None:
+                obj_data = {}
+            if not isinstance(obj_data, dict):
+                raise ValueError(f"object_grasp_yaml: objects.{name} must be a dict.")
+
+            # Backward compatibility:
+            #   object_to_grasp no longer means direct grasp pose.
+            #   It is treated as RAW/CAD object -> centered/canonical object frame.
+            raw_object_T_centered_object = _load_T_from_keys(
+                obj_data,
+                keys=["object_to_center", "object_to_canonical", "object_to_grasp"],
+                default_T=np.eye(4, dtype=np.float64),
+            )
+
+            # Final optional TCP offset from the centered object frame.
+            centered_object_T_tcp_goal = _load_T_from_keys(
+                obj_data,
+                keys=["centered_object_to_tcp", "center_to_tcp", "canonical_to_tcp", "object_center_to_tcp"],
+                default_T=np.eye(4, dtype=np.float64),
+            )
+
+            cfg[str(name)] = {
+                "raw_object_T_centered_object": raw_object_T_centered_object,
+                "centered_object_T_tcp_goal": centered_object_T_tcp_goal,
+                "symmetry": obj_data.get("symmetry", {}) or {},
+                # Optional. Used only for hole/cross by default in object_to_pose6_target_dict.
+                "tilted_grasp": obj_data.get("tilted_grasp", {}) or {},
+                # Optional. Used for cylinder yaw candidate scoring.
+                "cylinder_yaw_search": obj_data.get("cylinder_yaw_search", {}) or {},
             }
 
-        est = FPEstimator(
-            class_name=class_name,
-            mesh=mesh,
-            foundationpose_cls=self.FoundationPose,
-            glctx=self.glctx,
-            scorer=self.scorer,
-            refiner=self.refiner,
-            debug=self.fp_debug,
-            debug_dir=self.fp_debug_dir,
-        )
-        self._fp_estimators[class_name] = est
-        self.get_logger().info(f"[FP] estimator created: {class_name}")
-        return est
+        self.get_logger().info(f"loaded object target YAML: {path}")
+        return cfg
 
-    def _mode_callback(self, msg: String):
-        mode = msg.data.strip().lower()
-        if mode not in {"object", "insert"}:
-            self.get_logger().warn(f"unknown mode: {mode}")
-            return
-        if mode == "object" and self.object_model is None:
-            self.get_logger().warn("object YOLO model not loaded")
-            return
-        if mode == "insert" and self.insert_model is None:
-            self.get_logger().warn("insert YOLO model not loaded")
-            return
-        self.mode = mode
-        if mode == "object":
-            for est in self._fp_estimators.values():
-                est.reset()
-        self.get_logger().info(f"mode switched -> {mode}")
+    def get_object_target_transforms_for_class(
+        self,
+        cls: str,
+    ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+        base_name = canonical_object_name(cls)
 
-    def _object_trigger_callback(self, msg: String):
-        payload = msg.data.strip()
-
-        target_class = None
-        allowed_ids = None
-
-        if payload:
-            try:
-                data = json.loads(payload)
-
-                if isinstance(data, dict):
-                    if "allowed_ids" in data:
-                        allowed_ids = []
-                        for v in data.get("allowed_ids", []):
-                            try:
-                                obj_id = int(round(float(v)))
-                            except Exception:
-                                continue
-                            if obj_id in {0, 1, 2} and obj_id not in allowed_ids:
-                                allowed_ids.append(obj_id)
-
-                    elif "allowed_classes" in data:
-                        allowed_ids = []
-                        for cls in data.get("allowed_classes", []):
-                            cls = str(cls).strip()
-                            if cls in self.class_to_id:
-                                obj_id = int(self.class_to_id[cls])
-                                if obj_id not in allowed_ids:
-                                    allowed_ids.append(obj_id)
-
-                    else:
-                        target_class = data.get("class") or data.get("target_class")
-
-            except Exception:
-                # Backward compatibility:
-                # raw class name, "nearest", etc.
-                if payload.lower() not in {"nearest", "object", "trigger", "capture", "1", "true"}:
-                    target_class = payload
-
-        if allowed_ids is not None and len(allowed_ids) == 0:
-            allowed_ids = None
-
-        if target_class is not None:
-            target_class = str(target_class).strip()
-            if not target_class:
-                target_class = None
-
-        self._object_trigger_pending = True
-        self._object_trigger_class = target_class
-        self._object_trigger_allowed_ids = allowed_ids
-        self._object_trigger_seq += 1
-        self.get_logger().info(
-            f"[OBJECT_TRIGGER] seq={self._object_trigger_seq} "
-            f"target_class={target_class or 'nearest'} "
-            f"allowed_ids={allowed_ids if allowed_ids is not None else 'all'}"
-        )
-
-    def _consume_object_trigger(self) -> Tuple[bool, Optional[str], Optional[List[int]], int]:
-        if not self._object_trigger_pending:
-            return False, None, None, self._object_trigger_seq
-
-        target_class = self._object_trigger_class
-        allowed_ids = self._object_trigger_allowed_ids
-        seq = self._object_trigger_seq
-
-        self._object_trigger_pending = False
-        self._object_trigger_class = None
-        self._object_trigger_allowed_ids = None
-
-        return True, target_class, allowed_ids, seq
-
-    def _read_aligned_rgbd(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        frames = self.pipeline.wait_for_frames()
-        aligned = self.align.process(frames)
-        color_frame = aligned.get_color_frame()
-        depth_frame = aligned.get_depth_frame()
-        if not color_frame or not depth_frame:
-            return None, None
-        color = np.asanyarray(color_frame.get_data())
-        depth = np.asanyarray(depth_frame.get_data())
-        return color, depth
-
-    def _timer_callback(self):
-        color, depth = self._read_aligned_rgbd()
-        if color is None or depth is None:
-            return
-        display = color.copy()
-
-        if self.mode == "object":
-            triggered, target_class, allowed_ids, trigger_seq = self._consume_object_trigger()
-            objects, status = self._process_object_mode(
-                color=color,
-                depth=depth,
-                display=display,
-                run_fp=triggered,
-                requested_class=target_class,
-                requested_allowed_ids=allowed_ids,
-                trigger_seq=trigger_seq,
-            )
-            # Object 6D response is published only for an explicit trigger.
-            if triggered:
-                self._publish_json(self.object_pub, "object", objects, extra=status)
+        if cls in self.grasp_cfg:
+            item = self.grasp_cfg[cls]
+        elif base_name in self.grasp_cfg:
+            item = self.grasp_cfg[base_name]
         else:
-            objects = self._process_insert_mode(color, depth, display)
-            self._publish_json(self.insert_pub, "insert", objects)
+            item = {
+                "raw_object_T_centered_object": np.eye(4, dtype=np.float64),
+                "centered_object_T_tcp_goal": np.eye(4, dtype=np.float64),
+                "symmetry": {},
+                "tilted_grasp": {},
+                "cylinder_yaw_search": {},
+            }
 
-        if self.enable_visualization:
-            self._draw_last_empty_space_debug(display)
-            cv2.imshow("6D Pose Vision | object=FP, insert=PCA+template", display)
-            cv2.waitKey(1)
+        raw_object_T_centered_object = np.asarray(
+            item["raw_object_T_centered_object"], dtype=np.float64
+        ).reshape(4, 4)
+        centered_object_T_tcp_goal = np.asarray(
+            item["centered_object_T_tcp_goal"], dtype=np.float64
+        ).reshape(4, 4)
+        symmetry = item.get("symmetry", {}) or {}
+        tilted_grasp = item.get("tilted_grasp", {}) or {}
+        cylinder_yaw_search = item.get("cylinder_yaw_search", {}) or {}
 
-    def _collect_detections(self, model, color, depth) -> List[Dict]:
-        if model is None:
-            return []
-        results = model(color, conf=self.conf_thresh, verbose=False)[0]
-        detections = []
-        if results.masks is None:
-            return detections
-        for i, mask_xy in enumerate(results.masks.xy):
-            mask_img = mask_from_polygon(mask_xy, color.shape)
-            cls_id = int(results.boxes.cls[i])
+        validate_T(raw_object_T_centered_object, name=f"raw_object_T_centered_object[{cls}]")
+        validate_T(centered_object_T_tcp_goal, name=f"centered_object_T_tcp_goal[{cls}]")
 
-            # depth_med: 기존 전체 mask median. 디버그/로그용으로 유지.
-            # depth_score: nearest 선택용. 가까운 쪽 35% depth subset의 median.
-            depth_med = depth_median_in_mask(depth, mask_img, self.depth_scale)
-            depth_score = depth_front_median_score_in_mask(
-                depth,
-                mask_img,
-                self.depth_scale,
-                front_ratio=0.35,
-                min_valid_pixels=30,
-            )
-
-            detections.append({
-                "class_name": results.names[cls_id],
-                "confidence": float(results.boxes.conf[i]),
-                "mask_xy": mask_xy,
-                "mask_img": mask_img,
-                "depth_med": depth_med,
-                "depth_score": depth_score,
-                "bbox": results.boxes.xyxy[i].cpu().numpy().astype(int),
-            })
-
-        # allowed-id nearest 선택과 preview 대표 detection 모두 depth_score 기준으로 정렬.
-        detections.sort(key=lambda d: d.get("depth_score", d["depth_med"]))
-        return detections
-
-    def _available_object_info(self, detections: List[Dict]) -> Tuple[List[int], List[str]]:
-        """Return unique currently detected object ids/classes in nearest-depth order."""
-        available_ids = []
-        available_classes = []
-
-        for det in detections:
-            cls = str(det.get("class_name", ""))
-            if cls not in self.class_to_id:
-                continue
-
-            obj_id = int(self.class_to_id[cls])
-            canonical_cls = self.mesh_alias.get(cls, cls)
-
-            if obj_id not in available_ids:
-                available_ids.append(obj_id)
-                available_classes.append(canonical_cls)
-
-        return available_ids, available_classes
-
-    def _make_priority_table(self, detections: List[Dict]) -> List[Dict]:
-        """Build a JSON-friendly priority table from already-sorted detections.
-
-        Current rule:
-          smaller depth_score_m -> closer to camera -> higher priority.
-
-        depth_score is not the full mask median. It is the median of the nearest
-        front-side depth subset computed in depth_front_median_score_in_mask().
-        """
-        table = []
-
-        for rank, det in enumerate(detections, start=1):
-            cls = str(det.get("class_name", "unknown"))
-            obj_id = int(self.class_to_id.get(cls, -1))
-
-            depth_score = float(det.get("depth_score", det.get("depth_med", float("inf"))))
-            depth_med = float(det.get("depth_med", float("inf")))
-            conf = float(det.get("confidence", 0.0))
-
-            x1, y1, x2, y2 = det.get("bbox", [0, 0, 0, 0])
-            area_px = int(max(0, int(x2) - int(x1)) * max(0, int(y2) - int(y1)))
-
-            table.append({
-                "rank": int(rank),
-                "selected": bool(rank == 1),
-                "class_name": cls,
-                "class_id": obj_id,
-                "confidence": round(conf, 3),
-                "depth_score_m": round(depth_score, 4),
-                "depth_median_m": round(depth_med, 4),
-                "bbox_area_px": area_px,
-                "reason": "nearest depth_score; smaller is closer",
-            })
-
-        return table
-
-    def _log_priority_table(
-        self,
-        detections: List[Dict],
-        trigger_seq: int,
-        title: str = "PRIORITY_TABLE",
-    ) -> None:
-        """Print a readable candidate ranking table to ROS log."""
-        if not detections:
-            self.get_logger().info(f"[{title}] seq={trigger_seq} no detections")
-            return
-
-        lines = [
-            f"[{title}] seq={trigger_seq} candidates={len(detections)} "
-            f"rule=sort_by_depth_score_ascending"
-        ]
-
-        for rank, det in enumerate(detections, start=1):
-            cls = str(det.get("class_name", "unknown"))
-            obj_id = int(self.class_to_id.get(cls, -1))
-            depth_score = float(det.get("depth_score", det.get("depth_med", float("inf"))))
-            depth_med = float(det.get("depth_med", float("inf")))
-            conf = float(det.get("confidence", 0.0))
-
-            tag = "SELECT" if rank == 1 else "      "
-            lines.append(
-                f"  #{rank:<2} {tag} "
-                f"class={cls:<14} id={obj_id:<2} "
-                f"depth_score={depth_score:.4f}m "
-                f"depth_med={depth_med:.4f}m "
-                f"conf={conf:.3f}"
-            )
-
-        self.get_logger().info("\n".join(lines))
-
-
-    def _draw_depth_histogram_image(
-        self,
-        z: np.ndarray,
-        title: str = "depth histogram",
-        width: int = 900,
-        height: int = 500,
-        bins: int = 80,
-    ) -> np.ndarray:
-        """Create a simple depth histogram image using only OpenCV."""
-        img = np.full((height, width, 3), 255, dtype=np.uint8)
-
-        z = np.asarray(z, dtype=np.float32)
-        z = z[np.isfinite(z)]
-        z = z[z > 0]
-
-        if len(z) == 0:
-            cv2.putText(img, "No valid depth", (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-            return img
-
-        z_min = float(np.percentile(z, 1))
-        z_max = float(np.percentile(z, 99))
-        if z_max <= z_min:
-            z_min = float(np.min(z))
-            z_max = float(np.max(z)) + 1e-6
-
-        hist, _ = np.histogram(z, bins=bins, range=(z_min, z_max))
-
-        left, right = 70, width - 30
-        top, bottom = 80, height - 70
-        plot_w = right - left
-        plot_h = bottom - top
-
-        cv2.rectangle(img, (left, top), (right, bottom), (0, 0, 0), 1)
-        max_count = int(hist.max()) if hist.max() > 0 else 1
-
-        for i, count in enumerate(hist):
-            x0 = int(left + i * plot_w / bins)
-            x1 = int(left + (i + 1) * plot_w / bins)
-            bar_h = int((count / max_count) * plot_h)
-            y0 = bottom - bar_h
-            cv2.rectangle(img, (x0, y0), (x1, bottom), (80, 80, 80), -1)
-
-        percentiles = {
-            "p05": float(np.percentile(z, 5)),
-            "p10": float(np.percentile(z, 10)),
-            "p20": float(np.percentile(z, 20)),
-            "p35": float(np.percentile(z, 35)),
-            "p50": float(np.percentile(z, 50)),
-        }
-
-        for name, value in percentiles.items():
-            x = int(left + (value - z_min) / max(z_max - z_min, 1e-6) * plot_w)
-            x = int(np.clip(x, left, right))
-            cv2.line(img, (x, top), (x, bottom), (0, 0, 255), 2)
-            cv2.putText(img, f"{name}:{value:.3f}", (x + 3, top + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
-
-        cv2.putText(img, title[:100], (30, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 0), 2)
-        cv2.putText(
-            img,
-            f"range: {z_min:.3f}m ~ {z_max:.3f}m | n={len(z)}",
-            (left, height - 25),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 0, 0),
-            1,
+        return (
+            raw_object_T_centered_object.copy(),
+            centered_object_T_tcp_goal.copy(),
+            dict(symmetry),
+            dict(tilted_grasp),
+            dict(cylinder_yaw_search),
         )
-        return img
 
-    def _save_priority_debug_artifacts(
+    def make_symmetric_grasp_candidates(
         self,
-        color: np.ndarray,
-        depth: np.ndarray,
-        display: np.ndarray,
-        detections: List[Dict],
-        trigger_seq: int,
-        selected_det: Optional[Dict] = None,
-    ) -> None:
-        """Save per-trigger mask/depth artifacts and overwrite previous files.
-
-        This function intentionally deletes priority_debug_dir every trigger so that
-        debug data does not accumulate across runs.
+        centered_object_T_tcp_nominal: np.ndarray,
+        symmetry: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
         """
-        if not self.priority_debug_save:
+        centered_object_to_tcp 기본 grasp를 centered object local +Z 기준 yaw 후보로 회전시킨다.
+
+        YAML 예:
+            symmetry:
+              axis: "+z"
+              yaw_candidates_deg: [0.0, 180.0]
+        """
+        yaw_candidates = symmetry.get("yaw_candidates_deg", [0.0])
+        candidates: List[Dict[str, Any]] = []
+
+        for yaw in yaw_candidates:
+            yaw = float(yaw)
+            centered_object_T_tcp = T_rot_z_deg(yaw) @ centered_object_T_tcp_nominal
+            validate_T(centered_object_T_tcp, name=f"centered_object_T_tcp_candidate[yaw={yaw}]")
+            candidates.append({
+                "name": f"yaw_{yaw:.0f}",
+                "yaw_deg": yaw,
+                "centered_object_T_tcp": centered_object_T_tcp,
+            })
+
+        if not candidates:
+            candidates.append({
+                "name": "yaw_0",
+                "yaw_deg": 0.0,
+                "centered_object_T_tcp": centered_object_T_tcp_nominal.copy(),
+            })
+
+        return candidates
+
+    def estimate_last_joint_for_goal(
+        self,
+        base_T_goal: np.ndarray,
+        reference_T_tcp: np.ndarray,
+    ) -> Tuple[float, float, float]:
+        """
+        목표 TCP 자세가 기준 TCP 자세에서 마지막 joint를 얼마나 더 돌려야 하는지 근사 추정한다.
+
+        trigger로 받은 현재 TCP pose6를 reference_T_tcp로 사용한다.
+        전체 IK를 푸는 것이 아니라, TCP +X 방향 변화를 TCP +Y축 기준 signed angle로 보고
+        reference_last_joint_deg에 더한 값을 estimated J5로 사용한다.
+        """
+        R_ref = orthonormalize_R(reference_T_tcp[:3, :3])
+        R_goal = orthonormalize_R(base_T_goal[:3, :3])
+
+        ref_x = R_ref[:, 0]
+        goal_x = R_goal[:, 0]
+        goal_y = R_goal[:, 1]
+
+        signed_delta = signed_angle_about_axis_deg(ref_x, goal_x, goal_y)
+        estimated_j5 = wrap_deg(self.reference_last_joint_deg + signed_delta)
+        delta_abs = abs(wrap_deg(estimated_j5 - self.reference_last_joint_deg))
+        return estimated_j5, delta_abs, signed_delta
+
+    # ============================================================
+    # Input callbacks
+    # ============================================================
+
+    def object_callback(self, msg):
+        try:
+            data = json.loads(msg.data)
+            self.latest_objects = self.extract_objects_from_payload(data)
+            self.latest_object_available_ids = self.extract_available_ids_from_payload(data)
+            self.latest_object_status = str(data.get("status", ""))
+
+            # Preferred synchronized path:
+            # mixed_pose_vision_node bundles empty-space candidates into the same
+            # /object_poses JSON as the 6D pose result. This avoids cross-topic
+            # callback ordering races between /empty_space_candidates and /object_poses.
+            bundled_empty = data.get("empty_space", None)
+            if isinstance(bundled_empty, dict) and str(bundled_empty.get("mode", "")) == "empty_space":
+                self.latest_empty_space_payload = bundled_empty
+                self.latest_empty_space_stamp_sec = self.get_clock().now().nanoseconds * 1e-9
+                self.get_logger().info(
+                    f"[EMPTY-SPACE] bundled with object JSON: "
+                    f"candidates={len(bundled_empty.get('candidates', []))} "
+                    f"objects_camera={len(bundled_empty.get('objects_camera', []))} "
+                    f"trigger_seq={bundled_empty.get('trigger_seq', None)}"
+                )
+            else:
+                # Do not reuse a stale empty-space payload from a previous trigger.
+                # If the object JSON does not contain empty_space, the empty-space
+                # override will be skipped and the original pose6 XY will be used.
+                self.latest_empty_space_payload = None
+                self.latest_empty_space_stamp_sec = None
+        except Exception as e:
+            self.latest_objects = []
+            self.latest_object_available_ids = []
+            self.latest_object_status = "parse_error"
+            self.latest_empty_space_payload = None
+            self.latest_empty_space_stamp_sec = None
+            self.get_logger().warn(f"failed to parse {self.object_topic} JSON: {e}")
             return
 
-        out_dir = self.priority_debug_dir
+        if self.pending_task == "peg_wait_object":
+            self.collect_peg_object_frame()
+
+    def insert_callback(self, msg):
+        try:
+            data = json.loads(msg.data)
+            self.latest_inserts = self.extract_objects_from_payload(data)
+        except Exception as e:
+            self.latest_inserts = []
+            self.get_logger().warn(f"failed to parse {self.insert_topic} JSON: {e}")
+            return
+
+        if self.pending_task == "hole_wait_insert":
+            self.collect_hole_insert_frame()
+
+    def empty_space_callback(self, msg):
+        try:
+            data = json.loads(msg.data)
+            if not isinstance(data, dict):
+                raise ValueError("empty-space payload must be a JSON object")
+            if str(data.get("mode", "")) != "empty_space":
+                raise ValueError(f"unexpected empty-space mode={data.get('mode')}")
+
+            # Debug-only topic path. The synchronized source of truth is the
+            # empty_space field bundled inside /object_poses. To avoid stale/racy
+            # cross-topic data, do not update latest_empty_space_payload here.
+            self.get_logger().info(
+                f"[EMPTY-SPACE] debug topic received candidates={len(data.get('candidates', []))} "
+                f"objects_camera={len(data.get('objects_camera', []))} "
+                f"trigger_seq={data.get('trigger_seq', None)} "
+                f"use_for_control=False"
+            )
+        except Exception as e:
+            self.latest_empty_space_payload = None
+            self.latest_empty_space_stamp_sec = None
+            self.get_logger().warn(f"failed to parse {self.empty_space_topic} JSON: {e}")
+
+    @staticmethod
+    def extract_objects_from_payload(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Supports perception JSON:
+            {"objects": [...]}
+        or:
+            {"target": {...}, "objects": [...]}
+        """
+        objects = data.get("objects", [])
+        if objects is None:
+            objects = []
+
+        if not isinstance(objects, list):
+            raise ValueError("'objects' must be a list.")
+
+        # If only target exists, use it.
+        if len(objects) == 0 and isinstance(data.get("target"), dict):
+            objects = [data["target"]]
+
+        return objects
+
+    def extract_available_ids_from_payload(self, data: Dict[str, Any]) -> List[int]:
+        """
+        Return currently visible object ids from perception JSON.
+
+        Preferred source:
+            data["available_ids"] from mixed_pose_vision_node.
+
+        Fallback source:
+            class names inside data["objects"].
+        """
+        raw_ids = data.get("available_ids", None)
+        ids = []
+
+        if isinstance(raw_ids, list):
+            for v in raw_ids:
+                try:
+                    obj_id = int(round(float(v)))
+                except Exception:
+                    continue
+                if obj_id in self.id_to_class and obj_id not in ids:
+                    ids.append(obj_id)
+
+        if ids:
+            return ids
 
         try:
-            if out_dir.exists():
-                shutil.rmtree(out_dir)
-            out_dir.mkdir(parents=True, exist_ok=True)
-            masks_dir = out_dir / "masks"
-            masks_dir.mkdir(parents=True, exist_ok=True)
+            objects = self.extract_objects_from_payload(data)
+        except Exception:
+            objects = []
 
-            cv2.imwrite(str(out_dir / "color.png"), color)
+        for obj in objects:
+            cls = str(obj.get("class", ""))
+            if cls not in self.class_to_id:
+                continue
+            obj_id = int(self.class_to_id[cls])
+            if obj_id not in ids:
+                ids.append(obj_id)
 
-            depth_m = depth.astype(np.float32) * float(self.depth_scale)
-            valid = depth_m > 0
-            if np.any(valid):
-                vmin = float(np.percentile(depth_m[valid], 2))
-                vmax = float(np.percentile(depth_m[valid], 98))
-                depth_norm = np.clip((depth_m - vmin) / max(vmax - vmin, 1e-6), 0.0, 1.0)
-            else:
-                depth_norm = np.zeros_like(depth_m, dtype=np.float32)
+        return ids
 
-            depth_u8 = (depth_norm * 255).astype(np.uint8)
-            depth_color = cv2.applyColorMap(depth_u8, cv2.COLORMAP_JET)
-            depth_color[~valid] = (0, 0, 0)
-            cv2.imwrite(str(out_dir / "depth_colormap.png"), depth_color)
-            cv2.imwrite(str(out_dir / "overlay_priority.png"), display)
+    # ============================================================
+    # Empty-space world XY selection
+    # ============================================================
 
-            table = []
-            for rank, det in enumerate(detections, start=1):
-                cls = str(det.get("class_name", "unknown"))
-                conf = float(det.get("confidence", 0.0))
-                obj_id = int(self.class_to_id.get(cls, -1))
-                is_selected = bool(det is selected_det)
-                safe_cls = cls.replace("/", "_").replace(" ", "_")
-                prefix = f"rank{rank:02d}_{safe_cls}"
+    def camera_point_m_to_base_mm(self, camera_xyz_m: Dict[str, Any], base_T_ee: np.ndarray) -> np.ndarray:
+        """Transform a camera-frame point in meters to base/world point in mm."""
+        p_cam_mm = np.array([
+            float(camera_xyz_m["x"]) * 1000.0,
+            float(camera_xyz_m["y"]) * 1000.0,
+            float(camera_xyz_m["z"]) * 1000.0,
+            1.0,
+        ], dtype=np.float64)
 
-                mask_img = det["mask_img"]
-                mask_bool = mask_img > 0
+        base_T_cam = np.asarray(base_T_ee, dtype=np.float64).reshape(4, 4) @ self.ee_T_cam
+        p_base_mm = base_T_cam @ p_cam_mm
+        return np.asarray(p_base_mm[:3], dtype=np.float64).reshape(3)
 
-                cv2.imwrite(str(masks_dir / f"{prefix}_mask.png"), mask_img)
+    @staticmethod
+    def roi_edge_distance_px(pixel: Dict[str, Any], roi: Dict[str, Any]) -> float:
+        """Distance from a pixel candidate to the rectangular ROI boundary in pixels."""
+        if not isinstance(pixel, dict) or not isinstance(roi, dict):
+            return 0.0
+        if roi.get("type") != "rect":
+            return 0.0
 
-                mask_color = np.zeros_like(color)
-                mask_color[mask_bool] = self.class_colors.get(cls, (255, 255, 255))
-                mask_overlay = cv2.addWeighted(color, 0.65, mask_color, 0.35, 0)
-                cv2.imwrite(str(masks_dir / f"{prefix}_overlay.png"), mask_overlay)
+        u = float(pixel.get("u", 0.0))
+        v = float(pixel.get("v", 0.0))
+        x_min = float(roi.get("x_min", 0.0))
+        y_min = float(roi.get("y_min", 0.0))
+        x_max = float(roi.get("x_max", x_min))
+        y_max = float(roi.get("y_max", y_min))
 
-                det_depth_color = np.zeros_like(depth_color)
-                det_depth_color[mask_bool] = depth_color[mask_bool]
-                cv2.imwrite(str(masks_dir / f"{prefix}_depth_colormap.png"), det_depth_color)
+        return float(min(u - x_min, x_max - u, v - y_min, y_max - v))
 
-                z = depth[mask_bool].astype(np.float32) * float(self.depth_scale)
-                z = z[z > 0]
-                hist_path = masks_dir / f"{prefix}_hist.png"
-                if len(z) > 0:
-                    hist_img = self._draw_depth_histogram_image(
-                        z,
-                        title=(
-                            f"#{rank} {cls} "
-                            f"score={det.get('depth_score', float('inf')):.4f}m "
-                            f"med={det.get('depth_med', float('inf')):.4f}m"
-                        ),
-                    )
-                    cv2.imwrite(str(hist_path), hist_img)
+    def empty_payload_is_fresh(self) -> bool:
+        if self.latest_empty_space_payload is None or self.latest_empty_space_stamp_sec is None:
+            return False
 
-                ply_path = masks_dir / f"{prefix}_points.ply"
-                ply_count = save_mask_point_cloud_ply(
-                    ply_path,
-                    depth,
-                    mask_img,
-                    color,
-                    self.intrinsics,
-                    self.depth_scale,
+        max_age = float(self.get_parameter("empty_space_candidate_max_age_sec").value)
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
+        age_sec = float(now_sec - float(self.latest_empty_space_stamp_sec))
+        return age_sec <= max_age
+
+    def select_empty_space_world_xy(
+        self,
+        base_T_ee: np.ndarray,
+        fallback_xy_mm: Tuple[float, float],
+    ) -> Optional[Dict[str, Any]]:
+        """Select a final empty-space world XY from the latest vision candidates.
+
+        Policy:
+          1) Convert candidate camera xyz and object camera translations to base/world mm.
+          2) Hard reject candidates whose center is too close to any object center.
+             The 60x60 mm footprint is approximated as a circle using the
+             circumscribed radius: hypot(size_x/2, size_y/2) + safety_margin.
+          3) Hard reject candidates too close to the ROI edge when configured.
+          4) Rank remaining candidates by a weighted score that considers both:
+                - object clearance: farther from objects is better.
+                - pose6 proximity: closer to the original tilted pose6 XY is better.
+             This treats object adjacency and excessive displacement from the
+             original pose as two simultaneous "do not place here" costs.
+          5) If nothing remains, return None and caller keeps the original pose6 XY.
+        """
+        if not self.empty_payload_is_fresh():
+            return None
+
+        payload = self.latest_empty_space_payload
+        candidates = payload.get("candidates", []) if isinstance(payload, dict) else []
+        objects_camera = payload.get("objects_camera", []) if isinstance(payload, dict) else []
+        roi = payload.get("roi", {}) if isinstance(payload, dict) else {}
+
+        if not isinstance(candidates, list) or len(candidates) == 0:
+            return None
+
+        object_size_x_mm = float(self.get_parameter("empty_space_object_size_x_mm").value)
+        object_size_y_mm = float(self.get_parameter("empty_space_object_size_y_mm").value)
+        safety_margin_mm = float(self.get_parameter("empty_space_safety_margin_mm").value)
+        roi_edge_reject_px = float(self.get_parameter("empty_space_roi_edge_reject_px").value)
+
+        w_clearance = float(self.get_parameter("empty_space_w_clearance").value)
+        w_pose6 = float(self.get_parameter("empty_space_w_pose6_proximity").value)
+        w_edge = float(self.get_parameter("empty_space_w_roi_edge").value)
+        w_vision = float(self.get_parameter("empty_space_w_vision_score").value)
+
+        clearance_norm_mm = max(float(self.get_parameter("empty_space_clearance_norm_mm").value), 1e-6)
+        pose6_proximity_norm_mm = max(float(self.get_parameter("empty_space_pose6_proximity_norm_mm").value), 1e-6)
+        roi_edge_norm_px = max(float(self.get_parameter("empty_space_roi_edge_norm_px").value), 1e-6)
+
+        object_radius_mm = float(np.hypot(object_size_x_mm * 0.5, object_size_y_mm * 0.5))
+        reject_radius_mm = object_radius_mm + safety_margin_mm
+
+        fallback_xy = np.asarray(fallback_xy_mm, dtype=np.float64).reshape(2)
+
+        # Transform detected object centers to base/world XY.
+        object_world_rows = []
+        for obj in objects_camera:
+            try:
+                cam = obj.get("camera_translation", None)
+                if cam is None:
+                    continue
+                p_obj = self.camera_point_m_to_base_mm(cam, base_T_ee)
+                object_world_rows.append({
+                    "class_name": str(obj.get("class_name", "unknown")),
+                    "class_id": int(obj.get("class_id", -1)),
+                    "world": p_obj,
+                })
+            except Exception:
+                continue
+
+        valid_rows = []
+        rejected_by_object = 0
+        rejected_by_roi_edge = 0
+        rejected_invalid = 0
+
+        for cand in candidates:
+            try:
+                cam = cand.get("camera", None)
+                pixel = cand.get("pixel", {})
+                if cam is None:
+                    rejected_invalid += 1
+                    continue
+
+                p_cand = self.camera_point_m_to_base_mm(cam, base_T_ee)
+                edge_px = self.roi_edge_distance_px(pixel, roi)
+
+                if edge_px < roi_edge_reject_px:
+                    rejected_by_roi_edge += 1
+                    continue
+
+                min_center_dist_mm = float("inf")
+                min_circle_clearance_mm = float("inf")
+                nearest_obj_debug = None
+                blocked = False
+
+                for obj_row in object_world_rows:
+                    p_obj = obj_row["world"]
+                    dx = float(p_cand[0] - p_obj[0])
+                    dy = float(p_cand[1] - p_obj[1])
+                    center_dist = float(np.hypot(dx, dy))
+                    circle_clearance = float(center_dist - reject_radius_mm)
+
+                    if center_dist < min_center_dist_mm:
+                        min_center_dist_mm = center_dist
+                        nearest_obj_debug = obj_row
+                    if circle_clearance < min_circle_clearance_mm:
+                        min_circle_clearance_mm = circle_clearance
+
+                    # 60x60 mm object footprint is treated as a rotation-invariant circle.
+                    if center_dist < reject_radius_mm:
+                        blocked = True
+                        break
+
+                if blocked:
+                    rejected_by_object += 1
+                    continue
+
+                if not np.isfinite(min_center_dist_mm):
+                    min_center_dist_mm = 999999.0
+                if not np.isfinite(min_circle_clearance_mm):
+                    min_circle_clearance_mm = 999999.0
+
+                dist_to_fallback_xy_mm = float(
+                    np.hypot(float(p_cand[0] - fallback_xy[0]), float(p_cand[1] - fallback_xy[1]))
                 )
+                vision_score = float(cand.get("score", 0.0))
 
-                stats = depth_stats_in_mask(depth, mask_img, self.depth_scale)
-                table.append({
-                    "rank": int(rank),
-                    "selected": is_selected,
-                    "class_name": cls,
-                    "class_id": obj_id,
-                    "confidence": round(conf, 3),
-                    "depth_score_m": round(float(det.get("depth_score", float("inf"))), 4),
-                    "depth_median_m": round(float(det.get("depth_med", float("inf"))), 4),
-                    "bbox": [int(v) for v in det.get("bbox", [0, 0, 0, 0])],
-                    "depth_stats": stats,
-                    "pointcloud_points_saved": int(ply_count),
-                    "files": {
-                        "mask": str(masks_dir / f"{prefix}_mask.png"),
-                        "overlay": str(masks_dir / f"{prefix}_overlay.png"),
-                        "depth_colormap": str(masks_dir / f"{prefix}_depth_colormap.png"),
-                        "histogram": str(hist_path),
-                        "pointcloud": str(ply_path),
+                valid_rows.append({
+                    "candidate": cand,
+                    "world": p_cand,
+                    "min_center_dist_mm": float(min_center_dist_mm),
+                    "min_circle_clearance_mm": float(min_circle_clearance_mm),
+                    "dist_to_fallback_xy_mm": float(dist_to_fallback_xy_mm),
+                    "roi_edge_distance_px": float(edge_px),
+                    "vision_score_raw": float(vision_score),
+                    "nearest_object": None if nearest_obj_debug is None else {
+                        "class_name": nearest_obj_debug["class_name"],
+                        "class_id": nearest_obj_debug["class_id"],
+                        "world_xy_mm": [
+                            round(float(nearest_obj_debug["world"][0]), 3),
+                            round(float(nearest_obj_debug["world"][1]), 3),
+                        ],
                     },
                 })
 
-            debug_json = {
-                "trigger_seq": int(trigger_seq),
-                "priority_rule": "smaller depth_score is closer and higher priority",
-                "depth_score_definition": "median of nearest 35 percent valid depth values inside each mask",
-                "depth_scale": float(self.depth_scale),
-                "debug_dir": str(out_dir),
-                "overwrite_mode": True,
-                "selected_rank": None,
-                "selected_class": None,
-                "detections": table,
-            }
-
-            if selected_det is not None:
-                for row in table:
-                    if row["selected"]:
-                        debug_json["selected_rank"] = row["rank"]
-                        debug_json["selected_class"] = row["class_name"]
-                        break
-
-            with open(out_dir / "priority_table.json", "w") as f:
-                json.dump(debug_json, f, indent=2, ensure_ascii=False)
-
-            self.get_logger().info(
-                f"[PRIORITY_DEBUG] saved trigger_seq={trigger_seq} "
-                f"candidates={len(detections)} dir={out_dir}"
-            )
-        except Exception as e:
-            self.get_logger().warn(f"[PRIORITY_DEBUG] save failed: {e}")
-            traceback.print_exc()
-
-
-    def _find_detection_for_last_pose(self, detections: List[Dict]) -> Optional[Dict]:
-        """Find current detection corresponding to the last successful object pose.
-
-        현재는 object tracking ID가 없으므로, 마지막 성공 class와 같은 detection 중
-        가장 가까운 것을 last pose overlay 대상으로 사용한다.
-        """
-        if self.last_object_class_name is None:
-            return None
-        candidates = [d for d in detections if d["class_name"] == self.last_object_class_name]
-        if not candidates:
-            return None
-        candidates.sort(key=lambda d: d.get("depth_score", d["depth_med"]))
-        return candidates[0]
-
-    def _get_empty_space_roi_mask(self, image_shape: Tuple[int, int, int]) -> Tuple[np.ndarray, Dict]:
-        """Build fixed rectangular ROI mask for empty-space proposals."""
-        h, w = image_shape[:2]
-
-        x_min = int(self.get_parameter("empty_roi_x_min").value)
-        y_min = int(self.get_parameter("empty_roi_y_min").value)
-        x_max_param = int(self.get_parameter("empty_roi_x_max").value)
-        y_max_param = int(self.get_parameter("empty_roi_y_max").value)
-        right_margin = int(self.get_parameter("empty_roi_right_margin").value)
-        bottom_margin = int(self.get_parameter("empty_roi_bottom_margin").value)
-
-        x_max = x_max_param if x_max_param >= 0 else (w - right_margin)
-        y_max = y_max_param if y_max_param >= 0 else (h - bottom_margin)
-
-        x_min = int(np.clip(x_min, 0, w - 1))
-        y_min = int(np.clip(y_min, 0, h - 1))
-        x_max = int(np.clip(x_max, x_min + 1, w))
-        y_max = int(np.clip(y_max, y_min + 1, h))
-
-        roi = np.zeros((h, w), dtype=np.uint8)
-        roi[y_min:y_max, x_min:x_max] = 255
-
-        meta = {
-            "type": "rect",
-            "x_min": x_min,
-            "y_min": y_min,
-            "x_max": x_max,
-            "y_max": y_max,
-        }
-        return roi, meta
-
-    def _build_occupied_mask_from_detections(
-        self,
-        detections: List[Dict],
-        image_shape: Tuple[int, int, int],
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Union object masks and make a dilated near-object exclusion mask."""
-        h, w = image_shape[:2]
-        occupied = np.zeros((h, w), dtype=np.uint8)
-
-        for det in detections:
-            mask_img = det.get("mask_img")
-            if mask_img is None:
+            except Exception:
+                rejected_invalid += 1
                 continue
-            occupied[mask_img > 0] = 255
 
-        dilate_px = max(0, int(self.get_parameter("empty_mask_dilate_px").value))
-        if dilate_px > 0:
-            k = 2 * dilate_px + 1
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-            occupied_near = cv2.dilate(occupied, kernel, iterations=1)
-        else:
-            occupied_near = occupied.copy()
+        if not valid_rows:
+            self.get_logger().warn(
+                "[EMPTY-SPACE-WORLD] no valid final candidate after world filtering. "
+                f"total={len(candidates)} rejected_object={rejected_by_object} "
+                f"rejected_roi_edge={rejected_by_roi_edge} rejected_invalid={rejected_invalid}. "
+                f"fallback_xy=({fallback_xy_mm[0]:.1f}, {fallback_xy_mm[1]:.1f})mm"
+            )
+            return None
 
-        return occupied, occupied_near
+        # Normalize vision scores by the maximum score in the current valid set.
+        max_vision = max([max(0.0, float(r["vision_score_raw"])) for r in valid_rows] + [1e-6])
 
-    def _make_object_translation_table(
-        self,
-        detections: List[Dict],
-        depth: np.ndarray,
-    ) -> List[Dict]:
-        """Return detected object translations only: class/id/conf + camera xyz."""
-        objects = []
+        for row in valid_rows:
+            # Object clearance: larger is better. Saturate to prevent one very far point
+            # from dominating pose6 proximity completely.
+            norm_clearance = float(np.clip(row["min_circle_clearance_mm"] / clearance_norm_mm, 0.0, 1.0))
 
-        for rank, det in enumerate(detections, start=1):
-            cls = str(det.get("class_name", "unknown"))
-            obj_id = int(self.class_to_id.get(cls, -1))
-            t_cam = estimate_mask_translation_camera(
-                depth,
-                det.get("mask_img"),
-                self.intrinsics,
-                self.depth_scale,
+            # Pose6 proximity: closer to original tilted pose6 XY is better.
+            # 0mm distance => 1.0, distance >= pose6_proximity_norm_mm => 0.0.
+            norm_pose6_proximity = float(
+                np.clip(1.0 - row["dist_to_fallback_xy_mm"] / pose6_proximity_norm_mm, 0.0, 1.0)
             )
 
-            x1, y1, x2, y2 = [int(v) for v in det.get("bbox", [0, 0, 0, 0])]
-            row = {
-                "rank": int(rank),
-                "class_name": cls,
-                "class_id": obj_id,
-                "confidence": round(float(det.get("confidence", 0.0)), 3),
-                "bbox": [x1, y1, x2, y2],
-                "depth_score_m": round(float(det.get("depth_score", float("inf"))), 4),
-                "depth_median_m": round(float(det.get("depth_med", float("inf"))), 4),
-                "camera_translation_valid": bool(t_cam is not None),
-                "camera_translation": None,
+            # ROI edge: farther from ROI boundary is better.
+            norm_edge = float(np.clip(row["roi_edge_distance_px"] / roi_edge_norm_px, 0.0, 1.0))
+            norm_vision = float(np.clip(max(0.0, row["vision_score_raw"]) / max_vision, 0.0, 1.0))
+
+            score = (
+                w_clearance * norm_clearance
+                + w_pose6 * norm_pose6_proximity
+                + w_edge * norm_edge
+                + w_vision * norm_vision
+            )
+
+            row["score"] = float(score)
+            row["score_terms"] = {
+                "norm_clearance": float(norm_clearance),
+                "norm_pose6_proximity": float(norm_pose6_proximity),
+                "norm_roi_edge": float(norm_edge),
+                "norm_vision": float(norm_vision),
+                "weighted_clearance": float(w_clearance * norm_clearance),
+                "weighted_pose6_proximity": float(w_pose6 * norm_pose6_proximity),
+                "weighted_roi_edge": float(w_edge * norm_edge),
+                "weighted_vision": float(w_vision * norm_vision),
             }
+            row["priority_tuple"] = (
+                float(score),
+                float(row["min_circle_clearance_mm"]),
+                -float(row["dist_to_fallback_xy_mm"]),
+                float(row["roi_edge_distance_px"]),
+                float(row["vision_score_raw"]),
+            )
 
-            if t_cam is not None:
-                row["camera_translation"] = {
-                    "x": round(float(t_cam[0]), 4),
-                    "y": round(float(t_cam[1]), 4),
-                    "z": round(float(t_cam[2]), 4),
-                }
+        valid_rows.sort(key=lambda row: row["priority_tuple"], reverse=True)
+        selected = valid_rows[0]
+        p = selected["world"]
+        cand = selected["candidate"]
 
-            objects.append(row)
-
-        return objects
-
-    def _generate_empty_space_candidates(
-        self,
-        color: np.ndarray,
-        depth: np.ndarray,
-        detections: List[Dict],
-        trigger_seq: int,
-    ) -> Dict:
-        """Generate image-grid empty-space candidates.
-
-        Stage handled here:
-          1) fixed image-grid proposals
-          2) fixed ROI filtering
-          3) object mask overlap / near-object filtering
-          4) camera-coordinate candidate point from local depth patch
-          5) detected object translations in camera frame
-
-        World-frame object-size filtering is intentionally left to the calib node.
-        """
-        h, w = color.shape[:2]
-        step_px = max(5, int(self.get_parameter("empty_grid_step_px").value))
-        max_candidates = max(1, int(self.get_parameter("empty_max_candidates").value))
-        patch_radius = max(1, int(self.get_parameter("empty_depth_patch_radius_px").value))
-        valid_ratio_min = float(self.get_parameter("empty_depth_valid_ratio_min").value)
-        spread_max_m = float(self.get_parameter("empty_depth_spread_max_m").value)
-
-        roi_mask, roi_meta = self._get_empty_space_roi_mask(color.shape)
-        occupied_mask, occupied_near_mask = self._build_occupied_mask_from_detections(detections, color.shape)
-
-        # Distance to the nearest excluded object-mask region.
-        free_for_distance = (occupied_near_mask == 0).astype(np.uint8)
-        dist_map = cv2.distanceTransform(free_for_distance, cv2.DIST_L2, 5)
-
-        proposals_total = 0
-        removed_outside_roi = 0
-        removed_on_object_mask = 0
-        removed_near_object_mask = 0
-        removed_bad_depth = 0
-        raw_candidates = []
-
-        # Use half-step offset so grid points are centered inside cells.
-        for v in range(step_px // 2, h, step_px):
-            for u in range(step_px // 2, w, step_px):
-                proposals_total += 1
-
-                if roi_mask[v, u] == 0:
-                    removed_outside_roi += 1
-                    continue
-
-                if occupied_mask[v, u] > 0:
-                    removed_on_object_mask += 1
-                    continue
-
-                if occupied_near_mask[v, u] > 0:
-                    removed_near_object_mask += 1
-                    continue
-
-                dstat = patch_depth_stats_at_pixel(
-                    depth,
-                    u,
-                    v,
-                    self.depth_scale,
-                    radius_px=patch_radius,
-                )
-
-                if (
-                    (not dstat["valid"])
-                    or float(dstat["valid_ratio"]) < valid_ratio_min
-                    or (
-                        dstat["spread_p90_p10_m"] is not None
-                        and float(dstat["spread_p90_p10_m"]) > spread_max_m
-                    )
-                ):
-                    removed_bad_depth += 1
-                    continue
-
-                p_cam = deproject_pixel_to_camera(
-                    u,
-                    v,
-                    float(dstat["median_m"]),
-                    self.intrinsics,
-                )
-
-                if p_cam is None:
-                    removed_bad_depth += 1
-                    continue
-
-                # Prefer larger clearance, with a very small center preference.
-                clearance_px = float(dist_map[v, u])
-                du = (float(u) - (w / 2.0)) / max(w / 2.0, 1.0)
-                dv = (float(v) - (h / 2.0)) / max(h / 2.0, 1.0)
-                center_penalty = float(np.sqrt(du * du + dv * dv))
-                score = clearance_px - 3.0 * center_penalty
-
-                raw_candidates.append({
-                    "u": int(u),
-                    "v": int(v),
-                    "score": float(score),
-                    "clearance_px": clearance_px,
-                    "camera_point": p_cam,
-                    "depth_stats": dstat,
-                })
-
-        raw_candidates.sort(key=lambda c: c["score"], reverse=True)
-
-        candidates = []
-        for rank, cand in enumerate(raw_candidates[:max_candidates], start=1):
-            p_cam = cand["camera_point"]
-            dstat = cand["depth_stats"]
-            candidates.append({
-                "rank": int(rank),
-                "pixel": {
-                    "u": int(cand["u"]),
-                    "v": int(cand["v"]),
+        result = {
+            "selected_world_xy_mm": [float(p[0]), float(p[1])],
+            "selected_world_xyz_mm": [float(p[0]), float(p[1]), float(p[2])],
+            "selected_candidate_rank": int(cand.get("rank", -1)),
+            "selected_candidate_pixel": cand.get("pixel", {}),
+            "selected_candidate_camera": cand.get("camera", {}),
+            "score": float(selected["score"]),
+            "score_terms": selected["score_terms"],
+            "min_center_dist_mm": float(selected["min_center_dist_mm"]),
+            "min_circle_clearance_mm": float(selected["min_circle_clearance_mm"]),
+            "dist_to_original_pose6_xy_mm": float(selected["dist_to_fallback_xy_mm"]),
+            "roi_edge_distance_px": float(selected["roi_edge_distance_px"]),
+            "nearest_object": selected["nearest_object"],
+            "selection_policy": {
+                "type": "hard_filter_then_weighted_score",
+                "hard_filters": [
+                    "center_dist_to_any_object >= reject_radius_mm",
+                    "roi_edge_distance_px >= empty_space_roi_edge_reject_px",
+                ],
+                "score": "w_clearance*norm_clearance + w_pose6*norm_pose6_proximity + w_edge*norm_roi_edge + w_vision*norm_vision",
+                "meaning": "far from objects and close to original pose6 XY are considered simultaneously",
+                "weights": {
+                    "w_clearance": float(w_clearance),
+                    "w_pose6_proximity": float(w_pose6),
+                    "w_roi_edge": float(w_edge),
+                    "w_vision_score": float(w_vision),
                 },
-                "camera": {
-                    "x": round(float(p_cam[0]), 4),
-                    "y": round(float(p_cam[1]), 4),
-                    "z": round(float(p_cam[2]), 4),
+                "norms": {
+                    "clearance_norm_mm": float(clearance_norm_mm),
+                    "pose6_proximity_norm_mm": float(pose6_proximity_norm_mm),
+                    "roi_edge_norm_px": float(roi_edge_norm_px),
                 },
-                "score": round(float(cand["score"]), 3),
-                "clearance_px": round(float(cand["clearance_px"]), 2),
-                "depth_source": "patch_median",
-                "depth_median_m": round(float(dstat["median_m"]), 4),
-                "depth_valid_ratio": round(float(dstat["valid_ratio"]), 3),
-                "depth_spread_p90_p10_m": (
-                    None
-                    if dstat["spread_p90_p10_m"] is None
-                    else round(float(dstat["spread_p90_p10_m"]), 4)
-                ),
-                "status": "vision_valid_world_filter_pending",
-            })
-
-        objects = self._make_object_translation_table(detections, depth)
-
-        return {
-            "mode": "empty_space",
-            "frame_id": self.frame_id,
-            "trigger_seq": int(trigger_seq),
-            "proposal_rule": "fixed_image_grid_then_roi_then_mask_near_exclusion",
-            "world_filter_policy": "calib_node_should_transform_candidates_and_objects_then_apply_object_size_filter",
-            "roi": roi_meta,
-            "params": {
-                "grid_step_px": int(step_px),
-                "max_candidates": int(max_candidates),
-                "mask_dilate_px": int(self.get_parameter("empty_mask_dilate_px").value),
-                "depth_patch_radius_px": int(patch_radius),
-                "depth_valid_ratio_min": float(valid_ratio_min),
-                "depth_spread_max_m": float(spread_max_m),
+            },
+            "world_filter_params": {
+                "object_size_x_mm": object_size_x_mm,
+                "object_size_y_mm": object_size_y_mm,
+                "object_radius_mm": object_radius_mm,
+                "safety_margin_mm": safety_margin_mm,
+                "reject_radius_mm": reject_radius_mm,
+                "roi_edge_reject_px": roi_edge_reject_px,
             },
             "stats": {
-                "proposals_total": int(proposals_total),
-                "removed_outside_roi": int(removed_outside_roi),
-                "removed_on_object_mask": int(removed_on_object_mask),
-                "removed_near_object_mask": int(removed_near_object_mask),
-                "removed_bad_depth": int(removed_bad_depth),
-                "candidates_before_limit": int(len(raw_candidates)),
-                "candidates_published": int(len(candidates)),
-                "objects_published": int(len(objects)),
+                "input_candidates": int(len(candidates)),
+                "valid_after_world_filter": int(len(valid_rows)),
+                "rejected_by_object_size": int(rejected_by_object),
+                "rejected_by_roi_edge": int(rejected_by_roi_edge),
+                "rejected_invalid": int(rejected_invalid),
+                "objects_world": int(len(object_world_rows)),
             },
-            "objects_camera": objects,
-            "candidates": candidates,
-            "target": candidates[0] if candidates else None,
         }
 
-    def _publish_empty_space_candidates(
+        self.get_logger().info(
+            "[EMPTY-SPACE-WORLD] selected "
+            f"rank={result['selected_candidate_rank']} "
+            f"pixel={result['selected_candidate_pixel']} "
+            f"world_xy=({p[0]:.1f}, {p[1]:.1f})mm "
+            f"score={result['score']:.3f} "
+            f"circle_clearance={result['min_circle_clearance_mm']:.1f}mm "
+            f"pose6_dist={result['dist_to_original_pose6_xy_mm']:.1f}mm "
+            f"roi_edge={result['roi_edge_distance_px']:.1f}px "
+            f"valid={len(valid_rows)}/{len(candidates)}"
+        )
+
+        return result
+
+    def apply_empty_space_override_if_needed(self, target: Dict[str, Any]) -> Dict[str, Any]:
+        """For tilted_grasp negative output id, append selected empty-space world X/Y.
+
+        Important output policy:
+          - Do NOT replace the original object grasp pose6.
+          - Keep target_pose6 as the pose computed from the object 6D pose.
+          - If output id is negative and a valid empty-space candidate exists, attach
+            empty_space_world_xy_mm=[x_mm, y_mm].
+
+        Therefore /vision/peg_targets becomes:
+          normal success:    [id, x, y, z, rx, ry, rz]                  len=7
+          tilted + empty:    [-id, x, y, z, rx, ry, rz, empty_x, empty_y] len=9
+        """
+        out = dict(target)
+        target_pose6 = np.asarray(target["target_pose6"], dtype=np.float64).reshape(6).copy()
+
+        target_id = int(round(float(target.get("id", 999999))))
+        tilted_grasp_used = bool(target.get("tilted_grasp_used", False))
+        enable_append = bool(self.get_parameter("empty_space_override_on_negative_tilted_id").value)
+        should_append = bool(enable_append and tilted_grasp_used and target_id < 0)
+
+        # Keep original pose6 always.  The empty-space XY is additional metadata/output,
+        # not a replacement for pose6 X/Y.
+        out["target_pose6"] = target_pose6
+
+        # Keep old key names for log compatibility, but the behavior is append, not override.
+        out["empty_space_override_checked"] = bool(tilted_grasp_used and target_id < 0)
+        out["empty_space_override_used"] = False
+        out["empty_space_override_reason"] = "not_tilted_grasp_negative_output_id"
+
+        out["empty_space_append_checked"] = bool(tilted_grasp_used and target_id < 0)
+        out["empty_space_append_used"] = False
+        out["empty_space_append_reason"] = "not_tilted_grasp_negative_output_id"
+        out.pop("empty_space_world_xy_mm", None)
+
+        if not should_append:
+            if not enable_append:
+                out["empty_space_override_reason"] = "disabled_by_parameter"
+                out["empty_space_append_reason"] = "disabled_by_parameter"
+            return out
+
+        base_T_ee = pose6_mm_deg_to_T_mm(self.pending_trigger_msg.data[3:9])
+        validate_T(base_T_ee, name="empty_space_append_base_T_ee")
+
+        fallback_xy = (float(target_pose6[0]), float(target_pose6[1]))
+        selected = self.select_empty_space_world_xy(base_T_ee, fallback_xy_mm=fallback_xy)
+
+        if selected is None:
+            out["empty_space_override_reason"] = "no_valid_empty_space_candidate_no_append"
+            out["empty_space_append_reason"] = "no_valid_empty_space_candidate_no_append"
+            return out
+
+        x_mm, y_mm = selected["selected_world_xy_mm"]
+
+        # Append-only data. Do not modify target_pose6, x/y, or target_T.
+        out["empty_space_world_xy_mm"] = [float(x_mm), float(y_mm)]
+        out["empty_space_selected"] = selected
+
+        out["empty_space_override_used"] = False
+        out["empty_space_override_reason"] = "append_only_original_pose6_kept"
+
+        out["empty_space_append_used"] = True
+        out["empty_space_append_reason"] = "tilted_grasp_negative_output_id_append_empty_space_xy"
+
+        return out
+
+    # ============================================================
+    # Transform core - object output: final moveL pose6
+    # ============================================================
+
+    def object_to_pose6_target_dict(
         self,
-        color: np.ndarray,
-        depth: np.ndarray,
-        display: np.ndarray,
-        detections: List[Dict],
-        trigger_seq: int,
-    ) -> Optional[Dict]:
-        if not bool(self.get_parameter("empty_space_enable").value):
+        obj: Dict[str, Any],
+        base_T_ee: np.ndarray,
+        allowed_object_ids: Optional[List[int]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        cls = str(obj.get("class", ""))
+        conf = float(obj.get("confidence", 0.0))
+
+        if conf < self.min_confidence:
             return None
 
-        data = self._generate_empty_space_candidates(
-            color=color,
-            depth=depth,
-            detections=detections,
-            trigger_seq=trigger_seq,
-        )
+        if cls not in self.class_to_id:
+            return None
 
-        msg = String()
-        msg.data = json.dumps(data, ensure_ascii=False)
-        self.empty_space_pub.publish(msg)
+        obj_id = int(self.class_to_id[cls])
+        if allowed_object_ids is not None:
+            allowed_object_ids = [int(v) for v in allowed_object_ids]
+            if obj_id not in allowed_object_ids:
+                return None
 
-        # Save this result so the OpenCV visualization remains visible for a few seconds.
-        self.last_empty_space_debug = data
-        self.last_empty_space_debug_stamp_sec = self.get_clock().now().nanoseconds * 1e-9
+        try:
+            # FoundationPose/CAD raw object pose in camera frame.
+            cam_T_obj = object_json_to_cam_T_obj_mm(obj)
 
-        # Visualization on the trigger frame: green = published candidate, red = detected object translation.
-        for cand in data.get("candidates", []):
-            u = int(cand["pixel"]["u"])
-            v = int(cand["pixel"]["v"])
-            rank = int(cand["rank"])
-            cv2.circle(display, (u, v), 5, (0, 255, 0), -1)
-            if rank <= 5:
-                cv2.putText(
-                    display,
-                    f"E{rank}",
-                    (u + 6, v - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
-                    (0, 255, 0),
-                    1,
+            # Trigger에서 받은 현재 TCP/EE pose + hand-eye + camera object pose.
+            # 1번 코드처럼 rbpodo로 직접 TCP를 다시 쿼리하지 않고, 2번의 기존 trigger TCP를 유지한다.
+            base_T_obj_raw = base_T_ee @ self.ee_T_cam @ cam_T_obj
+            validate_T(base_T_obj_raw, name=f"base_T_obj_raw[{cls}]")
+
+            # YAML:
+            #   raw object/CAD frame -> centered/canonical object frame
+            #   centered object frame -> nominal TCP goal frame
+            raw_object_T_centered_object, centered_object_T_tcp_nominal, symmetry, tilted_grasp_cfg, cylinder_yaw_cfg = (
+                self.get_object_target_transforms_for_class(cls)
+            )
+
+            base_T_centered_object = base_T_obj_raw @ raw_object_T_centered_object
+            validate_T(base_T_centered_object, name=f"base_T_centered_object[{cls}]")
+
+            # 1번 최신 Z-up defense:
+            # keep 후보와 X/Z 동시 flip 후보 중 object +Z가 world +Z에 더 가까운 쪽 선택.
+            axis_info = None
+            if bool(self.get_parameter("canonicalize_object_axes").value):
+                base_T_centered_object, axis_info = defend_centered_object_z_up(
+                    base_T_centered_object,
+                    z_flip_margin=float(self.get_parameter("canonicalize_z_flip_margin").value),
+                )
+                if axis_info["z_flipped"]:
+                    self.get_logger().info(
+                        f"z-defense centered object axes class={cls} "
+                        f"z_flipped={axis_info['z_flipped']} "
+                        f"keep_dot_up={axis_info.get('keep_dot_up')} "
+                        f"flip_dot_up={axis_info.get('flip_dot_up')} "
+                        f"after_dot_up={axis_info['after_dot_up']}"
+                    )
+
+            # 1번 전체 로직: X/Y 중 월드 XY 평면에 더 평행한 축을 object +X로 선택.
+            # 그 후, hole/cross에 한해서 selected +X가 너무 기울어져 있으면
+            # centered object local +Z 기준 45deg yaw를 먼저 적용하고 다시 XY_FLAT을 수행한다.
+            xy_info = None
+            tilted_grasp_used = False
+            tilted_grasp_reason = ""
+            tilted_pre_yaw_deg = 0.0
+            tilt_info = compute_centered_axis_tilt_info(base_T_centered_object)
+
+            if bool(self.get_parameter("canonicalize_xy_flatter_as_x").value):
+                base_T_centered_object, xy_info = canonicalize_xy_flatter_as_x(
+                    base_T_centered_object,
+                    swap_margin=float(self.get_parameter("canonicalize_xy_swap_margin").value),
+                )
+                self.get_logger().info(
+                    f"[XY_FLAT] cls={cls} "
+                    f"swapped={xy_info['xy_swapped']} "
+                    f"selected_x={xy_info['selected_x_from']} "
+                    f"x_flat_before={xy_info['x_flatness_before']:.3f} "
+                    f"y_flat_before={xy_info['y_flatness_before']:.3f} "
+                    f"x_flat_after={xy_info['x_flatness_after']:.3f}"
                 )
 
-        for obj in data.get("objects_camera", []):
-            t = obj.get("camera_translation")
-            if not t:
-                continue
-            z = float(t["z"])
-            if z <= 0:
-                continue
-            u = int(float(t["x"]) * self.intrinsics.fx / z + self.intrinsics.ppx)
-            v = int(float(t["y"]) * self.intrinsics.fy / z + self.intrinsics.ppy)
-            cv2.circle(display, (u, v), 6, (0, 0, 255), -1)
+                # Debug: centered object frame after:
+                # raw object -> object_to_center -> z-up defense -> xy-flat canonicalization
+                # This is BEFORE centered_object_to_tcp.
+                tilt_info = compute_centered_axis_tilt_info(base_T_centered_object)
+                log_centered_axis_tilt(
+                    self.get_logger(),
+                    "CENTERED_OBJECT_SAFE",
+                    cls,
+                    tilt_info,
+                )
 
-        self.get_logger().info(
-            f"[EMPTY_SPACE] seq={trigger_seq} "
-            f"candidates={data['stats']['candidates_published']} "
-            f"objects={data['stats']['objects_published']} "
-            f"topic={str(self.get_parameter('empty_space_topic').value)} "
-            f"bundled_into_object_json=True"
-        )
+                # cylinder는 제외. hole/cross만 tilted grasp branch 허용.
+                tilted_enable = (
+                    bool(tilted_grasp_cfg.get("enable", False))
+                    and canonical_object_name(cls) != "cylinder"
+                )
+                tilted_threshold_deg = float(tilted_grasp_cfg.get("x_tilt_threshold_deg", 999.0))
+                tilted_pre_yaw_deg = float(tilted_grasp_cfg.get("pre_yaw_deg", 45.0))
+
+                if tilted_enable and tilt_info["x_tilt_ground_deg"] >= tilted_threshold_deg:
+                    before_x_tilt = float(tilt_info["x_tilt_ground_deg"])
+
+                    # centered object local +Z 기준으로 먼저 45deg yaw 회전.
+                    # base_T_centered_object의 오른쪽에 곱하므로 local frame 기준 yaw가 된다.
+                    base_T_centered_object = base_T_centered_object @ T_rot_z_deg(tilted_pre_yaw_deg)
+                    validate_T(
+                        base_T_centered_object,
+                        name=f"base_T_centered_object_tilted_yaw[{cls}]",
+                    )
+
+                    # 45deg 돌린 뒤, 다시 x/y 중 더 world XY 평면에 완만한 축을 +X로 선택.
+                    base_T_centered_object, xy_info_2 = canonicalize_xy_flatter_as_x(
+                        base_T_centered_object,
+                        swap_margin=float(self.get_parameter("canonicalize_xy_swap_margin").value),
+                    )
+
+                    tilt_info_2 = compute_centered_axis_tilt_info(base_T_centered_object)
+
+                    tilted_grasp_used = True
+                    tilted_grasp_reason = (
+                        f"x_tilt_ground {before_x_tilt:.2f}deg >= "
+                        f"threshold {tilted_threshold_deg:.2f}deg"
+                    )
+
+                    self.get_logger().warn(
+                        f"[TILTED_GRASP_X45] cls={cls} "
+                        f"reason='{tilted_grasp_reason}' "
+                        f"pre_yaw={tilted_pre_yaw_deg:.1f}deg "
+                        f"xy2_swapped={xy_info_2['xy_swapped']} "
+                        f"xy2_selected_x={xy_info_2['selected_x_from']} "
+                        f"x_tilt_before={before_x_tilt:.2f}deg "
+                        f"x_tilt_after={tilt_info_2['x_tilt_ground_deg']:.2f}deg "
+                        f"y_tilt_after={tilt_info_2['y_tilt_ground_deg']:.2f}deg "
+                        f"z_tilt_up_after={tilt_info_2['z_tilt_up_deg']:.2f}deg"
+                    )
+                    log_centered_axis_tilt(
+                        self.get_logger(),
+                        "CENTERED_OBJECT_TILTED_SAFE",
+                        cls,
+                        tilt_info_2,
+                    )
+
+                    tilt_info = tilt_info_2
+                    xy_info = {
+                        **xy_info,
+                        "tilted_xy_swapped": bool(xy_info_2["xy_swapped"]),
+                        "tilted_selected_x_from": str(xy_info_2["selected_x_from"]),
+                        "tilted_x_flatness_after": float(xy_info_2["x_flatness_after"]),
+                        "tilted_y_flatness_after": float(xy_info_2["y_flatness_after"]),
+                    }
+
+                max_flat = float(self.get_parameter("canonicalize_xy_max_flatness").value)
+                final_x_flatness = abs(float(tilt_info["x_dot_up"]))
+                if final_x_flatness > max_flat:
+                    self.get_logger().warn(
+                        f"[SKIP] cls={cls}: selected object +X is still too steep. "
+                        f"x_flatness_after={final_x_flatness:.3f} > {max_flat:.3f}"
+                    )
+                    return None
+
+            # symmetry.yaw_candidates_deg 후보를 만들고, RB5 마지막 joint 기준으로 필터링.
+            grasp_candidates = self.make_symmetric_grasp_candidates(
+                centered_object_T_tcp_nominal,
+                symmetry,
+            )
+
+            best = None
+            is_cylinder = canonical_object_name(cls) == "cylinder"
+            world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+            # Cylinder-specific policy:
+            #   1) J5 limit 초과 후보는 기존처럼 skip
+            #   2) 남은 후보 중 centered object 기준 축이 world XY 평면에 가장 평평한 후보 선택
+            #   3) 평평함이 비슷하면 J5 delta가 더 작은 후보 선택
+            #
+            # Default score_axis="object_x" means:
+            #   yaw 후보가 적용된 centered object frame의 +X축을 평가한다.
+            #   즉 TCP 축이 아니라 물체/centered-object 축 기준이다.
+            cyl_yaw_search_enabled = bool(cylinder_yaw_cfg.get("enable", True))
+            cyl_score_axis = str(cylinder_yaw_cfg.get("score_axis", "object_x")).lower()
+            cyl_flat_tolerance_deg = float(cylinder_yaw_cfg.get("flat_tolerance_deg", 3.0))
+
+            def _axis_for_cylinder_score(
+                axis_name: str,
+                base_T_centered: np.ndarray,
+                base_T_tcp: np.ndarray,
+                yaw_deg: float,
+            ) -> np.ndarray:
+                axis_name = str(axis_name).lower()
+
+                object_axis_map = {
+                    "object_x": 0, "+object_x": 0, "center_x": 0, "+center_x": 0,
+                    "centered_object_x": 0, "+centered_object_x": 0,
+                    "object_y": 1, "+object_y": 1, "center_y": 1, "+center_y": 1,
+                    "centered_object_y": 1, "+centered_object_y": 1,
+                    "object_z": 2, "+object_z": 2, "center_z": 2, "+center_z": 2,
+                    "centered_object_z": 2, "+centered_object_z": 2,
+                }
+                tcp_axis_map = {
+                    "tcp_x": 0, "+tcp_x": 0,
+                    "tcp_y": 1, "+tcp_y": 1,
+                    "tcp_z": 2, "+tcp_z": 2,
+                }
+
+                if axis_name in object_axis_map:
+                    # 후보 yaw가 적용된 centered object frame의 축을 평가.
+                    # 여기서 오른쪽에 Rz(yaw)를 곱하므로 local +Z 기준 yaw가 된다.
+                    base_T_centered_yaw = base_T_centered @ T_rot_z_deg(float(yaw_deg))
+                    R_eval = orthonormalize_R(base_T_centered_yaw[:3, :3])
+                    return R_eval[:, object_axis_map[axis_name]]
+
+                if axis_name in tcp_axis_map:
+                    # 필요 시 디버그/실험용: 최종 TCP frame의 축을 평가.
+                    R_eval = orthonormalize_R(base_T_tcp[:3, :3])
+                    return R_eval[:, tcp_axis_map[axis_name]]
+
+                # 잘못된 값이면 안전하게 object_x 기준으로 fallback.
+                base_T_centered_yaw = base_T_centered @ T_rot_z_deg(float(yaw_deg))
+                R_eval = orthonormalize_R(base_T_centered_yaw[:3, :3])
+                return R_eval[:, 0]
+
+            for cand in grasp_candidates:
+                base_T_tcp_goal_cand = base_T_centered_object @ cand["centered_object_T_tcp"]
+                validate_T(base_T_tcp_goal_cand, name=f"base_T_tcp_goal[{cls}:{cand['name']}]")
+
+                estimated_j5, delta_j5, signed_delta_j5 = self.estimate_last_joint_for_goal(
+                    base_T_tcp_goal_cand,
+                    base_T_ee,
+                )
+
+                if delta_j5 > self.last_joint_limit_delta_deg + 1e-9:
+                    self.get_logger().info(
+                        f"[J5_SKIP] cls={cls} cand={cand['name']} "
+                        f"yaw={cand['yaw_deg']:.1f} "
+                        f"est_J5={estimated_j5:.2f} "
+                        f"signed_delta={signed_delta_j5:.2f} "
+                        f"delta={delta_j5:.2f} "
+                        f"limit=±{self.last_joint_limit_delta_deg:.1f}"
+                    )
+                    continue
+
+                axis_tilt_ground_deg = None
+                score = delta_j5
+                better = False
+
+                if is_cylinder and cyl_yaw_search_enabled:
+                    flat_axis = _axis_for_cylinder_score(
+                        cyl_score_axis,
+                        base_T_centered_object,
+                        base_T_tcp_goal_cand,
+                        cand["yaw_deg"],
+                    )
+                    axis_dot_up = abs(float(np.dot(flat_axis, world_up)))
+                    axis_tilt_ground_deg = float(
+                        np.degrees(np.arcsin(np.clip(axis_dot_up, 0.0, 1.0)))
+                    )
+
+                    if best is None:
+                        better = True
+                    else:
+                        best_axis_tilt = float(best.get("axis_tilt_ground_deg", 999.0))
+                        if axis_tilt_ground_deg < best_axis_tilt - cyl_flat_tolerance_deg:
+                            better = True
+                        elif abs(axis_tilt_ground_deg - best_axis_tilt) <= cyl_flat_tolerance_deg:
+                            better = delta_j5 < float(best["delta_j5"])
+                else:
+                    # Non-cylinder, or cylinder_yaw_search.enable=false:
+                    # J5 limit을 통과한 후보 중 J5 delta가 가장 작은 후보 선택.
+                    if best is None or score < best["score"]:
+                        better = True
+
+                if better:
+                    best = {
+                        "candidate": cand,
+                        "base_T_tcp_goal": base_T_tcp_goal_cand,
+                        "estimated_j5": estimated_j5,
+                        "delta_j5": delta_j5,
+                        "signed_delta_j5": signed_delta_j5,
+                        "score": score,
+                        "axis_tilt_ground_deg": axis_tilt_ground_deg,
+                        "cylinder_score_axis": cyl_score_axis if is_cylinder else "",
+                        "cylinder_flat_tolerance_deg": cyl_flat_tolerance_deg if is_cylinder else 0.0,
+                    }
+
+                if is_cylinder:
+                    if cyl_yaw_search_enabled:
+                        self.get_logger().info(
+                            f"[J5_CAND] cls={cls} cand={cand['name']} "
+                            f"yaw={cand['yaw_deg']:.1f} "
+                            f"est_J5={estimated_j5:.2f} "
+                            f"signed_delta={signed_delta_j5:.2f} "
+                            f"delta={delta_j5:.2f} "
+                            f"axis={cyl_score_axis} "
+                            f"axis_tilt_ground={axis_tilt_ground_deg:.2f}deg "
+                            f"flat_tol={cyl_flat_tolerance_deg:.2f}deg"
+                        )
+                    else:
+                        self.get_logger().info(
+                            f"[J5_CAND] cls={cls} cand={cand['name']} "
+                            f"yaw={cand['yaw_deg']:.1f} "
+                            f"est_J5={estimated_j5:.2f} "
+                            f"signed_delta={signed_delta_j5:.2f} "
+                            f"delta={delta_j5:.2f} "
+                            f"score={score:.2f} "
+                            f"cylinder_yaw_search=disabled"
+                        )
+                else:
+                    self.get_logger().info(
+                        f"[J5_CAND] cls={cls} cand={cand['name']} "
+                        f"yaw={cand['yaw_deg']:.1f} "
+                        f"est_J5={estimated_j5:.2f} "
+                        f"signed_delta={signed_delta_j5:.2f} "
+                        f"delta={delta_j5:.2f} "
+                        f"score={score:.2f}"
+                    )
+
+            if best is None:
+                self.get_logger().warn(
+                    f"[NO_VALID_GRASP] cls={cls}: all yaw candidates exceed "
+                    f"J5 reference {self.reference_last_joint_deg:.2f} "
+                    f"±{self.last_joint_limit_delta_deg:.1f} deg"
+                )
+                return None
+
+            selected = best["candidate"]
+            base_T_tcp_goal = best["base_T_tcp_goal"]
+            target_pose6 = T_mm_to_pose6_mm_deg(base_T_tcp_goal)
+            p = base_T_tcp_goal[:3, 3]
+
+            output_obj_id = obj_id
+            if tilted_grasp_used and bool(tilted_grasp_cfg.get("mark_output_id_negative", True)):
+                # cylinder는 tilted_grasp branch에서 제외되므로 -0 문제는 발생하지 않는다.
+                output_obj_id = -abs(obj_id)
+
+            return {
+                "class": cls,
+                "id": output_obj_id,
+                "raw_id": obj_id,
+                "tilted_grasp_used": bool(tilted_grasp_used),
+                "tilted_grasp_reason": tilted_grasp_reason,
+                "tilted_pre_yaw_deg": float(tilted_pre_yaw_deg),
+                "confidence": conf,
+                "source_depth_m": self.object_source_depth_m(obj),
+                "x": float(p[0]),
+                "y": float(p[1]),
+                "z": float(p[2]),
+                "target_T": base_T_tcp_goal,
+                "target_pose6": target_pose6,
+                "base_T_obj_raw": base_T_obj_raw,
+                "base_T_centered_object_safe": base_T_centered_object,
+                "target_frame": "tcp_goal",
+                "axis_info": axis_info,
+                "xy_info": xy_info,
+                "selected_grasp_name": selected["name"],
+                "selected_grasp_yaw_deg": float(selected["yaw_deg"]),
+                "estimated_last_joint_deg": float(best["estimated_j5"]),
+                "last_joint_delta_deg": float(best["delta_j5"]),
+                "last_joint_signed_delta_deg": float(best["signed_delta_j5"]),
+                "selected_axis_tilt_ground_deg": (
+                    None if best.get("axis_tilt_ground_deg") is None
+                    else float(best["axis_tilt_ground_deg"])
+                ),
+                "cylinder_score_axis": str(best.get("cylinder_score_axis", "")),
+                "cylinder_flat_tolerance_deg": float(best.get("cylinder_flat_tolerance_deg", 0.0)),
+                "output_format": "id_plus_moveL_pose6_7",
+            }
+
+        except Exception as e:
+            self.get_logger().warn(f"failed to transform object class={cls}: {e}")
+            return None
+
+    # ============================================================
+    # Transform core - insert output: legacy [x, y, yaw, id]
+    # ============================================================
+
+    def insert_to_legacy_target_dict(self, obj: Dict[str, Any], base_T_ee: np.ndarray) -> Optional[Dict[str, Any]]:
+        cls = str(obj.get("class", ""))
+        conf = float(obj.get("confidence", 0.0))
+
+        if conf < self.min_confidence:
+            return None
+
+        if cls not in self.class_to_id:
+            return None
+
+        try:
+            cam_T_obj = object_json_to_cam_T_obj_mm(obj)
+            base_T_obj = base_T_ee @ self.ee_T_cam @ cam_T_obj
+            validate_T(base_T_obj, name=f"base_T_obj_insert[{cls}]")
+
+            p = base_T_obj[:3, 3]
+            x_mm = float(p[0])
+            y_mm = float(p[1])
+
+            if "yaw_deg" in obj:
+                yaw_deg = float(obj["yaw_deg"])
+                yaw_source = str(obj.get("yaw_source", "template"))
+            else:
+                yaw_deg = self.yaw_deg_from_R_base_obj(base_T_obj[:3, :3])
+                yaw_source = "pose_matrix"
+
+            yaw_deg = (yaw_deg + 180.0) % 360.0 - 180.0
+
+            return {
+                "class": cls,
+                "id": int(self.class_to_id[cls]),
+                "confidence": conf,
+                "x": x_mm,
+                "y": y_mm,
+                "yaw": float(yaw_deg),
+                "yaw_source": yaw_source,
+                "source_yaw_deg": obj.get("yaw_deg", None),
+                "source_yaw_score": obj.get("yaw_score", None),
+                "output_format": "legacy_xyyaw_4",
+            }
+
+        except Exception as e:
+            self.get_logger().warn(f"failed to transform insert class={cls}: {e}")
+            return None
+
+    @staticmethod
+    def yaw_deg_from_R_base_obj(R: np.ndarray) -> float:
+        R = orthonormalize_R(np.asarray(R, dtype=np.float64).reshape(3, 3))
+        yaw_rad = np.arctan2(R[1, 0], R[0, 0])
+        yaw_deg = np.degrees(yaw_rad)
+        return float((yaw_deg + 180.0) % 360.0 - 180.0)
+
+    @staticmethod
+    def object_source_depth_m(obj: Dict[str, Any]) -> float:
+        """Depth median from vision JSON, used only for robust nearest fallback."""
+        try:
+            priority = obj.get("priority", {})
+            if isinstance(priority, dict) and "depth_median_m" in priority:
+                return float(priority["depth_median_m"])
+            if "depth_median_m" in obj:
+                return float(obj["depth_median_m"])
+        except Exception:
+            pass
+        return float("inf")
+
+    def make_pose6_targets_from_objects(self, objects, base_T_ee, allowed_object_ids=None):
+        targets = []
+        for obj in objects:
+            target = self.object_to_pose6_target_dict(
+                obj,
+                base_T_ee,
+                allowed_object_ids=allowed_object_ids,
+            )
+            if target is not None:
+                targets.append(target)
+        return targets
+
+    def make_legacy_targets_from_inserts(self, objects, base_T_ee):
+        targets = []
+        for obj in objects:
+            target = self.insert_to_legacy_target_dict(obj, base_T_ee)
+            if target is not None:
+                targets.append(target)
+        return targets
+
+    @staticmethod
+    def object_targets_to_msg_data(targets):
+        """
+        Object target success format:
+            normal object:
+                [object_id, tcp_x_mm, tcp_y_mm, tcp_z_mm, tcp_rx_deg, tcp_ry_deg, tcp_rz_deg]
+                len = 7
+
+            tilted object with empty-space candidate:
+                [-object_id, tcp_x_mm, tcp_y_mm, tcp_z_mm, tcp_rx_deg, tcp_ry_deg, tcp_rz_deg,
+                 empty_space_world_x_mm, empty_space_world_y_mm]
+                len = 9
+
+        Important:
+            For negative id, pose6 is still the original object grasp pose6.
+            Empty-space world X/Y is appended after pose6; pose6 X/Y is not replaced.
+        """
+        data = []
+
+        for t in targets:
+            obj_id = float(t["id"])
+            pose6 = np.asarray(t["target_pose6"], dtype=np.float64).reshape(6)
+            row = [obj_id] + pose6.tolist()
+
+            extra_xy = t.get("empty_space_world_xy_mm", None)
+            if int(round(obj_id)) < 0 and extra_xy is not None:
+                extra_xy = np.asarray(extra_xy, dtype=np.float64).reshape(2)
+                row.extend([float(extra_xy[0]), float(extra_xy[1])])
+
+            data.extend(row)
 
         return data
 
-
-    def _draw_last_empty_space_debug(self, display: np.ndarray) -> None:
-        """Keep the last empty-space proposal visualization visible for N seconds.
-
-        This is intentionally independent from the trigger frame drawing so that
-        candidates do not disappear too quickly in the OpenCV preview window.
+    @staticmethod
+    def object_visible_ids_to_msg_data(visible_ids):
         """
-        if self.last_empty_space_debug is None or self.last_empty_space_debug_stamp_sec is None:
-            return
+        Peg fallback/failure format:
+            [currently_visible_object_id_0, currently_visible_object_id_1, ...]
 
-        hold_sec = float(self.get_parameter("empty_space_vis_hold_sec").value)
-        if hold_sec <= 0.0:
-            self.last_empty_space_debug = None
-            self.last_empty_space_debug_stamp_sec = None
-            return
+        The controller distinguishes this from success by length:
+            len(data) == 7 -> success [object_id, moveL pose6]
+            len(data) != 7 -> fallback visible-id response
+        """
+        ids = []
+        for v in visible_ids:
+            obj_id = int(round(float(v)))
+            if obj_id not in ids:
+                ids.append(obj_id)
+        return [float(v) for v in ids]
 
-        now_sec = self.get_clock().now().nanoseconds * 1e-9
-        elapsed = float(now_sec - float(self.last_empty_space_debug_stamp_sec))
+    @staticmethod
+    def insert_targets_to_msg_data(targets):
+        """
+        Insert legacy target format:
+            x_mm, y_mm, yaw_deg, id
+        Total 4 floats per target.
+        """
+        data = []
 
-        if elapsed > hold_sec:
-            self.last_empty_space_debug = None
-            self.last_empty_space_debug_stamp_sec = None
-            return
+        for t in targets:
+            data.extend([
+                float(t["x"]),
+                float(t["y"]),
+                float(t["yaw"]),
+                float(t["id"]),
+            ])
 
-        data = self.last_empty_space_debug
-        h, w = display.shape[:2]
+        return data
 
-        # ROI rectangle: blue.
-        roi = data.get("roi", {})
-        if roi.get("type") == "rect":
-            x_min = int(np.clip(int(roi.get("x_min", 0)), 0, w - 1))
-            y_min = int(np.clip(int(roi.get("y_min", 0)), 0, h - 1))
-            x_max = int(np.clip(int(roi.get("x_max", w - 1)), 0, w - 1))
-            y_max = int(np.clip(int(roi.get("y_max", h - 1)), 0, h - 1))
-            cv2.rectangle(display, (x_min, y_min), (x_max, y_max), (255, 0, 0), 2)
-            cv2.putText(
-                display,
-                "EMPTY ROI",
-                (x_min + 5, max(20, y_min - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (255, 0, 0),
-                2,
+    def publish_repeated(self, publisher, msg, count=10):
+        for _ in range(count):
+            publisher.publish(msg)
+
+    # ============================================================
+    # Trigger handling
+    # ============================================================
+
+    @staticmethod
+    def parse_peg_trigger_data(trigger_msg) -> Tuple[List[int], np.ndarray]:
+        data = np.asarray(trigger_msg.data, dtype=np.float64).reshape(-1)
+        if data.size < 9:
+            raise ValueError(
+                "peg trigger data must be "
+                "[use_cylinder, use_hole, use_cross, "
+                "x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg]. "
+                f"got {data.size} values"
             )
 
-        # Empty-space candidates: green. Top-10 get rank labels.
-        candidates = data.get("candidates", [])
-        for cand in candidates:
-            pixel = cand.get("pixel", {})
-            u = int(pixel.get("u", -1))
-            v = int(pixel.get("v", -1))
-            rank = int(cand.get("rank", 0))
-
-            if u < 0 or v < 0 or u >= w or v >= h:
-                continue
-
-            radius = 7 if rank == 1 else 5
-            thickness = -1 if rank <= 10 else 1
-            cv2.circle(display, (u, v), radius, (0, 255, 0), thickness)
-
-            if rank <= 10:
-                cv2.putText(
-                    display,
-                    f"E{rank}",
-                    (u + 8, v - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
-                    (0, 255, 0),
-                    2,
+        use_flags = [int(round(float(v))) for v in data[:3]]
+        for flag in use_flags:
+            if flag not in (0, 1):
+                raise ValueError(
+                    "peg trigger use flags must be 0 or 1: "
+                    f"[use_cylinder, use_hole, use_cross]={use_flags}"
                 )
 
-        # Detected object camera translations reprojected into the image: red.
-        objects = data.get("objects_camera", [])
-        for obj in objects:
-            t = obj.get("camera_translation")
-            if not t:
-                continue
-
-            z = float(t.get("z", 0.0))
-            if z <= 0.0:
-                continue
-
-            u = int(float(t.get("x", 0.0)) * self.intrinsics.fx / z + self.intrinsics.ppx)
-            v = int(float(t.get("y", 0.0)) * self.intrinsics.fy / z + self.intrinsics.ppy)
-            if u < 0 or v < 0 or u >= w or v >= h:
-                continue
-
-            cv2.circle(display, (u, v), 7, (0, 0, 255), -1)
-            cls = str(obj.get("class_name", "obj"))
-            cv2.putText(
-                display,
-                cls,
-                (u + 8, v + 12),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                (0, 0, 255),
-                2,
+        allowed_object_ids = [obj_id for obj_id, flag in enumerate(use_flags) if flag == 1]
+        if not allowed_object_ids:
+            raise ValueError(
+                "peg trigger must enable at least one object. "
+                "example: [1, 0, 1, tcp_x, tcp_y, tcp_z, tcp_rx, tcp_ry, tcp_rz]"
             )
 
-        # Status text.
-        stats = data.get("stats", {})
-        cand_n = int(stats.get("candidates_published", len(candidates)))
-        obj_n = int(stats.get("objects_published", len(objects)))
-        cv2.putText(
-            display,
-            f"EMPTY SPACE DEBUG {elapsed:.1f}/{hold_sec:.1f}s | cand={cand_n} obj={obj_n}",
-            (10, h - 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 0),
-            2,
-        )
+        base_T_ee = pose6_mm_deg_to_T_mm(data[3:9])
+        validate_T(base_T_ee, name="base_T_ee")
+        return allowed_object_ids, base_T_ee
 
+    def schedule_once(self, delay_sec: float, timer_attr: str, callback):
+        delay_sec = max(float(delay_sec), 0.0)
 
-    def _process_object_mode(
-        self,
-        color,
-        depth,
-        display,
-        run_fp: bool,
-        requested_class: Optional[str],
-        requested_allowed_ids: Optional[List[int]],
-        trigger_seq: int,
-    ) -> Tuple[List[Dict], Dict]:
-        status = {
-            "triggered": bool(run_fp),
-            "trigger_seq": int(trigger_seq),
-            "requested_class": requested_class,
-            "requested_allowed_ids": requested_allowed_ids,
-            "status": "preview" if not run_fp else "pending",
-        }
-        trigger_text = "TRIGGERED" if run_fp else "WAIT_TRIGGER"
-        cv2.putText(
-            display,
-            f"MODE: object | FP: {'ON' if self.fp_available else 'OFF'} | {trigger_text}",
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.75,
-            (0, 255, 255),
-            2,
-        )
+        self.cancel_timer_if_alive(timer_attr)
 
-        # 1) object YOLO segmentation은 매 프레임 전체 detection을 수집하고 전부 시각화한다.
-        raw_detections = self._collect_detections(self.object_model, color, depth)
-        status["detected_count_raw"] = len(raw_detections)
+        if delay_sec <= 1e-6:
+            callback()
+            return
 
-        # On a 6D trigger, generate empty-space candidates before FoundationPose.
-        # The same data is also bundled into the /object_poses JSON so the transform node
-        # receives pose + empty-space candidates atomically from the same trigger/frame.
-        empty_space_data = None
-        if run_fp:
-            empty_space_data = self._publish_empty_space_candidates(
-                color=color,
-                depth=depth,
-                display=display,
-                detections=raw_detections,
-                trigger_seq=trigger_seq,
-            )
-            if empty_space_data is not None:
-                status["empty_space"] = empty_space_data
-                status["empty_space_bundle_policy"] = "included_in_object_poses_json_same_trigger"
+        def _wrapped_callback():
+            self.cancel_timer_if_alive(timer_attr)
+            callback()
 
-        # Show current top-priority candidate in the preview window.
-        # Current priority rule: smaller depth_score means closer object.
-        if raw_detections:
-            top = raw_detections[0]
-            top_depth = float(top.get("depth_score", top["depth_med"]))
-            cv2.putText(
-                display,
-                f"PRIORITY: #1 {top['class_name']} | nearest depth_score={top_depth:.3f}m",
-                (10, 60),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (0, 255, 255),
-                2,
-            )
+        setattr(self, timer_attr, self.create_timer(delay_sec, _wrapped_callback))
 
-        available_ids, available_classes = self._available_object_info(raw_detections)
-        status["available_ids"] = available_ids
-        status["available_classes"] = available_classes
-
-        if not raw_detections:
-            status["status"] = "no_detection" if run_fp else "preview_no_detection"
-            status["message"] = "no object detected"
-            return [], status
-
-        # 2) trigger 대상 선택용 detection list.
-        #    requested_allowed_ids가 있으면 0인 물체는 제외하고,
-        #    1인 물체들 중 depth가 가장 가까운 detection을 선택한다.
-        target_detections = raw_detections
-        if requested_allowed_ids is not None:
-            allowed_ids_set = {int(v) for v in requested_allowed_ids}
-            target_detections = [
-                d for d in raw_detections
-                if d["class_name"] in self.class_to_id
-                and int(self.class_to_id[d["class_name"]]) in allowed_ids_set
-            ]
-        elif requested_class:
-            target_detections = [
-                d for d in raw_detections
-                if d["class_name"] == requested_class
-            ]
-
-        # raw_detections is already sorted by depth, but sort again after filtering.
-        target_detections.sort(key=lambda d: d.get("depth_score", d["depth_med"]))
-        status["detected_count"] = len(target_detections)
-
-        # Priority information for JSON/log debugging.
-        priority_table = self._make_priority_table(target_detections)
-        status["priority_rule"] = "smaller depth_score is closer and higher priority"
-        status["priority_table"] = priority_table
-
-        if run_fp:
-            self._log_priority_table(target_detections, trigger_seq)
-
-        # 3) 우선 전체 YOLO detection을 항상 그림.
-        #    last pose가 붙을 detection은 중복으로 그리지 않고 뒤에서 pose overlay와 함께 강조한다.
-        last_pose_det = self._find_detection_for_last_pose(raw_detections)
-        for rank, det_vis in enumerate(raw_detections, start=1):
-            if (last_pose_det is not None) and (det_vis is last_pose_det) and (not run_fp):
-                continue
-
-            depth_score = float(det_vis.get("depth_score", det_vis["depth_med"]))
-            depth_med = float(det_vis["depth_med"])
-            source_text = (
-                f"#{rank} "
-                f"{'SELECT' if rank == 1 else 'candidate'} | "
-                f"d_score:{depth_score:.3f}m med:{depth_med:.3f}m"
-            )
-            self._draw_detection(display, det_vis, None, source_text)
-
-        # 4) trigger가 없으면 마지막 성공 pose만 현재 detection 위에 유지 표시한다.
-        if not run_fp:
-            if last_pose_det is not None and self.last_object_pose_mat is not None:
-                self._draw_detection(
-                    display,
-                    last_pose_det,
-                    self.last_object_pose_mat,
-                    self.last_object_status_text or "last FP pose",
-                )
-
-            status["status"] = "preview_detected"
-            status["preview_class"] = raw_detections[0]["class_name"]
-            status["preview_depth_m"] = round(float(raw_detections[0].get("depth_score", raw_detections[0]["depth_med"])), 4)
-            status["preview_depth_median_m"] = round(float(raw_detections[0]["depth_med"]), 4)
-            if self.last_object_class_name is not None:
-                status["last_pose_class"] = self.last_object_class_name
-            return [], status
-
-        # 5) trigger가 들어왔는데 요청 class가 현재 안 보이면, 전체 preview는 유지하고 실패 반환.
-        if not target_detections:
-            status["status"] = "no_detection"
-            if requested_allowed_ids is not None:
-                status["message"] = f"no allowed object detected: allowed_ids={requested_allowed_ids}"
-            else:
-                status["message"] = f"requested class not detected: {requested_class}"
-            return [], status
-
-        # 6) FoundationPose는 선택된 1개 target만 수행한다.
-        det = target_detections[0]
-        class_name = det["class_name"]
-
-        # Save per-trigger mask/depth debug artifacts.
-        # Files are overwritten every trigger in ./debug_priority by default.
-        self._save_priority_debug_artifacts(
-            color=color,
-            depth=depth,
-            display=display,
-            detections=target_detections,
-            trigger_seq=trigger_seq,
-            selected_det=det,
-        )
-
-        pose_mat = None
-        refined_frames = 0
-        register_iter = int(self.get_parameter("fp_register_iter").value)
-        track_iter = int(self.get_parameter("fp_track_iter").value)
-        track_loss_thr = float(self.get_parameter("fp_track_loss_thr").value)
-        trigger_track_frames = max(0, int(self.get_parameter("fp_trigger_track_frames").value))
-        trigger_track_use_new_frames = bool(self.get_parameter("fp_trigger_track_use_new_frames").value)
+    def peg_trigger_callback(self, trigger_msg):
+        if self.pending_task is not None:
+            self.get_logger().warn(f"ignore peg trigger: pending_task={self.pending_task}")
+            return
 
         try:
-            est = self._get_fp_estimator(class_name)
-            if est is not None:
-                # Each trigger starts with a fresh register to avoid stale pose.
-                # Then, only inside this trigger request, run a short track_one refinement.
-                # This is useful when robot/camera/object are static during capture.
-                est.reset()
-                pose_mat = est.estimate(
-                    rgb_bgr=color,
-                    depth_uint16=depth,
-                    mask_uint8=det["mask_img"],
-                    K=self.K,
-                    register_iter=register_iter,
-                    track_iter=track_iter,
-                    track_loss_thr=track_loss_thr,
-                    use_tracking=False,
-                    depth_scale=self.depth_scale,
-                )
-
-                for _ in range(trigger_track_frames):
-                    track_color = color
-                    track_depth = depth
-                    if trigger_track_use_new_frames:
-                        next_color, next_depth = self._read_aligned_rgbd()
-                        if next_color is not None and next_depth is not None:
-                            track_color, track_depth = next_color, next_depth
-
-                    pose_mat = est.estimate(
-                        rgb_bgr=track_color,
-                        depth_uint16=track_depth,
-                        mask_uint8=det["mask_img"],
-                        K=self.K,
-                        register_iter=register_iter,
-                        track_iter=track_iter,
-                        track_loss_thr=track_loss_thr,
-                        use_tracking=True,
-                        depth_scale=self.depth_scale,
-                    )
-                    refined_frames += 1
-
-                est.reset()
+            allowed_object_ids, _ = self.parse_peg_trigger_data(trigger_msg)
+            for object_idx in allowed_object_ids:
+                self.class_name_from_id(object_idx)
         except Exception as e:
-            self.get_logger().warn(f"[FP] triggered pose failed: {class_name}: {e}")
-            traceback.print_exc()
-            if class_name in self._fp_estimators:
-                self._fp_estimators[class_name].reset()
-        if pose_mat is None:
-            self._draw_detection(display, det, None, "FP failed")
-            status["status"] = "fp_failed"
-            status["message"] = f"FoundationPose failed for {class_name}"
-            status["selected_class"] = class_name
-            return [], status
+            self.get_logger().warn(f"invalid peg trigger: {e}")
+            return
 
-        extra = {
-            "pose_source": "foundationpose_register_short_track",
-            "trigger_seq": int(trigger_seq),
-            "register_iter": int(register_iter),
-            "track_iter": int(track_iter),
-            "track_refine_frames": int(refined_frames),
-            "priority": {
-                "selected": True,
-                "reason": (
-                    "allowed_ids_nearest_depth"
-                    if requested_allowed_ids is not None
-                    else ("nearest_depth" if requested_class is None else "requested_class_nearest_depth")
-                ),
-                "allowed_ids": requested_allowed_ids,
-                "depth_median_m": round(float(det["depth_med"]), 4),
-                "depth_score_m": round(float(det.get("depth_score", det["depth_med"])), 4),
-                "detected_count": len(target_detections),
-                "detected_count_raw": int(status["detected_count_raw"]),
-            },
-        }
-        obj = pose_to_dict(pose_mat, class_name, det["confidence"], extra)
+        self.pending_trigger_msg = trigger_msg
+        self.pending_object_idx = allowed_object_ids
+        self.pending_task = "peg_settling"
 
-        ps = make_pose_stamped(pose_mat, self.frame_id)
-        ps.header.stamp = self.get_clock().now().to_msg()
-        self.object_pose_pub.publish(ps)
+        self.publish_detect_mode("object")
 
-        # 7) 새 trigger 결과로 last pose를 즉시 교체한다.
-        self.last_object_pose_mat = pose_mat.copy()
-        self.last_object_class_name = class_name
-        self.last_object_status_text = f"last FP pose seq={trigger_seq}"
-
-        # 8) trigger 대상은 pose axis + 3D CAD bbox로 다시 강조해서 그림.
-        self._draw_detection(display, det, pose_mat, f"TRIGGERED reg+track({refined_frames})")
-
-        selected_rank = target_detections.index(det) + 1
-
-        status["status"] = "success"
-        status["selected_class"] = class_name
-        status["selected_id"] = int(self.class_to_id[class_name])
-        status["selected_rank"] = int(selected_rank)
-        status["selected_depth_m"] = round(float(det.get("depth_score", det["depth_med"])), 4)
-        status["selected_depth_median_m"] = round(float(det["depth_med"]), 4)
+        delay_sec = float(self.get_parameter("detect_mode_settle_sec").value)
         self.get_logger().info(
-            f"[OBJECT_6D_SELECTED] seq={trigger_seq} "
-            f"rank=#{selected_rank} "
-            f"class={class_name} id={self.class_to_id[class_name]} "
-            f"reason=nearest_depth_score "
-            f"depth_score={det.get('depth_score', det['depth_med']):.4f}m "
-            f"depth_med={det['depth_med']:.4f}m "
-            f"conf={det['confidence']:.3f} "
-            f"register_iter={register_iter} "
-            f"track_iter={track_iter} "
-            f"refined_frames={refined_frames}"
+            f"peg trigger accepted: allowed_ids={allowed_object_ids}, "
+            f"switch detect_mode=object, wait {delay_sec:.3f}s, "
+            f"then send object 6D trigger"
         )
-        return [obj], status
+        self.schedule_once(
+            delay_sec,
+            "object_trigger_delay_timer",
+            lambda: self.finish_peg_settle_and_trigger_object(allowed_object_ids),
+        )
 
-    def _estimate_yaw_from_template(self, mask_img: np.ndarray, class_name: str):
-        if class_name in self.no_yaw_classes:
-            return 0.0, 1.0, "circle_no_yaw"
-        if class_name not in self.rotated_templates:
-            return 0.0, 0.0, "template_missing"
-        crop = crop_mask_to_square(mask_img)
-        if crop is None:
-            return 0.0, 0.0, "mask_invalid"
-        query = normalize_binary(crop, self.match_size)
-        best_angle, best_score = 0.0, -1.0
-        for angle, tmpl in self.rotated_templates[class_name]:
-            score = iou_score(query, tmpl)
-            if score > best_score:
-                best_angle, best_score = angle, score
-        return float(best_angle), float(best_score), "template_iou"
+    def finish_peg_settle_and_trigger_object(self, allowed_object_ids: List[int]):
+        if self.pending_task != "peg_settling":
+            self.get_logger().warn(
+                f"skip delayed object 6D trigger: pending_task={self.pending_task}"
+            )
+            return
 
-    def _process_insert_mode(self, color, depth, display) -> List[Dict]:
-        cv2.putText(display, "MODE: insert | PCA+template", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
-        detections = self._collect_detections(self.insert_model, color, depth)
-        objects = []
-        for det in detections:
-            points = get_point_cloud(depth, det["mask_img"], self.intrinsics, self.depth_scale)
-            if points is None:
-                continue
-            pose_mat = estimate_pca_pose(points)
-            yaw_deg, yaw_score, yaw_source = self._estimate_yaw_from_template(det["mask_img"], det["class_name"])
-            obj = pca_pose_to_dict(pose_mat, det["class_name"], det["confidence"], yaw_deg, yaw_score, yaw_source)
-            obj["pose_source"] = "depth_pca_template"
-            obj["depth_median_m"] = round(float(det["depth_med"]), 4)
-            obj["depth_score_m"] = round(float(det.get("depth_score", det["depth_med"])), 4)
-            objects.append(obj)
-            ps = make_pose_stamped(pose_mat, self.frame_id)
-            ps.header.stamp = self.get_clock().now().to_msg()
-            self.insert_pose_pub.publish(ps)
-            self._draw_insert_detection(display, det, pose_mat, yaw_deg, yaw_score)
-        return objects
+        self.pending_task = "peg_wait_object"
+        self.publish_object_6d_trigger(allowed_object_ids)
 
-    def _draw_detection(self, display, det, pose_mat, source_text):
-        cls = det["class_name"]
-        color_val = self.class_colors.get(cls, (255, 255, 255))
-        overlay = display.copy()
-        if det["mask_xy"] is not None and len(det["mask_xy"]) > 0:
-            cv2.fillPoly(overlay, [det["mask_xy"].astype(np.int32)], color_val)
-        display[:] = cv2.addWeighted(display, 0.6, overlay, 0.4, 0)
-        x1, y1, x2, y2 = det["bbox"]
-        cv2.rectangle(display, (x1, y1), (x2, y2), color_val, 3)
-        label = f"TARGET {cls} {det['confidence']:.2f} | {source_text}"
-        if pose_mat is not None:
-            vis_info = self._mesh_vis_info.get(cls)
-            if vis_info is not None:
-                center_pose = np.asarray(pose_mat, dtype=np.float64).reshape(4, 4) @ np.linalg.inv(vis_info["to_origin"])
-                draw_projected_3d_bbox(
-                    display,
-                    center_pose,
-                    self.K,
-                    vis_info["bbox"],
-                    color=(255, 255, 255),
-                    thickness=2,
-                )
+    def hole_trigger_callback(self, trigger_msg):
+        if self.pending_task is not None:
+            self.get_logger().warn(f"ignore hole trigger: pending_task={self.pending_task}")
+            return
 
-            draw_pose_axis(display, pose_mat, self.K, axis_len=0.10)
-            t = pose_mat[:3, 3]
-            label += f" | X:{t[0]:+.3f} Y:{t[1]:+.3f} Z:{t[2]:.3f}m"
-        cv2.putText(display, label, (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color_val, 2)
+        self.pending_trigger_msg = trigger_msg
+        self.pending_task = "hole_settling"
 
-    def _draw_insert_detection(self, display, det, pose_mat, yaw_deg, yaw_score):
-        cls = det["class_name"]
-        color_val = self.class_colors.get(cls, (255, 255, 255))
-        overlay = display.copy()
-        if det["mask_xy"] is not None and len(det["mask_xy"]) > 0:
-            cv2.fillPoly(overlay, [det["mask_xy"].astype(np.int32)], color_val)
-        display[:] = cv2.addWeighted(display, 0.6, overlay, 0.4, 0)
-        x1, y1, x2, y2 = det["bbox"]
-        cv2.rectangle(display, (x1, y1), (x2, y2), color_val, 2)
-        t = pose_mat[:3, 3]
-        if t[2] > 0:
-            cx = int(t[0] * self.intrinsics.fx / t[2] + self.intrinsics.ppx)
-            cy = int(t[1] * self.intrinsics.fy / t[2] + self.intrinsics.ppy)
-            cv2.circle(display, (cx, cy), 5, (0, 0, 255), -1)
-            if cls not in self.no_yaw_classes:
-                length = 45
-                yaw_rad = np.radians(yaw_deg)
-                ex = int(cx + length * np.cos(yaw_rad))
-                ey = int(cy - length * np.sin(yaw_rad))
-                cv2.arrowedLine(display, (cx, cy), (ex, ey), (0, 0, 255), 2, tipLength=0.25)
-        label = f"{cls} {det['confidence']:.2f} | X:{t[0]:+.2f} Y:{t[1]:+.2f} Z:{t[2]:.2f}m | yaw:{yaw_deg:.1f} score:{yaw_score:.2f}"
-        cv2.putText(display, label, (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color_val, 2)
+        self.publish_detect_mode("insert")
 
-    def _publish_json(self, pub, mode: str, objects: List[Dict], extra: Optional[Dict] = None):
-        msg = String()
-        data = {
-            "mode": mode,
-            "target": objects[0] if objects else None,
-            "objects": objects,
-            "detected_count": len(objects),
-        }
-        if extra:
-            data.update(extra)
-        msg.data = json.dumps(data, ensure_ascii=False)
-        pub.publish(msg)
+        delay_sec = float(self.get_parameter("detect_mode_settle_sec").value)
+        self.get_logger().info(
+            f"hole trigger accepted: switch detect_mode=insert, "
+            f"wait {delay_sec:.3f}s, then accept next insert result"
+        )
+        self.schedule_once(
+            delay_sec,
+            "insert_settle_timer",
+            self.finish_hole_settle_and_wait_insert,
+        )
 
-    def destroy_node(self):
+    def finish_hole_settle_and_wait_insert(self):
+        if self.pending_task != "hole_settling":
+            self.get_logger().warn(
+                f"skip insert wait after settling: pending_task={self.pending_task}"
+            )
+            return
+
+        self.pending_task = "hole_wait_insert"
+        self.get_logger().info("hole trigger: now accepting next /insert_poses message")
+
+    def collect_peg_object_frame(self):
+        allowed_object_ids, base_T_ee = self.parse_peg_trigger_data(self.pending_trigger_msg)
+        if self.pending_object_idx is not None:
+            allowed_object_ids = [int(v) for v in self.pending_object_idx]
+
+        targets = self.make_pose6_targets_from_objects(
+            self.latest_objects,
+            base_T_ee,
+            allowed_object_ids=allowed_object_ids,
+        )
+
+        self.get_logger().info(
+            f"[PEG-OBJECT] allowed_ids={allowed_object_ids}, "
+            f"targets={len(targets)}, "
+            f"visible_ids={self.latest_object_available_ids}, "
+            f"perception_status={self.latest_object_status}"
+        )
+
+        if not targets:
+            self.publish_object_visible_ids_response(
+                publisher=self.peg_pub,
+                topic_name=self.peg_output_topic,
+                visible_ids=self.latest_object_available_ids,
+                requested_id=None,
+                label="PEG-OBJECT",
+            )
+            return
+
+        # Vision normally returns one nearest allowed object.
+        # If multiple objects are received for backward compatibility, choose nearest depth first,
+        # then higher confidence as a tie-breaker.
+        target = min(
+            targets,
+            key=lambda t: (
+                float(t.get("source_depth_m", float("inf"))),
+                -float(t.get("confidence", 0.0)),
+            ),
+        )
+
+        self.publish_object_target_once(
+            publisher=self.peg_pub,
+            topic_name=self.peg_output_topic,
+            target=target,
+            label="PEG-OBJECT",
+        )
+
+    def collect_hole_insert_frame(self):
+        base_T_ee = pose6_mm_deg_to_T_mm(self.pending_trigger_msg.data)
+        validate_T(base_T_ee, name="base_T_ee")
+
+        # Legacy insert/hole behavior without multi-frame collection
+        # and without distance-based duplicate suppression.
+        # Publish all valid targets from the current /insert_poses message
+        # in [x_mm, y_mm, yaw_deg, id] chunks.
+        targets = self.make_legacy_targets_from_inserts(self.latest_inserts, base_T_ee)
+
+        self.get_logger().info(
+            f"[HOLE-INSERT] current_frame_targets={len(targets)}"
+        )
+
+        if not targets:
+            self.get_logger().warn("[HOLE-INSERT] no valid target")
+            self.reset_pending()
+            return
+
+        self.publish_insert_targets_once(
+            publisher=self.hole_pub,
+            topic_name=self.hole_output_topic,
+            targets=targets,
+            label="HOLE-INSERT",
+        )
+
+    # ============================================================
+    # Visualization - final moveL pose6 target
+    # ============================================================
+
+    @staticmethod
+    def set_axes_equal_3d(ax):
+        """
+        Make 3D axis scales equal so pose directions are not visually distorted.
+        """
+        x_limits = ax.get_xlim3d()
+        y_limits = ax.get_ylim3d()
+        z_limits = ax.get_zlim3d()
+
+        x_range = abs(x_limits[1] - x_limits[0])
+        y_range = abs(y_limits[1] - y_limits[0])
+        z_range = abs(z_limits[1] - z_limits[0])
+
+        x_middle = np.mean(x_limits)
+        y_middle = np.mean(y_limits)
+        z_middle = np.mean(z_limits)
+
+        plot_radius = 0.5 * max([x_range, y_range, z_range, 1.0])
+
+        ax.set_xlim3d([x_middle - plot_radius, x_middle + plot_radius])
+        ax.set_ylim3d([y_middle - plot_radius, y_middle + plot_radius])
+        ax.set_zlim3d([z_middle - plot_radius, z_middle + plot_radius])
+
+    @staticmethod
+    def draw_frame_3d(ax, T: np.ndarray, name: str, axis_len: float, alpha: float = 1.0):
+        """
+        Draw a coordinate frame in base/world coordinates.
+        Columns of R are the frame X/Y/Z axes expressed in base/world.
+        """
+        T = np.asarray(T, dtype=np.float64).reshape(4, 4)
+        p = T[:3, 3]
+        R = orthonormalize_R(T[:3, :3])
+
+        # X/Y/Z axis colors are conventional for debug visualization.
+        colors = ["r", "g", "b"]
+        labels = [f"{name} +X", f"{name} +Y", f"{name} +Z"]
+
+        for i in range(3):
+            v = R[:, i] * float(axis_len)
+            ax.quiver(
+                p[0], p[1], p[2],
+                v[0], v[1], v[2],
+                color=colors[i], alpha=alpha,
+                arrow_length_ratio=0.18,
+                linewidth=1.6,
+            )
+
+        ax.text(p[0], p[1], p[2], f" {name}")
+
+    def visualize_pose6_target_once(self, target: Dict[str, Any]):
+        """
+        Show one 3D preview for the final moveL pose6 target.
+
+        Important convention from the old hand-eye sampler:
+            TCP/local -Y is the look/approach direction.
+
+        Therefore this preview draws:
+            - TCP frame axes
+            - a thick magenta arrow along TCP -Y: where the TCP target is looking
+            - a dashed pregrasp segment from +TCP_Y toward the target
+        """
+        if not bool(self.get_parameter("visualize_pose6_target").value):
+            return
+
         try:
-            self.pipeline.stop()
-        except Exception:
-            pass
-        if self.enable_visualization:
-            cv2.destroyAllWindows()
-        super().destroy_node()
+            import matplotlib.pyplot as plt
+        except Exception as e:
+            self.get_logger().warn(f"visualize_pose6_target disabled: matplotlib import failed: {e}")
+            return
+
+        try:
+            axis_len = float(self.get_parameter("visualize_axes_length_mm").value)
+            approach_len = float(self.get_parameter("visualize_approach_length_mm").value)
+            blocking = bool(self.get_parameter("visualize_blocking").value)
+            save_dir = str(self.get_parameter("visualize_save_dir").value).strip()
+
+            T_tcp = np.asarray(target["target_T"], dtype=np.float64).reshape(4, 4)
+            pose6 = np.asarray(target["target_pose6"], dtype=np.float64).reshape(6)
+            T_center = np.asarray(target.get("base_T_centered_object_safe", T_tcp), dtype=np.float64).reshape(4, 4)
+            T_raw = np.asarray(target.get("base_T_obj_raw", T_center), dtype=np.float64).reshape(4, 4)
+
+            validate_T(T_tcp, name="viz T_tcp")
+            validate_T(T_center, name="viz T_center")
+            validate_T(T_raw, name="viz T_raw")
+
+            p_tcp = T_tcp[:3, 3]
+            p_center = T_center[:3, 3]
+            p_raw = T_raw[:3, 3]
+            R_tcp = orthonormalize_R(T_tcp[:3, :3])
+
+            # Same convention as old hand-eye code:
+            #     camera/tool forward = local -Y
+            tcp_look_dir = -R_tcp[:, 1]
+            tcp_plus_y = R_tcp[:, 1]
+            p_pre = p_tcp + tcp_plus_y * approach_len
+
+            plt.ion()
+            if self._viz_fig is None or self._viz_ax is None:
+                self._viz_fig = plt.figure("moveL pose6 target preview")
+                self._viz_ax = self._viz_fig.add_subplot(111, projection="3d")
+            else:
+                self._viz_ax.clear()
+
+            ax = self._viz_ax
+            ax.set_title(
+                f"moveL pose6 target | class={target.get('class')} id={target.get('id')}\n"
+                f"TCP -Y is look/approach direction | pose6={np.round(pose6, 2).tolist()}"
+            )
+            ax.set_xlabel("Base X [mm]")
+            ax.set_ylabel("Base Y [mm]")
+            ax.set_zlabel("Base Z [mm]")
+
+            # World/base frame near the target area for orientation reference.
+            T_base_ref = np.eye(4, dtype=np.float64)
+            T_base_ref[:3, 3] = p_center
+            self.draw_frame_3d(ax, T_base_ref, "base ref", axis_len * 0.8, alpha=0.35)
+
+            self.draw_frame_3d(ax, T_raw, "raw obj", axis_len * 0.75, alpha=0.35)
+            self.draw_frame_3d(ax, T_center, "center obj", axis_len, alpha=0.75)
+            self.draw_frame_3d(ax, T_tcp, "TCP goal", axis_len * 1.2, alpha=1.0)
+
+            # Points and relation lines.
+            ax.scatter([p_raw[0]], [p_raw[1]], [p_raw[2]], marker="o", s=35, label="raw object origin")
+            ax.scatter([p_center[0]], [p_center[1]], [p_center[2]], marker="^", s=55, label="centered object origin")
+            ax.scatter([p_tcp[0]], [p_tcp[1]], [p_tcp[2]], marker="*", s=120, label="TCP goal origin")
+
+            ax.plot(
+                [p_center[0], p_tcp[0]],
+                [p_center[1], p_tcp[1]],
+                [p_center[2], p_tcp[2]],
+                linestyle="--", linewidth=1.2, label="center -> TCP offset"
+            )
+
+            # TCP look/approach direction: local -Y.
+            v = tcp_look_dir * approach_len
+            ax.quiver(
+                p_tcp[0], p_tcp[1], p_tcp[2],
+                v[0], v[1], v[2],
+                color="m", linewidth=3.0,
+                arrow_length_ratio=0.20,
+            )
+            ax.text(
+                p_tcp[0] + v[0], p_tcp[1] + v[1], p_tcp[2] + v[2],
+                " TCP look/approach (-Y)",
+                color="m",
+            )
+
+            # Pregrasp position if controller approaches along -TCP_Y.
+            ax.scatter([p_pre[0]], [p_pre[1]], [p_pre[2]], marker="x", s=80, label="pregrasp = TCP +Y")
+            ax.plot(
+                [p_pre[0], p_tcp[0]],
+                [p_pre[1], p_tcp[1]],
+                [p_pre[2], p_tcp[2]],
+                linestyle=":", linewidth=2.0, label="pregrasp move direction"
+            )
+
+            # Make bounds around all relevant points.
+            pts = np.vstack([
+                p_raw.reshape(1, 3),
+                p_center.reshape(1, 3),
+                p_tcp.reshape(1, 3),
+                p_pre.reshape(1, 3),
+                (p_tcp + tcp_look_dir * approach_len).reshape(1, 3),
+            ])
+            margin = max(axis_len, approach_len) * 1.4
+            mins = pts.min(axis=0) - margin
+            maxs = pts.max(axis=0) + margin
+            ax.set_xlim(mins[0], maxs[0])
+            ax.set_ylim(mins[1], maxs[1])
+            ax.set_zlim(mins[2], maxs[2])
+            self.set_axes_equal_3d(ax)
+            ax.legend(loc="upper left", fontsize=8)
+
+            self._viz_fig.tight_layout()
+
+            if save_dir:
+                out_dir = Path(save_dir)
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_path = out_dir / f"pose6_target_{target.get('class')}_{target.get('id')}.png"
+                self._viz_fig.savefig(str(out_path), dpi=150)
+                self.get_logger().info(f"saved pose6 target preview: {out_path}")
+
+            plt.show(block=blocking)
+            plt.pause(0.001)
+
+        except Exception as e:
+            self.get_logger().warn(f"failed to visualize pose6 target: {e}")
+
+    def publish_object_visible_ids_response(
+        self,
+        publisher,
+        topic_name: str,
+        visible_ids: List[int],
+        requested_id: Optional[int],
+        label: str,
+    ):
+        msg = Float64MultiArray()
+        msg.data = self.object_visible_ids_to_msg_data(visible_ids)
+
+        self.get_logger().warn(
+            f"[PUBLISH] topic={topic_name} type={label} format=visible_ids_fallback "
+            f"requested_id={requested_id} visible_ids={msg.data} data_len={len(msg.data)} "
+            f"rule='len(data)!=7 means requested pose unavailable'"
+        )
+
+        self.publish_repeated(publisher, msg, count=10)
+        self.reset_pending()
+
+    def publish_object_target_once(self, publisher, topic_name: str, target: Dict[str, Any], label: str):
+        # If tilted_grasp marks the output id negative, keep original pose6 and
+        # append selected empty-space world X/Y at the end of the message.
+        target = self.apply_empty_space_override_if_needed(target)
+
+        msg = Float64MultiArray()
+        msg.data = self.object_targets_to_msg_data([target])
+
+        debug_target = {
+            "class": target["class"],
+            "id": target["id"],
+            "raw_id": target.get("raw_id", target["id"]),
+            "tilted_grasp_used": target.get("tilted_grasp_used", False),
+            "tilted_pre_yaw_deg": target.get("tilted_pre_yaw_deg", 0.0),
+            "tilted_grasp_reason": target.get("tilted_grasp_reason", ""),
+            "confidence": round(float(target["confidence"]), 3),
+            "source_depth_m": target.get("source_depth_m", None),
+            "target_frame": target["target_frame"],
+            "selected_grasp": target.get("selected_grasp_name", None),
+            "selected_yaw_deg": target.get("selected_grasp_yaw_deg", None),
+            "estimated_last_joint_deg": target.get("estimated_last_joint_deg", None),
+            "last_joint_delta_deg": target.get("last_joint_delta_deg", None),
+            "target_pose6": np.asarray(target["target_pose6"]).round(3).tolist(),
+            "target_T": np.asarray(target["target_T"]).round(3).tolist(),
+            "empty_space_override_checked": target.get("empty_space_override_checked", False),
+            "empty_space_override_used": target.get("empty_space_override_used", False),
+            "empty_space_override_reason": target.get("empty_space_override_reason", ""),
+            "empty_space_append_checked": target.get("empty_space_append_checked", False),
+            "empty_space_append_used": target.get("empty_space_append_used", False),
+            "empty_space_append_reason": target.get("empty_space_append_reason", ""),
+            "empty_space_world_xy_mm": target.get("empty_space_world_xy_mm", None),
+            "empty_space_selected": target.get("empty_space_selected", None),
+        }
+
+        self.get_logger().info(
+            f"[PUBLISH] topic={topic_name} type={label} format=id_plus_moveL_pose6_7_or_negative_id_pose6_emptyxy_9_success "
+            f"target={debug_target} data_len={len(msg.data)}"
+        )
+
+        self.visualize_pose6_target_once(target)
+
+        self.publish_repeated(publisher, msg, count=10)
+        self.reset_pending()
+
+    def publish_insert_targets_once(self, publisher, topic_name: str, targets: List[Dict[str, Any]], label: str):
+        msg = Float64MultiArray()
+        msg.data = self.insert_targets_to_msg_data(targets)
+
+        debug_targets = []
+        for target in targets:
+            debug_targets.append({
+                "class": target["class"],
+                "id": target["id"],
+                "confidence": round(float(target["confidence"]), 3),
+                "x": round(float(target["x"]), 3),
+                "y": round(float(target["y"]), 3),
+                "yaw": round(float(target["yaw"]), 3),
+            })
+
+        self.get_logger().info(
+            f"[PUBLISH] topic={topic_name} type={label} format=legacy_xyyaw_4xN "
+            f"num_targets={len(targets)} targets={debug_targets} data_len={len(msg.data)}"
+        )
+
+        self.publish_repeated(publisher, msg, count=10)
+        self.reset_pending()
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = MixedPoseVisionNode()
+    node = ObjectPoseTransformNode()
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
