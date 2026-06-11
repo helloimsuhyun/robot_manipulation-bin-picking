@@ -72,12 +72,12 @@ def generate_launch_description():
 
             "default_mode": "object",
             "enable_visualization": "true",
-            "conf_thresh": "0.5",
+            "conf_thresh": "0.60",
 
             "fp_register_iter": "5",
             "fp_track_iter": "2",
             "fp_track_loss_thr": "0.2",
-            "fp_trigger_track_frames": "20",
+            "fp_trigger_track_frames": "10",
             "fp_trigger_track_use_new_frames": "true",
             "fp_debug": "0",
 
@@ -99,7 +99,7 @@ def generate_launch_description():
 
             # 이미지 grid 후보 간격.
             # 작을수록 촘촘하지만 연산량 증가.
-            "empty_grid_step_px": "80",
+            "empty_grid_step_px": "40",
 
             # vision node가 object JSON에 포함할 최대 후보 개수.
             "empty_max_candidates": "30",
@@ -116,7 +116,7 @@ def generate_launch_description():
             # YOLO object mask 주변 제외 영역.
             # 물체 가까운 후보가 많이 잡히면 30~40으로 증가.
             # 후보가 너무 적으면 10~18로 감소.
-            "empty_mask_dilate_px": "15",
+            "empty_mask_dilate_px": "22",
 
             # 후보 주변 depth patch 검사.
             "empty_depth_patch_radius_px": "6",
@@ -124,7 +124,7 @@ def generate_launch_description():
             "empty_depth_spread_max_m": "0.030",
 
             # OpenCV 시각화 유지 시간.
-            "empty_space_vis_hold_sec": "4.0",
+            "empty_space_vis_hold_sec": "2.0",
 
             # priority debug 저장.
             "priority_debug_save": "true",
@@ -198,7 +198,7 @@ def generate_launch_description():
             # 최종 world filtering safety margin.
             # 최종 reject_radius = 42.4 + safety_margin
             # 기본 10mm면 약 52.4mm 이내 후보 제거.
-            "empty_space_safety_margin_mm": 30.0,
+            "empty_space_safety_margin_mm": 35.0,
 
             # ROI 가장자리 reject.
             # 0이면 hard reject 거의 없음.
@@ -207,8 +207,8 @@ def generate_launch_description():
 
             # weighted score 가중치.
             # 물체와 멀수록 좋음 + 원래 pose6 위치와 가까울수록 좋음을 동시에 고려.
-            "empty_space_w_clearance": 2.2,
-            "empty_space_w_pose6_proximity": 1.5,
+            "empty_space_w_clearance": 2.0,
+            "empty_space_w_pose6_proximity": 2.0,
             "empty_space_w_roi_edge": 1.0,
             "empty_space_w_vision_score": 0.5,
 
@@ -263,16 +263,6 @@ def generate_launch_description():
             "place_down_target_z_mm": 81.0,
             "place_up_target_z_mm": 110.0,
 
-            # -1/-2 safe grasp 후 임시 빈 공간에 평평하게 내려놓는 pose
-            # x/y는 /vision/peg_targets len=9의 empty_x/empty_y를 사용
-            "regrasp_temp_place_z_mm": 90.0,
-            "regrasp_temp_approach_z_offset_mm": 50.0,
-            "regrasp_temp_lift_z_offset_mm": 50.0,
-            "regrasp_temp_flat_rx_deg": 90.0,
-            "regrasp_temp_flat_ry_deg": 0.0,
-            "regrasp_temp_flat_rz_deg": 135.0,
-            "regrasp_max_attempts": 110,
-
             "move_j_speed": 90.0,
             "move_j_acc": 90.0,
             "move_l_speed": 60.0,
@@ -289,7 +279,7 @@ def generate_launch_description():
 
             "camera_settle_sec": 0.5,
             "use_6d_peg_interface": True,
-            "vision_wait_timeout_sec": 9.0,
+            "vision_wait_timeout_sec": 3.0,
             "grasp_wait_sec": 1.0,
             "release_wait_sec": 1.0,
             "move_start_timeout_sec": 3.0,
