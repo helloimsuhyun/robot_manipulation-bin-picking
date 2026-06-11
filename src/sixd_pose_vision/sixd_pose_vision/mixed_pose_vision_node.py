@@ -121,6 +121,113 @@ def depth_front_median_score_in_mask(
     return float(np.median(z_front))
 
 
+def deproject_pixel_to_camera(
+    u: float,
+    v: float,
+    z_m: float,
+    intrinsics,
+) -> Optional[np.ndarray]:
+    """Deproject one image pixel and depth into camera coordinates.
+
+    Returns [x, y, z] in meters in the camera optical frame.
+    """
+    z_m = float(z_m)
+    if not np.isfinite(z_m) or z_m <= 0.0:
+        return None
+
+    x = (float(u) - float(intrinsics.ppx)) * z_m / float(intrinsics.fx)
+    y = (float(v) - float(intrinsics.ppy)) * z_m / float(intrinsics.fy)
+    return np.array([x, y, z_m], dtype=np.float64)
+
+
+def patch_depth_stats_at_pixel(
+    depth_image: np.ndarray,
+    u: int,
+    v: int,
+    depth_scale: float,
+    radius_px: int = 5,
+) -> Dict:
+    """Robust depth stats around an image-plane proposal point.
+
+    Used for empty-space candidates. Depth values are in meters.
+    """
+    h, w = depth_image.shape[:2]
+    r = max(1, int(radius_px))
+    x0, x1 = max(0, int(u) - r), min(w, int(u) + r + 1)
+    y0, y1 = max(0, int(v) - r), min(h, int(v) + r + 1)
+
+    patch = depth_image[y0:y1, x0:x1].astype(np.float32) * float(depth_scale)
+    total_px = int(patch.size)
+    valid = patch[patch > 0]
+
+    if total_px <= 0 or len(valid) == 0:
+        return {
+            "valid": False,
+            "median_m": None,
+            "valid_ratio": 0.0,
+            "spread_p90_p10_m": None,
+            "valid_px": 0,
+            "total_px": total_px,
+        }
+
+    p10 = float(np.percentile(valid, 10))
+    p50 = float(np.percentile(valid, 50))
+    p90 = float(np.percentile(valid, 90))
+
+    return {
+        "valid": True,
+        "median_m": p50,
+        "valid_ratio": float(len(valid) / max(total_px, 1)),
+        "spread_p90_p10_m": float(p90 - p10),
+        "valid_px": int(len(valid)),
+        "total_px": total_px,
+    }
+
+
+def estimate_mask_translation_camera(
+    depth_image: np.ndarray,
+    mask_img: np.ndarray,
+    intrinsics,
+    depth_scale: float,
+    z_reject_m: float = 0.05,
+) -> Optional[np.ndarray]:
+    """Estimate only translation [x,y,z] of a detected object in camera frame.
+
+    This is not a 6D pose. It is a robust median of masked RGB-D points, useful
+    for downstream empty-space/world collision filtering before FoundationPose.
+    """
+    if mask_img is None:
+        return None
+
+    rows, cols = np.where(mask_img > 0)
+    if len(rows) < 10:
+        return None
+
+    z = depth_image[rows, cols].astype(np.float32) * float(depth_scale)
+    valid = z > 0
+    rows = rows[valid]
+    cols = cols[valid]
+    z = z[valid]
+
+    if len(z) < 10:
+        return None
+
+    z_med = float(np.median(z))
+    keep = np.abs(z - z_med) < float(z_reject_m)
+    rows = rows[keep]
+    cols = cols[keep]
+    z = z[keep]
+
+    if len(z) < 10:
+        return None
+
+    x = (cols.astype(np.float32) - float(intrinsics.ppx)) * z / float(intrinsics.fx)
+    y = (rows.astype(np.float32) - float(intrinsics.ppy)) * z / float(intrinsics.fy)
+    pts = np.stack([x, y, z], axis=1)
+
+    return np.median(pts, axis=0).astype(np.float64)
+
+
 def pose_to_dict(pose_mat: np.ndarray, class_name: str, confidence: float, extra: Optional[Dict] = None) -> Dict:
     pose_mat = np.asarray(pose_mat, dtype=np.float64).reshape(4, 4)
     R = orthonormalize_R(pose_mat[:3, :3])
@@ -573,6 +680,23 @@ class MixedPoseVisionNode(Node):
         self.declare_parameter("insert_pose_topic", "/insert_pose_stamped")
         self.declare_parameter("detect_mode_topic", "/detect_mode")
         self.declare_parameter("object_trigger_topic", "/manipulation/object_6d_trigger")
+        self.declare_parameter("empty_space_topic", "/empty_space_candidates")
+
+        # Empty-space proposal parameters
+        self.declare_parameter("empty_space_enable", True)
+        self.declare_parameter("empty_grid_step_px", 40)
+        self.declare_parameter("empty_max_candidates", 30)
+        self.declare_parameter("empty_roi_x_min", 70)
+        self.declare_parameter("empty_roi_y_min", 60)
+        self.declare_parameter("empty_roi_x_max", -1)  # -1 means image_width - margin
+        self.declare_parameter("empty_roi_y_max", -1)  # -1 means image_height - margin
+        self.declare_parameter("empty_roi_right_margin", 70)
+        self.declare_parameter("empty_roi_bottom_margin", 50)
+        self.declare_parameter("empty_mask_dilate_px", 22)
+        self.declare_parameter("empty_depth_patch_radius_px", 6)
+        self.declare_parameter("empty_depth_valid_ratio_min", 0.50)
+        self.declare_parameter("empty_depth_spread_max_m", 0.030)
+        self.declare_parameter("empty_space_vis_hold_sec", 3.0)
 
         # Runtime parameters
         self.declare_parameter("default_mode", "object")
@@ -666,9 +790,14 @@ class MixedPoseVisionNode(Node):
         self.last_object_class_name = None
         self.last_object_status_text = ""
 
+        # Last empty-space candidates for visualization hold after a trigger.
+        self.last_empty_space_debug = None
+        self.last_empty_space_debug_stamp_sec = None
+
         # Publishers/subscribers
         self.object_pub = self.create_publisher(String, str(self.get_parameter("object_topic").value), 10)
         self.insert_pub = self.create_publisher(String, str(self.get_parameter("insert_topic").value), 10)
+        self.empty_space_pub = self.create_publisher(String, str(self.get_parameter("empty_space_topic").value), 10)
         self.object_pose_pub = self.create_publisher(PoseStamped, str(self.get_parameter("object_pose_topic").value), 10)
         self.insert_pose_pub = self.create_publisher(PoseStamped, str(self.get_parameter("insert_pose_topic").value), 10)
         self.create_subscription(String, str(self.get_parameter("detect_mode_topic").value), self._mode_callback, 10)
@@ -939,6 +1068,7 @@ class MixedPoseVisionNode(Node):
             self._publish_json(self.insert_pub, "insert", objects)
 
         if self.enable_visualization:
+            self._draw_last_empty_space_debug(display)
             cv2.imshow("6D Pose Vision | object=FP, insert=PCA+template", display)
             cv2.waitKey(1)
 
@@ -1292,6 +1422,446 @@ class MixedPoseVisionNode(Node):
         candidates.sort(key=lambda d: d.get("depth_score", d["depth_med"]))
         return candidates[0]
 
+    def _get_empty_space_roi_mask(self, image_shape: Tuple[int, int, int]) -> Tuple[np.ndarray, Dict]:
+        """Build fixed rectangular ROI mask for empty-space proposals."""
+        h, w = image_shape[:2]
+
+        x_min = int(self.get_parameter("empty_roi_x_min").value)
+        y_min = int(self.get_parameter("empty_roi_y_min").value)
+        x_max_param = int(self.get_parameter("empty_roi_x_max").value)
+        y_max_param = int(self.get_parameter("empty_roi_y_max").value)
+        right_margin = int(self.get_parameter("empty_roi_right_margin").value)
+        bottom_margin = int(self.get_parameter("empty_roi_bottom_margin").value)
+
+        x_max = x_max_param if x_max_param >= 0 else (w - right_margin)
+        y_max = y_max_param if y_max_param >= 0 else (h - bottom_margin)
+
+        x_min = int(np.clip(x_min, 0, w - 1))
+        y_min = int(np.clip(y_min, 0, h - 1))
+        x_max = int(np.clip(x_max, x_min + 1, w))
+        y_max = int(np.clip(y_max, y_min + 1, h))
+
+        roi = np.zeros((h, w), dtype=np.uint8)
+        roi[y_min:y_max, x_min:x_max] = 255
+
+        meta = {
+            "type": "rect",
+            "x_min": x_min,
+            "y_min": y_min,
+            "x_max": x_max,
+            "y_max": y_max,
+        }
+        return roi, meta
+
+    def _build_occupied_mask_from_detections(
+        self,
+        detections: List[Dict],
+        image_shape: Tuple[int, int, int],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Union object masks and make a dilated near-object exclusion mask."""
+        h, w = image_shape[:2]
+        occupied = np.zeros((h, w), dtype=np.uint8)
+
+        for det in detections:
+            mask_img = det.get("mask_img")
+            if mask_img is None:
+                continue
+            occupied[mask_img > 0] = 255
+
+        dilate_px = max(0, int(self.get_parameter("empty_mask_dilate_px").value))
+        if dilate_px > 0:
+            k = 2 * dilate_px + 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+            occupied_near = cv2.dilate(occupied, kernel, iterations=1)
+        else:
+            occupied_near = occupied.copy()
+
+        return occupied, occupied_near
+
+    def _make_object_translation_table(
+        self,
+        detections: List[Dict],
+        depth: np.ndarray,
+    ) -> List[Dict]:
+        """Return detected object translations only: class/id/conf + camera xyz."""
+        objects = []
+
+        for rank, det in enumerate(detections, start=1):
+            cls = str(det.get("class_name", "unknown"))
+            obj_id = int(self.class_to_id.get(cls, -1))
+            t_cam = estimate_mask_translation_camera(
+                depth,
+                det.get("mask_img"),
+                self.intrinsics,
+                self.depth_scale,
+            )
+
+            x1, y1, x2, y2 = [int(v) for v in det.get("bbox", [0, 0, 0, 0])]
+            row = {
+                "rank": int(rank),
+                "class_name": cls,
+                "class_id": obj_id,
+                "confidence": round(float(det.get("confidence", 0.0)), 3),
+                "bbox": [x1, y1, x2, y2],
+                "depth_score_m": round(float(det.get("depth_score", float("inf"))), 4),
+                "depth_median_m": round(float(det.get("depth_med", float("inf"))), 4),
+                "camera_translation_valid": bool(t_cam is not None),
+                "camera_translation": None,
+            }
+
+            if t_cam is not None:
+                row["camera_translation"] = {
+                    "x": round(float(t_cam[0]), 4),
+                    "y": round(float(t_cam[1]), 4),
+                    "z": round(float(t_cam[2]), 4),
+                }
+
+            objects.append(row)
+
+        return objects
+
+    def _generate_empty_space_candidates(
+        self,
+        color: np.ndarray,
+        depth: np.ndarray,
+        detections: List[Dict],
+        trigger_seq: int,
+    ) -> Dict:
+        """Generate image-grid empty-space candidates.
+
+        Stage handled here:
+          1) fixed image-grid proposals
+          2) fixed ROI filtering
+          3) object mask overlap / near-object filtering
+          4) camera-coordinate candidate point from local depth patch
+          5) detected object translations in camera frame
+
+        World-frame object-size filtering is intentionally left to the calib node.
+        """
+        h, w = color.shape[:2]
+        step_px = max(5, int(self.get_parameter("empty_grid_step_px").value))
+        max_candidates = max(1, int(self.get_parameter("empty_max_candidates").value))
+        patch_radius = max(1, int(self.get_parameter("empty_depth_patch_radius_px").value))
+        valid_ratio_min = float(self.get_parameter("empty_depth_valid_ratio_min").value)
+        spread_max_m = float(self.get_parameter("empty_depth_spread_max_m").value)
+
+        roi_mask, roi_meta = self._get_empty_space_roi_mask(color.shape)
+        occupied_mask, occupied_near_mask = self._build_occupied_mask_from_detections(detections, color.shape)
+
+        # Distance to the nearest excluded object-mask region.
+        free_for_distance = (occupied_near_mask == 0).astype(np.uint8)
+        dist_map = cv2.distanceTransform(free_for_distance, cv2.DIST_L2, 5)
+
+        proposals_total = 0
+        removed_outside_roi = 0
+        removed_on_object_mask = 0
+        removed_near_object_mask = 0
+        removed_bad_depth = 0
+        raw_candidates = []
+
+        # Use half-step offset so grid points are centered inside cells.
+        for v in range(step_px // 2, h, step_px):
+            for u in range(step_px // 2, w, step_px):
+                proposals_total += 1
+
+                if roi_mask[v, u] == 0:
+                    removed_outside_roi += 1
+                    continue
+
+                if occupied_mask[v, u] > 0:
+                    removed_on_object_mask += 1
+                    continue
+
+                if occupied_near_mask[v, u] > 0:
+                    removed_near_object_mask += 1
+                    continue
+
+                dstat = patch_depth_stats_at_pixel(
+                    depth,
+                    u,
+                    v,
+                    self.depth_scale,
+                    radius_px=patch_radius,
+                )
+
+                if (
+                    (not dstat["valid"])
+                    or float(dstat["valid_ratio"]) < valid_ratio_min
+                    or (
+                        dstat["spread_p90_p10_m"] is not None
+                        and float(dstat["spread_p90_p10_m"]) > spread_max_m
+                    )
+                ):
+                    removed_bad_depth += 1
+                    continue
+
+                p_cam = deproject_pixel_to_camera(
+                    u,
+                    v,
+                    float(dstat["median_m"]),
+                    self.intrinsics,
+                )
+
+                if p_cam is None:
+                    removed_bad_depth += 1
+                    continue
+
+                # Prefer larger clearance, with a very small center preference.
+                clearance_px = float(dist_map[v, u])
+                du = (float(u) - (w / 2.0)) / max(w / 2.0, 1.0)
+                dv = (float(v) - (h / 2.0)) / max(h / 2.0, 1.0)
+                center_penalty = float(np.sqrt(du * du + dv * dv))
+                score = clearance_px - 3.0 * center_penalty
+
+                raw_candidates.append({
+                    "u": int(u),
+                    "v": int(v),
+                    "score": float(score),
+                    "clearance_px": clearance_px,
+                    "camera_point": p_cam,
+                    "depth_stats": dstat,
+                })
+
+        raw_candidates.sort(key=lambda c: c["score"], reverse=True)
+
+        candidates = []
+        for rank, cand in enumerate(raw_candidates[:max_candidates], start=1):
+            p_cam = cand["camera_point"]
+            dstat = cand["depth_stats"]
+            candidates.append({
+                "rank": int(rank),
+                "pixel": {
+                    "u": int(cand["u"]),
+                    "v": int(cand["v"]),
+                },
+                "camera": {
+                    "x": round(float(p_cam[0]), 4),
+                    "y": round(float(p_cam[1]), 4),
+                    "z": round(float(p_cam[2]), 4),
+                },
+                "score": round(float(cand["score"]), 3),
+                "clearance_px": round(float(cand["clearance_px"]), 2),
+                "depth_source": "patch_median",
+                "depth_median_m": round(float(dstat["median_m"]), 4),
+                "depth_valid_ratio": round(float(dstat["valid_ratio"]), 3),
+                "depth_spread_p90_p10_m": (
+                    None
+                    if dstat["spread_p90_p10_m"] is None
+                    else round(float(dstat["spread_p90_p10_m"]), 4)
+                ),
+                "status": "vision_valid_world_filter_pending",
+            })
+
+        objects = self._make_object_translation_table(detections, depth)
+
+        return {
+            "mode": "empty_space",
+            "frame_id": self.frame_id,
+            "trigger_seq": int(trigger_seq),
+            "proposal_rule": "fixed_image_grid_then_roi_then_mask_near_exclusion",
+            "world_filter_policy": "calib_node_should_transform_candidates_and_objects_then_apply_object_size_filter",
+            "roi": roi_meta,
+            "params": {
+                "grid_step_px": int(step_px),
+                "max_candidates": int(max_candidates),
+                "mask_dilate_px": int(self.get_parameter("empty_mask_dilate_px").value),
+                "depth_patch_radius_px": int(patch_radius),
+                "depth_valid_ratio_min": float(valid_ratio_min),
+                "depth_spread_max_m": float(spread_max_m),
+            },
+            "stats": {
+                "proposals_total": int(proposals_total),
+                "removed_outside_roi": int(removed_outside_roi),
+                "removed_on_object_mask": int(removed_on_object_mask),
+                "removed_near_object_mask": int(removed_near_object_mask),
+                "removed_bad_depth": int(removed_bad_depth),
+                "candidates_before_limit": int(len(raw_candidates)),
+                "candidates_published": int(len(candidates)),
+                "objects_published": int(len(objects)),
+            },
+            "objects_camera": objects,
+            "candidates": candidates,
+            "target": candidates[0] if candidates else None,
+        }
+
+    def _publish_empty_space_candidates(
+        self,
+        color: np.ndarray,
+        depth: np.ndarray,
+        display: np.ndarray,
+        detections: List[Dict],
+        trigger_seq: int,
+    ) -> Optional[Dict]:
+        if not bool(self.get_parameter("empty_space_enable").value):
+            return None
+
+        data = self._generate_empty_space_candidates(
+            color=color,
+            depth=depth,
+            detections=detections,
+            trigger_seq=trigger_seq,
+        )
+
+        msg = String()
+        msg.data = json.dumps(data, ensure_ascii=False)
+        self.empty_space_pub.publish(msg)
+
+        # Save this result so the OpenCV visualization remains visible for a few seconds.
+        self.last_empty_space_debug = data
+        self.last_empty_space_debug_stamp_sec = self.get_clock().now().nanoseconds * 1e-9
+
+        # Visualization on the trigger frame: green = published candidate, red = detected object translation.
+        for cand in data.get("candidates", []):
+            u = int(cand["pixel"]["u"])
+            v = int(cand["pixel"]["v"])
+            rank = int(cand["rank"])
+            cv2.circle(display, (u, v), 5, (0, 255, 0), -1)
+            if rank <= 5:
+                cv2.putText(
+                    display,
+                    f"E{rank}",
+                    (u + 6, v - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (0, 255, 0),
+                    1,
+                )
+
+        for obj in data.get("objects_camera", []):
+            t = obj.get("camera_translation")
+            if not t:
+                continue
+            z = float(t["z"])
+            if z <= 0:
+                continue
+            u = int(float(t["x"]) * self.intrinsics.fx / z + self.intrinsics.ppx)
+            v = int(float(t["y"]) * self.intrinsics.fy / z + self.intrinsics.ppy)
+            cv2.circle(display, (u, v), 6, (0, 0, 255), -1)
+
+        self.get_logger().info(
+            f"[EMPTY_SPACE] seq={trigger_seq} "
+            f"candidates={data['stats']['candidates_published']} "
+            f"objects={data['stats']['objects_published']} "
+            f"topic={str(self.get_parameter('empty_space_topic').value)} "
+            f"bundled_into_object_json=True"
+        )
+
+        return data
+
+
+    def _draw_last_empty_space_debug(self, display: np.ndarray) -> None:
+        """Keep the last empty-space proposal visualization visible for N seconds.
+
+        This is intentionally independent from the trigger frame drawing so that
+        candidates do not disappear too quickly in the OpenCV preview window.
+        """
+        if self.last_empty_space_debug is None or self.last_empty_space_debug_stamp_sec is None:
+            return
+
+        hold_sec = float(self.get_parameter("empty_space_vis_hold_sec").value)
+        if hold_sec <= 0.0:
+            self.last_empty_space_debug = None
+            self.last_empty_space_debug_stamp_sec = None
+            return
+
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
+        elapsed = float(now_sec - float(self.last_empty_space_debug_stamp_sec))
+
+        if elapsed > hold_sec:
+            self.last_empty_space_debug = None
+            self.last_empty_space_debug_stamp_sec = None
+            return
+
+        data = self.last_empty_space_debug
+        h, w = display.shape[:2]
+
+        # ROI rectangle: blue.
+        roi = data.get("roi", {})
+        if roi.get("type") == "rect":
+            x_min = int(np.clip(int(roi.get("x_min", 0)), 0, w - 1))
+            y_min = int(np.clip(int(roi.get("y_min", 0)), 0, h - 1))
+            x_max = int(np.clip(int(roi.get("x_max", w - 1)), 0, w - 1))
+            y_max = int(np.clip(int(roi.get("y_max", h - 1)), 0, h - 1))
+            cv2.rectangle(display, (x_min, y_min), (x_max, y_max), (255, 0, 0), 2)
+            cv2.putText(
+                display,
+                "EMPTY ROI",
+                (x_min + 5, max(20, y_min - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 0, 0),
+                2,
+            )
+
+        # Empty-space candidates: green. Top-10 get rank labels.
+        candidates = data.get("candidates", [])
+        for cand in candidates:
+            pixel = cand.get("pixel", {})
+            u = int(pixel.get("u", -1))
+            v = int(pixel.get("v", -1))
+            rank = int(cand.get("rank", 0))
+
+            if u < 0 or v < 0 or u >= w or v >= h:
+                continue
+
+            radius = 7 if rank == 1 else 5
+            thickness = -1 if rank <= 10 else 1
+            cv2.circle(display, (u, v), radius, (0, 255, 0), thickness)
+
+            if rank <= 10:
+                cv2.putText(
+                    display,
+                    f"E{rank}",
+                    (u + 8, v - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (0, 255, 0),
+                    2,
+                )
+
+        # Detected object camera translations reprojected into the image: red.
+        objects = data.get("objects_camera", [])
+        for obj in objects:
+            t = obj.get("camera_translation")
+            if not t:
+                continue
+
+            z = float(t.get("z", 0.0))
+            if z <= 0.0:
+                continue
+
+            u = int(float(t.get("x", 0.0)) * self.intrinsics.fx / z + self.intrinsics.ppx)
+            v = int(float(t.get("y", 0.0)) * self.intrinsics.fy / z + self.intrinsics.ppy)
+            if u < 0 or v < 0 or u >= w or v >= h:
+                continue
+
+            cv2.circle(display, (u, v), 7, (0, 0, 255), -1)
+            cls = str(obj.get("class_name", "obj"))
+            cv2.putText(
+                display,
+                cls,
+                (u + 8, v + 12),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (0, 0, 255),
+                2,
+            )
+
+        # Status text.
+        stats = data.get("stats", {})
+        cand_n = int(stats.get("candidates_published", len(candidates)))
+        obj_n = int(stats.get("objects_published", len(objects)))
+        cv2.putText(
+            display,
+            f"EMPTY SPACE DEBUG {elapsed:.1f}/{hold_sec:.1f}s | cand={cand_n} obj={obj_n}",
+            (10, h - 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2,
+        )
+
+
     def _process_object_mode(
         self,
         color,
@@ -1323,6 +1893,22 @@ class MixedPoseVisionNode(Node):
         # 1) object YOLO segmentation은 매 프레임 전체 detection을 수집하고 전부 시각화한다.
         raw_detections = self._collect_detections(self.object_model, color, depth)
         status["detected_count_raw"] = len(raw_detections)
+
+        # On a 6D trigger, generate empty-space candidates before FoundationPose.
+        # The same data is also bundled into the /object_poses JSON so the transform node
+        # receives pose + empty-space candidates atomically from the same trigger/frame.
+        empty_space_data = None
+        if run_fp:
+            empty_space_data = self._publish_empty_space_candidates(
+                color=color,
+                depth=depth,
+                display=display,
+                detections=raw_detections,
+                trigger_seq=trigger_seq,
+            )
+            if empty_space_data is not None:
+                status["empty_space"] = empty_space_data
+                status["empty_space_bundle_policy"] = "included_in_object_poses_json_same_trigger"
 
         # Show current top-priority candidate in the preview window.
         # Current priority rule: smaller depth_score means closer object.

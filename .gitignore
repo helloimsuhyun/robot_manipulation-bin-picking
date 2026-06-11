@@ -60,6 +60,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
+debug_priority/
 
 # Large local installers
 *.deb

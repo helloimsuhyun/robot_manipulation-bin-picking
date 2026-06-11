@@ -11,7 +11,6 @@ python3 src/robot_ex_2026/robot_ex_2026/grip_current.py
 
 source /opt/ros/humble/setup.bash
 ros2 topic pub --once /manual_continue std_msgs/msg/Empty "{}"
-
 """
 
 from launch import LaunchDescription
@@ -24,7 +23,8 @@ from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description():
     # ============================================================
-    # PC 변경 시 여기 3개 경로만 먼저 확인 **********************************************************
+    # PC 변경 시 여기 3개 경로만 먼저 확인
+    # ============================================================
 
     foundationpose_repo_path = "/home/chu/FoundationPose"
 
@@ -38,6 +38,7 @@ def generate_launch_description():
 
     # ============================================================
     # Topic names
+    # ============================================================
 
     object_topic = "/object_poses"
     insert_topic = "/insert_poses"
@@ -50,7 +51,13 @@ def generate_launch_description():
     peg_output_topic = "/vision/peg_targets"
     hole_output_topic = "/vision/hole_targets"
 
+    empty_space_topic = "/empty_space_candidates" # 디버그용 토픽임
+
     sixd_pose_share = FindPackageShare("sixd_pose_vision")
+
+    # ============================================================
+    # Vision node launch
+    # ============================================================
 
     mixed_pose_vision_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -65,7 +72,7 @@ def generate_launch_description():
 
             "default_mode": "object",
             "enable_visualization": "true",
-            "conf_thresh": "0.4",
+            "conf_thresh": "0.5",
 
             "fp_register_iter": "5",
             "fp_track_iter": "2",
@@ -80,8 +87,54 @@ def generate_launch_description():
             "object_trigger_topic": object_6d_trigger_topic,
 
             "frame_id": "camera_color_optical_frame",
+
+            # ====================================================
+            # Empty-space vision param
+
+            # empty-space 후보 생성 on/off
+            "empty_space_enable": "true",
+
+            # 디버그용 topic. 실제 transform node는 /object_poses 안의 bundled empty_space 사용
+            "empty_space_topic": empty_space_topic,
+
+            # 이미지 grid 후보 간격.
+            # 작을수록 촘촘하지만 연산량 증가.
+            "empty_grid_step_px": "40",
+
+            # vision node가 object JSON에 포함할 최대 후보 개수.
+            "empty_max_candidates": "30",
+
+            # empty-space 후보 탐색 ROI.
+            # x_max/y_max=-1이면 image_width-right_margin, image_height-bottom_margin 사용.
+            "empty_roi_x_min": "70",
+            "empty_roi_y_min": "60",
+            "empty_roi_x_max": "-1",
+            "empty_roi_y_max": "-1",
+            "empty_roi_right_margin": "70",
+            "empty_roi_bottom_margin": "50",
+
+            # YOLO object mask 주변 제외 영역.
+            # 물체 가까운 후보가 많이 잡히면 30~40으로 증가.
+            # 후보가 너무 적으면 10~18로 감소.
+            "empty_mask_dilate_px": "22",
+
+            # 후보 주변 depth patch 검사.
+            "empty_depth_patch_radius_px": "6",
+            "empty_depth_valid_ratio_min": "0.50",
+            "empty_depth_spread_max_m": "0.030",
+
+            # OpenCV 시각화 유지 시간.
+            "empty_space_vis_hold_sec": "2.0",
+
+            # priority debug 저장.
+            "priority_debug_save": "true",
+            "priority_debug_dir": "debug_priority",
         }.items(),
     )
+
+    # ============================================================
+    # Calibration / transform node
+    # ============================================================
 
     sixd_pose_transform_node = Node(
         package="calib",
@@ -95,13 +148,14 @@ def generate_launch_description():
             # object_to_center 적용 후 centered object +Z가 world +Z에 더 가깝도록 보정
             "canonicalize_object_axes": True,
             "canonicalize_z_flip_margin": 0.05,
-            #    X/Y 중 world XY 평면에 더 평행한 축을 centered object +X로 선택
+
+            # X/Y 중 world XY 평면에 더 평행한 축을 centered object +X로 선택
             "canonicalize_xy_flatter_as_x": True,
             "canonicalize_xy_swap_margin": 0.03,
             "canonicalize_xy_max_flatness": 0.85,
 
-            # 3) YAML symmetry.yaw_candidates_deg 후보 중 RB5 마지막 joint 기준으로 선택
-            #    peg_camera_joint 마지막 joint J5=34.16 deg 기준
+            # YAML symmetry.yaw_candidates_deg 후보 중 RB5 마지막 joint 기준으로 선택
+            # peg_camera_joint 마지막 joint J5 기준
             "reference_last_joint_deg": 34.16,
             "last_joint_limit_delta_deg": 95.0,
 
@@ -120,6 +174,52 @@ def generate_launch_description():
 
             "detect_mode_settle_sec": 0.5,
 
+            # ====================================================
+            # Empty-space world filtering parameters
+            # ====================================================
+
+            # 디버그 topic 이름.
+            # transform node는 기본적으로 /object_poses JSON 안의 bundled empty_space를 사용.
+            "empty_space_topic": empty_space_topic,
+
+            # tilted_grasp로 output id가 음수인 경우에만 empty-space XY override 수행
+            "empty_space_override_on_negative_tilted_id": True,
+
+            # bundled empty_space가 없을 때만 fallback cache 사용 시 허용 age.
+            # 현재 구조에서는 bundled empty_space가 우선이라 큰 의미는 없음.
+            "empty_space_candidate_max_age_sec": 5.0,
+
+            # 물체 footprint 크기.
+            # 60x60mm를 회전 불변 원형 radius로 변환:
+            # radius = sqrt((60/2)^2 + (60/2)^2) = 약 42.4mm
+            "empty_space_object_size_x_mm": 60.0,
+            "empty_space_object_size_y_mm": 60.0,
+
+            # 최종 world filtering safety margin.
+            # 최종 reject_radius = 42.4 + safety_margin
+            # 기본 10mm면 약 52.4mm 이내 후보 제거.
+            "empty_space_safety_margin_mm": 30.0,
+
+            # ROI 가장자리 reject.
+            # 0이면 hard reject 거의 없음.
+            # 가장자리 후보가 선택되면 20~40으로 증가.
+            "empty_space_roi_edge_reject_px": 0.0,
+
+            # weighted score 가중치.
+            # 물체와 멀수록 좋음 + 원래 pose6 위치와 가까울수록 좋음을 동시에 고려.
+            "empty_space_w_clearance": 2.0,
+            "empty_space_w_pose6_proximity": 2.0,
+            "empty_space_w_roi_edge": 1.0,
+            "empty_space_w_vision_score": 0.5,
+
+            # normalization saturation 값.
+            # clearance가 150mm 이상이면 norm_clearance=1.0
+            # 원래 pose6에서 200mm 이상 떨어지면 norm_pose6_proximity=0.0
+            # ROI edge가 120px 이상이면 norm_roi_edge=1.0
+            "empty_space_clearance_norm_mm": 150.0,
+            "empty_space_pose6_proximity_norm_mm": 200.0,
+            "empty_space_roi_edge_norm_px": 120.0,
+
             # 실제 제어 노드 구조는 유지하고, publish 직후 preview만 띄움
             "visualize_pose6_target": False,
             "visualize_axes_length_mm": 50.0,
@@ -128,6 +228,10 @@ def generate_launch_description():
             "visualize_save_dir": "",
         }],
     )
+
+    # ============================================================
+    # Controller node
+    # ============================================================
 
     peg_in_hole_controller_node = Node(
         package="control",
@@ -144,8 +248,8 @@ def generate_launch_description():
             "grip_stop": 2,
 
             "home_joint": [-90.0, 0.0, 90.0, 0.0, 90.0, 45.0],
-            'peg_camera_joint': [9.68, 8.52, 55.63, 25.85, 90.0, 35.39],
-            'hole_camera_joint': [-173.76, 8.07, 56.16, 25.78, 90.0, 38.83],
+            "peg_camera_joint": [9.68, 8.52, 55.63, 25.85, 90.0, 35.39],
+            "hole_camera_joint": [-173.76, 8.07, 56.16, 25.78, 90.0, 38.83],
             "peg_return_mid_joint": [-47.0, 2.78, 79.15, 8.07, 90.0, 34.16],
 
             "pick_down_target_z_mm": 69.83,

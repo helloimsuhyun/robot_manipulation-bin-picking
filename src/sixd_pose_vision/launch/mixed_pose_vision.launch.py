@@ -110,6 +110,7 @@ def generate_launch_description():
         # short tracking refinement
         DeclareLaunchArgument("fp_trigger_track_frames", default_value="10"),
         DeclareLaunchArgument("fp_trigger_track_use_new_frames", default_value="true"),
+
         # 디버그 저장 끄기
         DeclareLaunchArgument("fp_debug", default_value="0"),
 
@@ -120,6 +121,51 @@ def generate_launch_description():
                 "debug_ros",
             ]),
         ),
+
+        # ============================================================
+        # Empty-space arguments
+        # ============================================================
+
+        # object pose JSON 안에 bundled empty_space로 들어가지만,
+        # 디버그/시각화용으로 /empty_space_candidates topic도 유지.
+        DeclareLaunchArgument("empty_space_topic", default_value="/empty_space_candidates"),
+        DeclareLaunchArgument("empty_space_enable", default_value="true"),
+
+        # 이미지 grid 후보 간격.
+        # 작을수록 후보가 촘촘하지만 연산량 증가.
+        DeclareLaunchArgument("empty_grid_step_px", default_value="40"),
+
+        # vision node가 publish/object JSON에 포함할 최대 후보 수.
+        DeclareLaunchArgument("empty_max_candidates", default_value="30"),
+
+        # Empty-space 탐색 ROI.
+        # x_max/y_max가 -1이면 width-right_margin, height-bottom_margin 사용.
+        DeclareLaunchArgument("empty_roi_x_min", default_value="70"),
+        DeclareLaunchArgument("empty_roi_y_min", default_value="60"),
+        DeclareLaunchArgument("empty_roi_x_max", default_value="-1"),
+        DeclareLaunchArgument("empty_roi_y_max", default_value="-1"),
+        DeclareLaunchArgument("empty_roi_right_margin", default_value="70"),
+        DeclareLaunchArgument("empty_roi_bottom_margin", default_value="50"),
+
+        # object mask 주변 제외 영역.
+        # 픽셀 단위 dilation. 너무 작으면 물체 옆 후보가 살아남고,
+        # 너무 크면 후보가 과하게 줄어듦.
+        DeclareLaunchArgument("empty_mask_dilate_px", default_value="22"),
+
+        # 후보점 주변 patch depth 검증.
+        DeclareLaunchArgument("empty_depth_patch_radius_px", default_value="6"),
+        DeclareLaunchArgument("empty_depth_valid_ratio_min", default_value="0.50"),
+        DeclareLaunchArgument("empty_depth_spread_max_m", default_value="0.030"),
+
+        # OpenCV 시각화 유지 시간.
+        DeclareLaunchArgument("empty_space_vis_hold_sec", default_value="2.0"),
+
+        # ============================================================
+        # Priority debug arguments
+        # ============================================================
+
+        DeclareLaunchArgument("priority_debug_save", default_value="true"),
+        DeclareLaunchArgument("priority_debug_dir", default_value="debug_priority"),
 
         # ============================================================
         # Topic arguments
@@ -163,7 +209,9 @@ def generate_launch_description():
                     value_type=float,
                 ),
 
-
+                # ----------------------------
+                # Runtime
+                # ----------------------------
                 "default_mode": LaunchConfiguration("default_mode"),
 
                 "enable_visualization": ParameterValue(
@@ -193,7 +241,9 @@ def generate_launch_description():
 
                 "frame_id": LaunchConfiguration("frame_id"),
 
-
+                # ----------------------------
+                # FoundationPose
+                # ----------------------------
                 "fp_register_iter": ParameterValue(
                     LaunchConfiguration("fp_register_iter"),
                     value_type=int,
@@ -226,6 +276,94 @@ def generate_launch_description():
 
                 "fp_debug_dir": LaunchConfiguration("fp_debug_dir"),
 
+                # ----------------------------
+                # Empty-space
+                # ----------------------------
+                "empty_space_topic": LaunchConfiguration("empty_space_topic"),
+
+                "empty_space_enable": ParameterValue(
+                    LaunchConfiguration("empty_space_enable"),
+                    value_type=bool,
+                ),
+
+                "empty_grid_step_px": ParameterValue(
+                    LaunchConfiguration("empty_grid_step_px"),
+                    value_type=int,
+                ),
+
+                "empty_max_candidates": ParameterValue(
+                    LaunchConfiguration("empty_max_candidates"),
+                    value_type=int,
+                ),
+
+                "empty_roi_x_min": ParameterValue(
+                    LaunchConfiguration("empty_roi_x_min"),
+                    value_type=int,
+                ),
+
+                "empty_roi_y_min": ParameterValue(
+                    LaunchConfiguration("empty_roi_y_min"),
+                    value_type=int,
+                ),
+
+                "empty_roi_x_max": ParameterValue(
+                    LaunchConfiguration("empty_roi_x_max"),
+                    value_type=int,
+                ),
+
+                "empty_roi_y_max": ParameterValue(
+                    LaunchConfiguration("empty_roi_y_max"),
+                    value_type=int,
+                ),
+
+                "empty_roi_right_margin": ParameterValue(
+                    LaunchConfiguration("empty_roi_right_margin"),
+                    value_type=int,
+                ),
+
+                "empty_roi_bottom_margin": ParameterValue(
+                    LaunchConfiguration("empty_roi_bottom_margin"),
+                    value_type=int,
+                ),
+
+                "empty_mask_dilate_px": ParameterValue(
+                    LaunchConfiguration("empty_mask_dilate_px"),
+                    value_type=int,
+                ),
+
+                "empty_depth_patch_radius_px": ParameterValue(
+                    LaunchConfiguration("empty_depth_patch_radius_px"),
+                    value_type=int,
+                ),
+
+                "empty_depth_valid_ratio_min": ParameterValue(
+                    LaunchConfiguration("empty_depth_valid_ratio_min"),
+                    value_type=float,
+                ),
+
+                "empty_depth_spread_max_m": ParameterValue(
+                    LaunchConfiguration("empty_depth_spread_max_m"),
+                    value_type=float,
+                ),
+
+                "empty_space_vis_hold_sec": ParameterValue(
+                    LaunchConfiguration("empty_space_vis_hold_sec"),
+                    value_type=float,
+                ),
+
+                # ----------------------------
+                # Priority debug
+                # ----------------------------
+                "priority_debug_save": ParameterValue(
+                    LaunchConfiguration("priority_debug_save"),
+                    value_type=bool,
+                ),
+
+                "priority_debug_dir": LaunchConfiguration("priority_debug_dir"),
+
+                # ----------------------------
+                # Topics
+                # ----------------------------
                 "object_topic": LaunchConfiguration("object_topic"),
                 "insert_topic": LaunchConfiguration("insert_topic"),
 
