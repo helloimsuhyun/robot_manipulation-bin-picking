@@ -22,9 +22,13 @@ class VisionInterface:
         trigger_peg = [allow_circle, allow_square, allow_cross, x, y, z, rx, ry, rz]
             - allow_* = 1이면 잡아도 됨, 0이면 잡으면 안 됨.
             - 순서: circle(id=0), square/hole(id=1), cross(id=2), pose6.
-        peg_targets success = [object_id, x, y, z, rx, ry, rz] # len(data)==7
+        peg_targets normal success = [object_id, x, y, z, rx, ry, rz] # len(data)==7
             - data[0]은 실제 인식되어 선택된 object_id이다.
             - data[1:7]은 move_l용 최종 grasp pose이다.
+        peg_targets safe-grasp success = [-object_id, x, y, z, rx, ry, rz, empty_x, empty_y] # len(data)==9
+            - 음수 id는 45도 틀어진 안전 grasp pose라는 의미이다.
+            - pose6은 여전히 실제 peg를 잡는 TCP pose이다.
+            - empty_x/empty_y는 잡은 뒤 임시로 평평하게 내려놓을 world XY 좌표이다.
         peg_targets legacy = [T00, T01, ... T33, object_id]   # len(data)==17
             - 이전 4x4 matrix 방식 호환용이다.
         peg_targets failure = [visible_id0, visible_id1, ...] # 그 외 길이
@@ -267,32 +271,60 @@ class VisionInterface:
     def _parse_peg_6d_msg(self, msg: Float64MultiArray) -> tuple[list[VisionTarget], list[int]]:
         data = list(msg.data)
 
-        # 최신 방식:
-        # 비전 노드가 이미 move_l에 넣을 최종 grasp pose를 계산해서 보낸다.
-        # data = [actual_object_id, x, y, z, rx, ry, rz]
-        # 특히 request_id=-1로 요청한 경우, data[0]을 실제 잡을 object_id로 사용해야 한다.
-        if len(data) == 7:
-            object_id = int(round(float(data[0])))
+        # 최신 방식 A: 일반 grasp success
+        # data = [object_id, x, y, z, rx, ry, rz]
+        #
+        # 최신 방식 B: tilted/safe grasp success
+        # data = [-object_id, x, y, z, rx, ry, rz, empty_world_x, empty_world_y]
+        #
+        # 음수 id는 object 종류가 아니라 "안전 grasp 후 임시 재배치 필요" 플래그이다.
+        # 따라서 shape 판단에는 abs(raw_id)를 사용하고, raw_id < 0이면
+        # regrasp_temp_xy_mm에 msg 끝의 empty XY를 저장한다.
+        if len(data) in (7, 9):
+            raw_object_id = int(round(float(data[0])))
+            object_id = abs(raw_object_id)
+            needs_regrasp = raw_object_id < 0
 
             if object_id not in self.VALID_OBJECT_IDS:
                 self.node.get_logger().warn(
-                    f"[VISION SUB] Unknown 6D peg response id: {object_id}. "
-                    f"Expected 0=cylinder, 1=hole, 2=cross."
+                    f"[VISION SUB] Unknown 6D peg response id: raw={raw_object_id}, abs={object_id}. "
+                    f"Expected 0=cylinder, 1=hole, 2=cross; negative id allowed only for 1/2."
                 )
                 return [], []
 
+            if needs_regrasp and len(data) != 9:
+                self.node.get_logger().warn(
+                    f"[VISION SUB] Negative 6D peg id={raw_object_id} requires len=9 "
+                    "[-id, pose6, empty_x, empty_y], but len=7 was received. Ignore for safety."
+                )
+                return [], []
+
+            if (not needs_regrasp) and len(data) == 9:
+                self.node.get_logger().warn(
+                    f"[VISION SUB] len=9 received with non-negative id={raw_object_id}. "
+                    "Treat as normal grasp and ignore appended empty XY."
+                )
+
             pose6 = np.asarray(data[1:7], dtype=np.float64)
+            regrasp_temp_xy = None
+            if needs_regrasp:
+                regrasp_temp_xy = np.asarray(data[7:9], dtype=np.float64)
 
             target = VisionTarget(
                 pose=pose6.copy(),
                 object_id=object_id,
                 transform=None,
+                raw_object_id=raw_object_id,
+                needs_regrasp=needs_regrasp,
+                regrasp_temp_xy_mm=None if regrasp_temp_xy is None else regrasp_temp_xy.copy(),
             )
 
             self.node.get_logger().info(
                 f"[VISION SUB] 6D peg grasp pose received directly: "
-                f"id={object_id} ({self.shape_name(object_id)}), "
-                f"pose6={np.round(pose6, 3).tolist()}"
+                f"raw_id={raw_object_id}, id={object_id} ({self.shape_name(object_id)}), "
+                f"needs_regrasp={needs_regrasp}, "
+                f"pose6={np.round(pose6, 3).tolist()}, "
+                f"regrasp_temp_xy={None if regrasp_temp_xy is None else np.round(regrasp_temp_xy, 3).tolist()}"
             )
             return [target], []
 
@@ -324,6 +356,9 @@ class VisionInterface:
                 pose=pose6.copy(),
                 object_id=object_id,
                 transform=None,
+                raw_object_id=object_id,
+                needs_regrasp=False,
+                regrasp_temp_xy_mm=None,
             )
 
             self.node.get_logger().info(
@@ -351,6 +386,9 @@ class VisionInterface:
                 pose=pose6,
                 object_id=object_id,
                 transform=T.copy(),
+                raw_object_id=object_id,
+                needs_regrasp=False,
+                regrasp_temp_xy_mm=None,
             )
 
             self.node.get_logger().info(
@@ -463,7 +501,7 @@ class VisionInterface:
 
         # FoundationPose는 object 종류에 따라 3초 이상 걸릴 수 있어서
         # 6D peg는 최소 6초는 기다리도록 한다.
-        timeout_sec = max(float(self.ctx.vision_wait_timeout_sec), 6.0)
+        timeout_sec = max(float(self.ctx.vision_wait_timeout_sec), 9.0)
 
         start_time = time.monotonic()
         last_seq = self.peg_msg_seq
@@ -793,12 +831,8 @@ class VisionInterface:
 
             elif object_id == 2:
                 # 십자가 hole:
-                # vision 단계에서는 90도 대칭 범위로만 접는다.
-                # 실제 place rz 범위(-90~0) 및 tilt 방향(final_rz-45)은
-                # peg_in_hole_controller.make_tilted_place_pose()에서 한 번만 처리한다.
-                # 여기서 -45도를 미리 빼면 controller에서 다시 보정되어
-                # 특정 yaw 구간에서 tilt 방향이 90도 어긋날 수 있다.
-                corrected_yaw = (yaw % 90.0)
+                # 여기에 성현님이 원하는 hole 전용 yaw 계산식을 넣으면 됨.
+                corrected_yaw = (yaw % 90.0) - 45.0
 
             else:
                 self.node.get_logger().warn(

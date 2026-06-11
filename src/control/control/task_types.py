@@ -14,6 +14,13 @@ class TaskState(Enum):
     DESCEND_TO_PEG = auto()                   # peg 잡는 높이로 내려감
     GRASP_PEG = auto()                        # peg 잡기
     LIFT_WITH_PEG = auto()                    # peg 잡고 상승
+
+    # -1/-2 safe grasp로 잡은 peg를 임시 빈 공간에 평평하게 내려놓고 재촬영
+    MOVE_TO_REGRASP_TEMP_APPROACH = auto()    # 임시 place 위치 위로 이동
+    DESCEND_TO_REGRASP_TEMP_PLACE = auto()    # 임시 place z까지 하강
+    RELEASE_AT_REGRASP_TEMP_PLACE = auto()    # 임시 위치에 peg 놓기
+    LIFT_FROM_REGRASP_TEMP_PLACE = auto()     # 임시 place 후 상승
+
     MOVE_TO_HOLE_CAMERA_POSE = auto()         # hole 보기 위한 자세로 이동
     INSPECT_HOLES = auto()                    # hole 인식
     MOVE_TO_TARGET_HOLE = auto()              # 목표 hole 위로 이동
@@ -59,6 +66,13 @@ class VisionTarget:
     pose: np.ndarray
     object_id: int
     transform: np.ndarray | None = None
+
+    # 6D peg 최신 포맷용 메타데이터.
+    # raw_object_id가 -1/-2이면 object_id는 abs(raw_object_id)로 정규화하고,
+    # needs_regrasp=True로 표시한다.
+    raw_object_id: int | None = None
+    needs_regrasp: bool = False
+    regrasp_temp_xy_mm: np.ndarray | None = None
 
 
 @dataclass
@@ -174,6 +188,23 @@ class TaskContext:
     current_peg_object_T: np.ndarray | None = None
     current_hole_place_pose: np.ndarray | None = None
     current_target_id: int | None = None
+
+    # -1/-2 safe grasp 후 임시 빈 공간에 내려놓기 위한 런타임 데이터
+    current_raw_target_id: int | None = None
+    current_needs_regrasp: bool = False
+    current_regrasp_temp_xy_mm: np.ndarray | None = None
+    current_regrasp_attempt_count: int = 0
+
+    # 임시 regrasp place pose 파라미터
+    # x/y는 비전 토픽의 len=9 응답 끝 두 값(empty_x, empty_y)을 사용하고,
+    # z와 자세는 아래 파라미터로 고정한다.
+    regrasp_temp_place_z_mm: float = 81.0
+    regrasp_temp_approach_z_offset_mm: float = 50.0
+    regrasp_temp_lift_z_offset_mm: float = 50.0
+    regrasp_temp_flat_rx_deg: float = 90.0
+    regrasp_temp_flat_ry_deg: float = 0.0
+    regrasp_temp_flat_rz_deg: float = -45.0
+    regrasp_max_attempts: int = 1
 
     # ===== jig 사용 현황 =====
     # 현재 채우고 있는 jig 세트의 남은 slot 목록.

@@ -37,9 +37,13 @@ class PegInHoleController(Node):
         id: 0=cylinder, 1=hole, 2=cross
 
     6D peg 결과 토픽 데이터:
-        success: len(data) == 6  -> [x, y, z, rx, ry, rz]
-            - 비전 노드에서 이미 move_l용 최종 grasp pose를 계산해서 보낸다.
-        legacy:  len(data) == 17 -> [4x4 target transform row-major, object_id]
+        normal success: len(data) == 7
+            [object_id, x, y, z, rx, ry, rz]
+        safe-grasp success: len(data) == 9
+            [-object_id, x, y, z, rx, ry, rz, empty_world_x, empty_world_y]
+            음수 id는 임시 재배치가 필요한 안전 grasp 플래그이며,
+            pose6은 여전히 실제 peg를 잡는 TCP pose이다.
+        legacy: len(data) == 17 -> [4x4 target transform row-major, object_id]
         failure: 그 외 길이 -> [currently visible object ids]
     """
 
@@ -94,7 +98,7 @@ class PegInHoleController(Node):
                 ("servo_insert_down_torque", [0.0, 0.0, 0.5, 0.0, 0.0, 0.0]),
 
                 # 4/5번 조인트 자세 복귀 servo_t
-                ("servo_level_max_duration_sec", 5.0),
+                ("servo_level_max_duration_sec", 4.0),
                 ("servo_level_target_stable_count", 10),
                 ("servo_level_j4_tol_deg", 1.0),
                 ("servo_level_j5_tol_deg", 1.0),
@@ -157,7 +161,17 @@ class PegInHoleController(Node):
 
                 # 방금 원위치에 되돌려놓은 peg를 한 번 제외할 때 쓰는 xy 거리 기준
                 ("skip_once_xy_tol_mm", 20.0),
-                
+
+                # -1/-2 safe grasp 후 임시로 평평하게 내려놓는 pose
+                # x/y는 /vision/peg_targets len=9의 마지막 두 값(empty_x, empty_y)을 사용한다.
+                ("regrasp_temp_place_z_mm", 81.0),
+                ("regrasp_temp_approach_z_offset_mm", 50.0),
+                ("regrasp_temp_lift_z_offset_mm", 50.0),
+                ("regrasp_temp_flat_rx_deg", 90.0),
+                ("regrasp_temp_flat_ry_deg", 0.0),
+                ("regrasp_temp_flat_rz_deg", -45.0),
+                ("regrasp_max_attempts", 1),
+
             ],
         )
 
@@ -257,6 +271,14 @@ class PegInHoleController(Node):
             vision_fixed_rz_deg=self._get_float_param("vision_fixed_rz_deg"),
 
             skip_once_xy_tol_mm=self._get_float_param("skip_once_xy_tol_mm"),
+
+            regrasp_temp_place_z_mm=self._get_float_param("regrasp_temp_place_z_mm"),
+            regrasp_temp_approach_z_offset_mm=self._get_float_param("regrasp_temp_approach_z_offset_mm"),
+            regrasp_temp_lift_z_offset_mm=self._get_float_param("regrasp_temp_lift_z_offset_mm"),
+            regrasp_temp_flat_rx_deg=self._get_float_param("regrasp_temp_flat_rx_deg"),
+            regrasp_temp_flat_ry_deg=self._get_float_param("regrasp_temp_flat_ry_deg"),
+            regrasp_temp_flat_rz_deg=self._get_float_param("regrasp_temp_flat_rz_deg"),
+            regrasp_max_attempts=self._get_int_param("regrasp_max_attempts"),
         )
 
         self.manual_continue_received = False
@@ -432,12 +454,29 @@ class PegInHoleController(Node):
             if selected_peg.transform is not None
             else None
         )
-        self.ctx.current_target_id = selected_peg.object_id
+        self.ctx.current_target_id = int(selected_peg.object_id)
+        self.ctx.current_raw_target_id = (
+            int(selected_peg.raw_object_id)
+            if selected_peg.raw_object_id is not None
+            else int(selected_peg.object_id)
+        )
+        self.ctx.current_needs_regrasp = bool(selected_peg.needs_regrasp)
+        self.ctx.current_regrasp_temp_xy_mm = (
+            None
+            if selected_peg.regrasp_temp_xy_mm is None
+            else np.asarray(selected_peg.regrasp_temp_xy_mm, dtype=float).reshape(2).copy()
+        )
+
+        if not self.ctx.current_needs_regrasp:
+            self.ctx.current_regrasp_attempt_count = 0
 
         self.get_logger().info(
             f"[SELECT] current peg index = {self.ctx.current_peg_index}, "
+            f"raw_id = {self.ctx.current_raw_target_id}, "
             f"id = {self.ctx.current_target_id} "
             f"({self.vision.shape_name(self.ctx.current_target_id)}), "
+            f"needs_regrasp = {self.ctx.current_needs_regrasp}, "
+            f"regrasp_temp_xy = {None if self.ctx.current_regrasp_temp_xy_mm is None else np.round(self.ctx.current_regrasp_temp_xy_mm, 3).tolist()}, "
             f"remaining_jig_counts = {dict(self.ctx.remaining_jig_counts)}"
         )
 
@@ -480,6 +519,9 @@ class PegInHoleController(Node):
             self.ctx.current_peg_pick_pose = None
             self.ctx.current_peg_object_T = None
             self.ctx.current_target_id = None
+            self.ctx.current_raw_target_id = None
+            self.ctx.current_needs_regrasp = False
+            self.ctx.current_regrasp_temp_xy_mm = None
             return False
 
         selected_index = None
@@ -557,6 +599,9 @@ class PegInHoleController(Node):
         self.ctx.current_peg_pick_pose = None
         self.ctx.current_peg_object_T = None
         self.ctx.current_target_id = None
+        self.ctx.current_raw_target_id = None
+        self.ctx.current_needs_regrasp = False
+        self.ctx.current_regrasp_temp_xy_mm = None
 
         self.get_logger().warn(
             "[SELECT] No peg matched with active jig layout. "
@@ -1063,25 +1108,6 @@ class PegInHoleController(Node):
     def _normalize_yaw_0_to_90_deg(self, yaw: float) -> float:
         return float(yaw) % 90.0
 
-    def _normalize_place_yaw_minus90_to_0_deg(self, yaw: float) -> float:
-        """
-        90도 대칭인 place yaw를 -90 <= rz <= 0 deg 범위로 접는다.
-
-        원형 place rz=-45 deg를 기준으로 사각형/십자가도 -45 deg 주변에서
-        움직이게 하려는 용도다.
-
-        예:
-             10 -> -80
-             45 -> -45
-             80 -> -10
-            -10 -> -10
-             90 ->   0
-        """
-        folded = -((-float(yaw)) % 90.0)
-        if abs(folded) < 1e-9:
-            return 0.0
-        return folded
-
     def make_tilted_place_pose(self) -> np.ndarray:
         """
         hole place pose를 기준으로 삽입 직전 tilt pose를 만든다.
@@ -1089,50 +1115,78 @@ class PegInHoleController(Node):
         - 접근 MOVE_L은 기존처럼 tilt 없이 수행한다.
         - 이 함수는 place_down_target_z_mm까지 내려갈 때만 사용한다.
         - yaw 방향으로 place_tilt_deg만큼 tilt를 주기 위해 rx/ry에 분배한다.
-        - 네모/object_id=1, 십자가/object_id=2는 90도 대칭이므로 place rz를 -90~0도 범위로 접는다.
+        - 사각형/object_id=1, 십자가/object_id=2는 place rz와 tilt 방향을 분리할 수 있다.
 
-        식:
-            rx = base_rx - tilt * sin(yaw)
-            ry = base_ry + tilt * cos(yaw)
+        기본 tilt 식:
+            rx = base_rx - tilt * sin(tilt_yaw)
+            ry = base_ry + tilt * cos(tilt_yaw)
 
-        yaw는 target_pose[5] = rz 기준이다.
+        주의:
+            target_pose[5]는 실제 로봇 place rz이다.
+            custom_tilt_yaw_deg는 tilt 방향 계산 전용 yaw이다.
         """
         if self.ctx.current_hole_place_pose is None:
             raise RuntimeError("No selected hole target")
 
         target_pose = self.ctx.current_hole_place_pose.copy()
         target_pose[2] = self.ctx.place_down_target_z_mm
-        target_pose[0] -= 5
+        target_pose[0] -= 5.0
 
         base_rx = float(target_pose[3])
         base_ry = float(target_pose[4])
         tilt_deg = float(self.ctx.place_tilt_deg)
 
-        # 십자가에서만 tilt 방향을 따로 쓰기 위한 변수
-        cross_tilt_yaw_deg = None
+        # 사각형/십자가처럼 place rz와 tilt 방향을 분리해야 하는 경우 사용
+        custom_tilt_yaw_deg = None
 
-        # 네모 peg/object_id=1: 기존 보정식은 유지하되 최종 rz는 -90~0도 범위로 접는다.
+        # ------------------------------------------------------------
+        # 사각형 peg/object_id=1
+        #
+        # - 최종 place rz:
+        #     rz = (raw_yaw - 45) % 90
+        #
+        # - tilt 방향:
+        #     raw_yaw 기준
+        #
+        # 현재 테스트에서 사각형은 이 방식이 정상 동작.
+        # ------------------------------------------------------------
         if self.ctx.current_target_id == 1:
             raw_yaw = float(target_pose[5])
-            corrected_yaw = self._normalize_place_yaw_minus90_to_0_deg(raw_yaw - 45.0)
+            corrected_yaw = self._normalize_yaw_0_to_90_deg(raw_yaw - 45.0)
 
             target_pose[0] += 2.0
             target_pose[5] = corrected_yaw
             tilt_deg += 5.0
 
+            custom_tilt_yaw_deg = raw_yaw
+
             self.get_logger().info(
                 f"[PLACE SQUARE] apply x offset +2.0 mm, "
-                f"yaw -45 then fold[-90,0]: {raw_yaw:.3f} -> {target_pose[5]:.3f}, "
+                f"place rz: yaw -45 then mod90 {raw_yaw:.3f} -> {target_pose[5]:.3f}, "
+                f"tilt_yaw=raw_yaw={custom_tilt_yaw_deg:.3f}, "
                 f"target x={target_pose[0]:.2f}, total tilt={tilt_deg:.2f}deg"
             )
 
-        # 십자가 peg/object_id=2:
-        # - 최종 rz는 raw_yaw와 90도 대칭인 값 중 -90~0도 범위를 사용
-        # - XY offset도 기존처럼 최종 rz 방향 사용
-        # - tilt 방향도 최종 rz 기준으로 final_rz - 45도 사용
+        # ------------------------------------------------------------
+        # 십자가 peg/object_id=2
+        #
+        # - 최종 place rz:
+        #     rz = raw_yaw % 90
+        #
+        # - XY offset:
+        #     최종 rz 방향 기준
+        #
+        # - tilt 방향:
+        #     기존 raw_yaw - 45.0 대신 corrected_yaw 기준으로 변경.
+        #
+        # 이유:
+        #   raw_yaw - 45를 쓰면 십자가를 대각 방향으로 눕히는 성격이 강해진다.
+        #   지금 증상처럼 rz는 맞는데 tilt 방향만 이상하면,
+        #   tilt 방향을 최종 place rz/XY offset 방향과 같은 기준으로 맞추는 쪽이 안전하다.
+        # ------------------------------------------------------------
         if self.ctx.current_target_id == 2:
             raw_yaw = float(target_pose[5])
-            corrected_yaw = self._normalize_place_yaw_minus90_to_0_deg(raw_yaw)
+            corrected_yaw = self._normalize_yaw_0_to_90_deg(raw_yaw)
 
             extra_tilt_deg = 12.0
             offset_mm = 10.0
@@ -1140,11 +1194,12 @@ class PegInHoleController(Node):
             target_pose[5] = corrected_yaw
             tilt_deg += extra_tilt_deg
 
-            # 십자가 tilt 방향도 최종 rz 기준으로 계산한다.
-            # raw_yaw를 그대로 쓰면 yaw가 -90~0으로 접히는 구간에서 tilt 방향이 90도 어긋날 수 있다.
-            cross_tilt_yaw_deg = corrected_yaw - 45.0
+            # 핵심 수정:
+            # 기존: custom_tilt_yaw_deg = raw_yaw - 45.0
+            # 수정: 최종 rz 방향과 같은 기준으로 tilt
+            custom_tilt_yaw_deg = corrected_yaw
 
-            # XY offset은 기존처럼 최종 rz 방향 기준
+            # XY offset도 최종 rz 방향 기준
             xy_yaw_rad = np.deg2rad(target_pose[5])
             target_pose[0] += offset_mm * np.cos(xy_yaw_rad)
             target_pose[1] += offset_mm * np.sin(xy_yaw_rad)
@@ -1153,8 +1208,8 @@ class PegInHoleController(Node):
             target_pose[2] += 4.0
 
             self.get_logger().info(
-                f"[PLACE CROSS] rz fold[-90,0]: {raw_yaw:.3f} -> {target_pose[5]:.3f}, "
-                f"tilt yaw=final_rz-45={cross_tilt_yaw_deg:.3f}, "
+                f"[PLACE CROSS] rz mod90: {raw_yaw:.3f} -> {target_pose[5]:.3f}, "
+                f"tilt_yaw=corrected_yaw={custom_tilt_yaw_deg:.3f}, "
                 f"xy offset yaw={target_pose[5]:.3f}, "
                 f"apply extra tilt +{extra_tilt_deg:.2f}deg, "
                 f"xy yaw offset={offset_mm:.2f}mm, "
@@ -1162,10 +1217,10 @@ class PegInHoleController(Node):
                 f"total tilt={tilt_deg:.2f}deg"
             )
 
-        # 십자가만 tilt 방향을 final_rz - 45도로 사용
-        # 나머지 원/네모는 기존처럼 target_pose[5] 기준으로 tilt
-        if self.ctx.current_target_id == 2 and cross_tilt_yaw_deg is not None:
-            tilt_yaw_deg = float(cross_tilt_yaw_deg)
+        # custom tilt yaw가 있으면 그것을 사용하고,
+        # 없으면 원형처럼 최종 target_pose[5] 기준으로 tilt한다.
+        if custom_tilt_yaw_deg is not None:
+            tilt_yaw_deg = float(custom_tilt_yaw_deg)
         else:
             tilt_yaw_deg = float(target_pose[5])
 
@@ -1175,13 +1230,53 @@ class PegInHoleController(Node):
         target_pose[4] = base_ry + tilt_deg * np.cos(tilt_yaw_rad)
 
         self.get_logger().info(
-            f"[PLACE TILT] tilt={tilt_deg:.2f}deg, yaw={tilt_yaw_deg:.2f}deg, "
+            f"[PLACE TILT] tilt={tilt_deg:.2f}deg, "
+            f"tilt_yaw={tilt_yaw_deg:.2f}deg, "
             f"final_rz={target_pose[5]:.2f}deg, "
             f"base_rpy=[{base_rx:.2f}, {base_ry:.2f}, {target_pose[5]:.2f}], "
             f"tilted_pose={np.round(target_pose, 3)}"
         )
 
         return target_pose
+
+    def make_regrasp_temp_place_pose(self, z_offset_mm: float = 0.0) -> np.ndarray:
+        """
+        -1/-2 safe grasp 후 임시 빈 공간에 내려놓을 flat place pose를 만든다.
+
+        입력 source:
+            x/y = /vision/peg_targets len=9 응답의 마지막 두 값
+                  [-id, pose6, empty_world_x, empty_world_y]
+            z   = regrasp_temp_place_z_mm + z_offset_mm
+            rpy = regrasp_temp_flat_* 파라미터
+
+        이 pose는 peg를 잡는 pose가 아니라, 잡은 뒤 바닥에 평평하게 다시
+        내려놓기 위한 pose이다.
+        """
+        if self.ctx.current_regrasp_temp_xy_mm is None:
+            raise RuntimeError(
+                "No regrasp temporary empty-space XY. "
+                "Negative id response must be len=9: [-id, pose6, empty_x, empty_y]."
+            )
+
+        xy = np.asarray(self.ctx.current_regrasp_temp_xy_mm, dtype=float).reshape(2)
+        pose = np.array(
+            [
+                float(xy[0]),
+                float(xy[1]),
+                float(self.ctx.regrasp_temp_place_z_mm) + float(z_offset_mm),
+                float(self.ctx.regrasp_temp_flat_rx_deg),
+                float(self.ctx.regrasp_temp_flat_ry_deg),
+                float(self.ctx.regrasp_temp_flat_rz_deg),
+            ],
+            dtype=float,
+        )
+
+        self.get_logger().info(
+            f"[REGRASP TEMP PLACE POSE] xy_from_topic=({xy[0]:.2f}, {xy[1]:.2f})mm, "
+            f"base_z={self.ctx.regrasp_temp_place_z_mm:.2f}mm, "
+            f"z_offset={float(z_offset_mm):.2f}mm, pose={np.round(pose, 3)}"
+        )
+        return pose
 
     def make_lift_pose_from_current_tcp(self) -> np.ndarray:
         """
@@ -1240,6 +1335,9 @@ class PegInHoleController(Node):
         self.ctx.current_peg_object_T = None
         self.ctx.current_hole_place_pose = None
         self.ctx.current_target_id = None
+        self.ctx.current_raw_target_id = None
+        self.ctx.current_needs_regrasp = False
+        self.ctx.current_regrasp_temp_xy_mm = None
 
     def clear_recovery_pose(self):
         self.ctx.last_pick_up_pose = None
@@ -1371,7 +1469,82 @@ class PegInHoleController(Node):
                 target_pose,
                 preserve_orientation=self.use_6d_peg_interface,
             )
-            self.state = TaskState.MOVE_TO_HOLE_CAMERA_POSE
+
+            if self.ctx.current_needs_regrasp:
+                if self.ctx.current_regrasp_temp_xy_mm is None:
+                    self.get_logger().error(
+                        "[REGRASP] Negative id selected, but no empty-space XY was provided. Stop for safety."
+                    )
+                    self.state = TaskState.ERROR
+                    return
+
+                if self.ctx.current_regrasp_attempt_count >= int(self.ctx.regrasp_max_attempts):
+                    self.get_logger().error(
+                        f"[REGRASP] max attempts exceeded. "
+                        f"attempts={self.ctx.current_regrasp_attempt_count}, "
+                        f"max={self.ctx.regrasp_max_attempts}. Stop for safety."
+                    )
+                    self.state = TaskState.ERROR
+                    return
+
+                self.ctx.current_regrasp_attempt_count += 1
+                self.get_logger().warn(
+                    f"[REGRASP] raw_id={self.ctx.current_raw_target_id} requires temporary flat place. "
+                    f"attempt={self.ctx.current_regrasp_attempt_count}/{self.ctx.regrasp_max_attempts}, "
+                    f"empty_xy={np.round(self.ctx.current_regrasp_temp_xy_mm, 3).tolist()}"
+                )
+                time.sleep(0.5)
+                self.state = TaskState.MOVE_TO_REGRASP_TEMP_APPROACH
+            else:
+                self.state = TaskState.MOVE_TO_HOLE_CAMERA_POSE
+
+        elif self.state == TaskState.MOVE_TO_REGRASP_TEMP_APPROACH:
+            target_pose = self.make_regrasp_temp_place_pose(
+                z_offset_mm=self.ctx.regrasp_temp_approach_z_offset_mm,
+            )
+            self.motion.move_l_and_wait(
+                target_pose,
+                speed=self.ctx.approach_move_l_speed,
+                acc=self.ctx.approach_move_l_acc,
+                preserve_orientation=True,
+            )
+            self.state = TaskState.DESCEND_TO_REGRASP_TEMP_PLACE
+
+        elif self.state == TaskState.DESCEND_TO_REGRASP_TEMP_PLACE:
+            target_pose = self.make_regrasp_temp_place_pose(z_offset_mm=0.0)
+            self.motion.move_l_and_wait(
+                target_pose,
+                speed=self.ctx.descend_move_l_speed,
+                acc=self.ctx.descend_move_l_acc,
+                preserve_orientation=True,
+            )
+            self.state = TaskState.RELEASE_AT_REGRASP_TEMP_PLACE
+
+        elif self.state == TaskState.RELEASE_AT_REGRASP_TEMP_PLACE:
+            self.get_logger().info(
+                "[REGRASP] release peg at temporary flat place. "
+                "Do not mark jig as used."
+            )
+            self.gripper.open()
+            time.sleep(self.ctx.release_wait_sec)
+            self.state = TaskState.LIFT_FROM_REGRASP_TEMP_PLACE
+
+        elif self.state == TaskState.LIFT_FROM_REGRASP_TEMP_PLACE:
+            target_pose = self.make_regrasp_temp_place_pose(
+                z_offset_mm=self.ctx.regrasp_temp_lift_z_offset_mm,
+            )
+            self.motion.move_l_and_wait(
+                target_pose,
+                speed=self.ctx.approach_move_l_speed,
+                acc=self.ctx.approach_move_l_acc,
+                preserve_orientation=True,
+            )
+
+            # 임시 재배치 완료 후 다시 peg 촬영부터 시작한다.
+            # jig count는 감소시키지 않고, current task만 비운다.
+            self.clear_current_task()
+            self.clear_recovery_pose()
+            self.state = TaskState.MOVE_TO_PEG_CAMERA_POSE
 
         elif self.state == TaskState.MOVE_TO_HOLE_CAMERA_POSE:
             # J1은 경유 각도, J2~J6은 hole 카메라 자세로 먼저 정렬
@@ -1411,22 +1584,22 @@ class PegInHoleController(Node):
 
             target_pose = self.ctx.current_hole_place_pose.copy()
 
-            # 네모/십자가는 90도 대칭이므로 place rz를 -90~0도 범위로 접는다.
+            # 네모/십자가는 90도 대칭이므로 place rz를 0~90도 범위로 접는다.
             if self.ctx.current_target_id == 1:
                 raw_yaw = float(target_pose[5])
                 target_pose[0] += 2.0
-                target_pose[5] = self._normalize_place_yaw_minus90_to_0_deg(raw_yaw + 45.0)
+                target_pose[5] = self._normalize_yaw_0_to_90_deg(raw_yaw + 45.0)
                 self.get_logger().info(
                     f"[PLACE SQUARE APPROACH] apply x offset +2.0 mm, "
-                    f"yaw +45 then fold[-90,0]: {raw_yaw:.3f} -> {target_pose[5]:.3f}, "
+                    f"yaw +45 then mod90: {raw_yaw:.3f} -> {target_pose[5]:.3f}, "
                     f"target x = {target_pose[0]:.2f}"
                 )
 
             elif self.ctx.current_target_id == 2:
                 raw_yaw = float(target_pose[5])
-                target_pose[5] = self._normalize_place_yaw_minus90_to_0_deg(raw_yaw)
+                target_pose[5] = self._normalize_yaw_0_to_90_deg(raw_yaw)
                 self.get_logger().info(
-                    f"[PLACE CROSS APPROACH] yaw fold[-90,0]: "
+                    f"[PLACE CROSS APPROACH] yaw mod90: "
                     f"{raw_yaw:.3f} -> {target_pose[5]:.3f}"
                 )
 
@@ -1487,10 +1660,10 @@ class PegInHoleController(Node):
             if self.ctx.current_target_id == 1:
                 raw_yaw = float(target_pose[5])
                 target_pose[0] += 2.0
-                target_pose[5] = self._normalize_place_yaw_minus90_to_0_deg(raw_yaw + 45.0)
+                target_pose[5] = self._normalize_yaw_deg(raw_yaw + 45.0)
                 self.get_logger().info(
                     f"[PLACE OFFSET] square descend. apply x offset +2.0 mm, "
-                    f"yaw +45 then fold[-90,0]: {raw_yaw:.3f} -> {target_pose[5]:.3f}, "
+                    f"yaw +45.0 deg: {raw_yaw:.3f} -> {target_pose[5]:.3f}, "
                     f"target x = {target_pose[0]:.2f}"
                 )
 

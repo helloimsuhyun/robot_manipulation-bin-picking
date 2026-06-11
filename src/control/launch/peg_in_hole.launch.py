@@ -44,7 +44,7 @@ def generate_launch_description():
         'trigger_peg_topic': '/manipulation/trigger_peg',
         'trigger_hole_topic': '/manipulation/trigger_hole',
         'camera_settle_sec': 0.5,
-        'vision_wait_timeout_sec': 2.0,
+        'vision_wait_timeout_sec': 6.0,
 
         # ===== 대기/timeout =====
         'grasp_wait_sec': 1.0,
