@@ -248,7 +248,7 @@ def generate_launch_description():
             "grip_stop": 2,
 
             "home_joint": [-90.0, 0.0, 90.0, 0.0, 90.0, 45.0],
-            "peg_camera_joint": [9.68, 8.52, 55.63, 25.85, 90.0, 35.39],
+            "peg_camera_joint": [10.87, 2.78, 79.15, 8.07, 90.0, 34.16],
             "hole_camera_joint": [-173.76, 8.07, 56.16, 25.78, 90.0, 38.83],
             "peg_return_mid_joint": [-47.0, 2.78, 79.15, 8.07, 90.0, 34.16],
 
@@ -280,7 +280,7 @@ def generate_launch_description():
             "camera_settle_sec": 0.5,
             "use_6d_peg_interface": True,
             "vision_wait_timeout_sec": 3.0,
-            "grasp_wait_sec": 1.0,
+            "grasp_wait_sec": 2.0,
             "release_wait_sec": 1.0,
             "move_start_timeout_sec": 3.0,
         }],
