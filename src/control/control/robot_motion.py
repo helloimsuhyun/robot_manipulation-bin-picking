@@ -591,9 +591,9 @@ class RobotMotion:
 
         # J6 위글링 설정
         # 안 돌면 7.0 유지, 너무 세면 5.0 / 3.0으로 낮추면 됨.
-        j6_wiggle_amp = 1.5
+        j6_wiggle_amp = 2.1
         j6_wiggle_freq_hz = 2.0
-        j6_wiggle_limit = 1.5
+        j6_wiggle_limit = 2.1
 
         try:
             while rclpy.ok():
