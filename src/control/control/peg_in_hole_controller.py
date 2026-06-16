@@ -1136,12 +1136,34 @@ class PegInHoleController(Node):
         - 접근 MOVE_L은 기존처럼 tilt 없이 수행한다.
         - 이 함수는 place_down_target_z_mm까지 내려갈 때만 사용한다.
         - 사각형/object_id=1, 십자가/object_id=2의 place rz는 -90~0도 범위로 접는다.
-        - tilt 방향은 기본적으로 최종 place rz(target_pose[5])를 기준으로 계산한다.
-        - 단, 십자가/object_id=2는 최종 place rz + 45도 방향으로 tilt한다.
 
-        기본 tilt 식:
-            rx = base_rx - tilt * sin(tilt_yaw)
-            ry = base_ry + tilt * cos(tilt_yaw)
+        사각형/object_id=1 tilt 기준:
+            기본적으로 tilt_yaw = 최종 place rz(target_pose[5])
+
+            단, 사각형은 90도 대칭이므로 place rz=0도와 -90도는 삽입 yaw로는 동등하다.
+            하지만 tilt 계산에서는 0도와 -90도가 서로 다르게 작용한다.
+
+            따라서:
+                corrected_rz = -43 deg 같은 일반 값 -> tilt_yaw = -43 deg 그대로 사용
+                corrected_rz =   0 deg              -> place rz는 0으로 유지,
+                                                       tilt_yaw 계산용으로만 -45 deg 사용
+
+            식:
+                rx = base_rx - tilt * sin(tilt_yaw)
+                ry = base_ry + tilt * cos(tilt_yaw)
+
+        십자가/object_id=2 tilt 기준:
+            기본적으로 tilt_yaw = 최종 place rz + 45 deg 방향으로 tilt한다.
+
+            단, final_rz가 -90도 근처로 접히는 경우:
+                final_rz + 45 = 약 -45 deg가 되어 실패 케이스처럼 들어갈 수 있다.
+                이 경우 place rz는 그대로 유지하고,
+                tilt_yaw 계산용으로만 0 deg를 사용한다.
+
+            따라서:
+                final_rz = -47 deg 같은 일반 값 -> tilt_yaw = final_rz + 45 = 약 -2 deg
+                final_rz = -89 deg              -> place rz는 -89로 유지,
+                                                    tilt_yaw 계산용으로만 0 deg 사용
 
         주의:
             target_pose[5]는 실제 로봇 place rz이다.
@@ -1153,17 +1175,23 @@ class PegInHoleController(Node):
         target_pose = self.ctx.current_hole_place_pose.copy()
         target_pose[2] = self.ctx.place_down_target_z_mm
 
-        # 필요 시 전역 x 보정이 필요하면 아래 줄을 다시 활성화한다.
+        # 기존 전역 x 보정 유지
         target_pose[0] += 4.0
 
         base_rx = float(self.ctx.flat_tcp_rx_deg)
         base_ry = float(self.ctx.flat_tcp_ry_deg)
         tilt_deg = float(self.ctx.place_tilt_deg)
 
+        # 특정 object에서 tilt_yaw를 강제로 지정할 때 사용
+        # None이면 마지막 공통 분기에서 계산한다.
+        tilt_yaw_override_deg = None
+
         # ------------------------------------------------------------
         # 사각형 peg/object_id=1
         # - 최종 place rz: (raw_yaw - 45)를 -90~0 범위로 접음
-        # - tilt 방향: 최종 place rz 기준
+        # - tilt 방향:
+        #   일반 값: 최종 place rz 기준
+        #   단, 최종 place rz가 0이면 tilt 계산용으로만 -45 사용
         # ------------------------------------------------------------
         if self.ctx.current_target_id == 1:
             raw_yaw = float(target_pose[5])
@@ -1173,17 +1201,30 @@ class PegInHoleController(Node):
             target_pose[5] = corrected_yaw
             tilt_deg += 5.0
 
+            square_tilt_yaw_deg = float(target_pose[5])
+
+            # 중요:
+            # 사각형에서 place rz=0도는 삽입 yaw로는 맞지만,
+            # tilt 계산에 그대로 쓰면 원하는 모서리/면 방향이 안 맞는다.
+            # 성공 케이스 기준으로 tilt 계산용 yaw만 -45도로 해석한다.
+            if abs(square_tilt_yaw_deg) < 1e-6:
+                square_tilt_yaw_deg = -45.0
+
+            tilt_yaw_override_deg = square_tilt_yaw_deg
+
             self.get_logger().info(
                 f"[PLACE SQUARE] apply x offset +2.0 mm, "
                 f"place rz: yaw -45 then fold[-90,0] {raw_yaw:.3f} -> {target_pose[5]:.3f}, "
-                f"tilt_yaw=final_rz={target_pose[5]:.3f}, "
+                f"tilt_yaw_for_square={tilt_yaw_override_deg:.3f}, "
                 f"target x={target_pose[0]:.2f}, total tilt={tilt_deg:.2f}deg"
             )
 
         # ------------------------------------------------------------
         # 십자가 peg/object_id=2
         # - 최종 place rz: raw_yaw를 -90~0 범위로 접음
-        # - tilt 방향: 최종 place rz + 45도
+        # - 기본 tilt 방향: 최종 place rz + 45도
+        # - 특수 케이스:
+        #   final_rz가 -90도 근처이면 tilt_yaw를 0도로 강제
         # - XY offset 방향은 기존처럼 place rz 기준 + 안정화 로직 유지
         # ------------------------------------------------------------
         elif self.ctx.current_target_id == 2:
@@ -1241,11 +1282,37 @@ class PegInHoleController(Node):
             # 십자가만 4 mm 덜 내려가게 함
             target_pose[2] += 4.0
 
-            cross_tilt_yaw_deg = self._normalize_yaw_deg(float(target_pose[5]) + 45.0)
+            # --------------------------------------------------------
+            # 십자가 tilt 방향 보정
+            # --------------------------------------------------------
+            # 기본:
+            #   final_rz + 45
+            #
+            # 성공 케이스:
+            #   raw_yaw=43, final_rz=-47
+            #   tilt_yaw=-2
+            #
+            # 실패 케이스:
+            #   raw_yaw=1, final_rz=-89
+            #   기존 tilt_yaw=-44
+            #
+            # 보정:
+            #   final_rz가 -90도 근처이면 place rz는 유지하고
+            #   tilt_yaw 계산용으로만 0도를 사용한다.
+            # --------------------------------------------------------
+            cross_final_rz_deg = float(target_pose[5])
+            cross_tilt_yaw_default_deg = self._normalize_yaw_deg(cross_final_rz_deg + 45.0)
+            cross_tilt_yaw_deg = cross_tilt_yaw_default_deg
+
+            if cross_final_rz_deg <= -67.5:
+                cross_tilt_yaw_deg = 0.0
+
+            tilt_yaw_override_deg = cross_tilt_yaw_deg
 
             self.get_logger().info(
                 f"[PLACE CROSS] rz fold[-90,0]: {raw_yaw:.3f} -> {target_pose[5]:.3f}, "
-                f"tilt_yaw=final_rz+45={cross_tilt_yaw_deg:.3f}, "
+                f"tilt_yaw_default=final_rz+45={cross_tilt_yaw_default_deg:.3f}, "
+                f"tilt_yaw_for_cross={cross_tilt_yaw_deg:.3f}, "
                 f"offset_ref_yaw={cross_offset_ref_yaw_deg:.3f}, "
                 f"offset_selected_yaw={offset_source_yaw_deg:.3f}, "
                 f"offset_flipped={offset_flipped}, "
@@ -1258,12 +1325,24 @@ class PegInHoleController(Node):
         # ------------------------------------------------------------
         # 최종 tilt 방향 계산
         # ------------------------------------------------------------
-        # 기본: 최종 place rz 기준
-        # 십자가: 최종 place rz + 45도 기준
-        if self.ctx.current_target_id == 0:
-            tilt_yaw_deg = float(target_pose[5])
-        else:
+        # 사각형/object_id=1:
+        #   tilt_yaw_override_deg 사용
+        #   corrected_rz=-43 -> tilt_yaw=-43
+        #   corrected_rz=0   -> tilt_yaw=-45
+        #
+        # 십자가/object_id=2:
+        #   기본은 final_rz+45
+        #   단, final_rz가 -90 근처이면 tilt_yaw_override_deg=0 사용
+        #
+        # 원형/object_id=0:
+        #   최종 place rz 기준
+        # ------------------------------------------------------------
+        if tilt_yaw_override_deg is not None:
+            tilt_yaw_deg = float(tilt_yaw_override_deg)
+        elif self.ctx.current_target_id == 2:
             tilt_yaw_deg = self._normalize_yaw_deg(float(target_pose[5]) + 45.0)
+        else:
+            tilt_yaw_deg = float(target_pose[5])
 
         tilt_yaw_rad = np.deg2rad(tilt_yaw_deg)
 

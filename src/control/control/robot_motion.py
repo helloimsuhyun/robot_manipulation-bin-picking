@@ -565,8 +565,19 @@ class RobotMotion:
 
         안전 조건:
             servo_level_max_duration_sec를 넘으면 timeout 종료 후 False 반환.
+
+        추가:
+            십자가(object_id=2)는 SERVO_LEVEL_J4_J5 timeout을 1초 더 준다.
         """
-        max_duration = float(self.ctx.servo_level_max_duration_sec)
+        current_target_id = int(getattr(self.ctx, "current_target_id", -1))
+
+        base_max_duration = float(self.ctx.servo_level_max_duration_sec)
+        max_duration = base_max_duration
+
+        # 십자가만 leveling 시간이 살짝 더 필요하므로 timeout +1.0초
+        if current_target_id == 2:
+            max_duration += 1.0
+
         stable_required = int(self.ctx.servo_level_target_stable_count)
 
         self.node.get_logger().info(
@@ -574,7 +585,9 @@ class RobotMotion:
             f"tol_j4={self.ctx.servo_level_j4_tol_deg:.3f}deg, "
             f"tol_j5={self.ctx.servo_level_j5_tol_deg:.3f}deg, "
             f"stable_required={stable_required}, "
-            f"max_duration={max_duration:.2f}s"
+            f"base_max_duration={base_max_duration:.2f}s, "
+            f"max_duration={max_duration:.2f}s, "
+            f"target_id={current_target_id}"
         )
 
         state = self.request_valid_state()
@@ -655,13 +668,13 @@ class RobotMotion:
                 prev_target_torque[5] = 0.0
 
                 # ------------------------------------------------------------
-                # 2) 십자가(object_id=2)일 때만 J6 위글링을 smoothing 이후 직접 추가
+                # 2) 사각형/십자가일 때만 J6 위글링을 smoothing 이후 직접 추가
                 #    이렇게 해야 tau6가 j6_wiggle_raw를 실제로 따라간다.
                 # ------------------------------------------------------------
                 j6_wiggle_raw = 0.0
                 j6_wiggle_cmd = 0.0
 
-                if int(getattr(self.ctx, "current_target_id", -1)) in (1, 2):
+                if current_target_id in (1, 2):
                     j6_wiggle_raw = float(j6_wiggle_amp) * np.sin(
                         2.0 * np.pi * float(j6_wiggle_freq_hz) * elapsed
                     )
