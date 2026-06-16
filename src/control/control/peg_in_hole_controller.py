@@ -1160,10 +1160,17 @@ class PegInHoleController(Node):
                 이 경우 place rz는 그대로 유지하고,
                 tilt_yaw 계산용으로만 0 deg를 사용한다.
 
-            따라서:
-                final_rz = -47 deg 같은 일반 값 -> tilt_yaw = final_rz + 45 = 약 -2 deg
-                final_rz = -89 deg              -> place rz는 -89로 유지,
-                                                    tilt_yaw 계산용으로만 0 deg 사용
+        십자가 XY offset 기준:
+            TCP 기준으로 tilt하면 gripper 끝단/peg 끝단 위치가 XY 평면에서 밀린다.
+            따라서 flat 자세의 끝단 방향과 tilted 자세의 끝단 방향 차이를 계산해서,
+            그 방향으로 offset_mm 만큼 보정한다.
+
+            offset 크기:
+                기존과 동일하게 17 mm 유지
+
+            gripper 끝단 방향:
+                현재 flat rx=90도 구조에서는 TCP local -Y가 아래 방향이므로,
+                local_tip_dir = [0, -1, 0]으로 둔다.
 
         주의:
             target_pose[5]는 실제 로봇 place rz이다.
@@ -1225,97 +1232,121 @@ class PegInHoleController(Node):
         # - 기본 tilt 방향: 최종 place rz + 45도
         # - 특수 케이스:
         #   final_rz가 -90도 근처이면 tilt_yaw를 0도로 강제
-        # - XY offset 방향은 기존처럼 place rz 기준 + 안정화 로직 유지
+        # - XY offset:
+        #   flat 자세와 tilted 자세의 gripper 끝단 위치 차이로 계산
         # ------------------------------------------------------------
         elif self.ctx.current_target_id == 2:
             raw_yaw = float(target_pose[5])
             corrected_yaw = self._normalize_yaw_minus90_to_0_deg(raw_yaw)
 
             extra_tilt_deg = 17.0
-            offset_mm = 17.0
+            offset_mm = 23.0
 
             target_pose[5] = corrected_yaw
             tilt_deg += extra_tilt_deg
-
-            # --------------------------------------------------------
-            # 십자가 XY offset 방향 안정화
-            # --------------------------------------------------------
-            offset_source_yaw_deg = float(target_pose[5])
-            offset_source_yaw_rad = np.deg2rad(offset_source_yaw_deg)
-
-            offset_vec = np.array(
-                [
-                    np.cos(offset_source_yaw_rad),
-                    np.sin(offset_source_yaw_rad),
-                ],
-                dtype=float,
-            )
-
-            # 기준 방향:
-            # 십자가가 잘 들어가던 offset 방향을 여기에 둔다.
-            # 만약 이 방향 자체가 반대라면 -45.0을 135.0으로 바꾸면 된다.
-            cross_offset_ref_yaw_deg = -45.0
-            cross_offset_ref_yaw_rad = np.deg2rad(cross_offset_ref_yaw_deg)
-
-            ref_vec = np.array(
-                [
-                    np.cos(cross_offset_ref_yaw_rad),
-                    np.sin(cross_offset_ref_yaw_rad),
-                ],
-                dtype=float,
-            )
-
-            offset_flipped = False
-
-            # offset_vec가 기준 방향의 반대쪽을 보고 있으면 180도 뒤집는다.
-            if float(np.dot(offset_vec, ref_vec)) < 0.0:
-                offset_vec *= -1.0
-                offset_source_yaw_deg = self._normalize_yaw_deg(offset_source_yaw_deg + 180.0)
-                offset_flipped = True
-
-            dx = offset_mm * offset_vec[0]
-            dy = offset_mm * offset_vec[1]
-
-            target_pose[0] += dx
-            target_pose[1] += dy
 
             # 십자가만 4 mm 덜 내려가게 함
             target_pose[2] += 4.0
 
             # --------------------------------------------------------
-            # 십자가 tilt 방향 보정
-            # --------------------------------------------------------
-            # 기본:
-            #   final_rz + 45
-            #
-            # 성공 케이스:
-            #   raw_yaw=43, final_rz=-47
-            #   tilt_yaw=-2
-            #
-            # 실패 케이스:
-            #   raw_yaw=1, final_rz=-89
-            #   기존 tilt_yaw=-44
-            #
-            # 보정:
-            #   final_rz가 -90도 근처이면 place rz는 유지하고
-            #   tilt_yaw 계산용으로만 0도를 사용한다.
+            # 1) 십자가 tilt 방향 계산
             # --------------------------------------------------------
             cross_final_rz_deg = float(target_pose[5])
-            cross_tilt_yaw_default_deg = self._normalize_yaw_deg(cross_final_rz_deg + 45.0)
+            cross_tilt_yaw_default_deg = self._normalize_yaw_deg(
+                cross_final_rz_deg + 45.0
+            )
             cross_tilt_yaw_deg = cross_tilt_yaw_default_deg
 
+            # final_rz가 -90도 근처이면 place rz는 유지하고
+            # tilt_yaw 계산용으로만 0도를 사용한다.
             if cross_final_rz_deg <= -67.5:
                 cross_tilt_yaw_deg = 0.0
 
             tilt_yaw_override_deg = cross_tilt_yaw_deg
 
+            # --------------------------------------------------------
+            # 2) 십자가 XY offset 보정
+            # --------------------------------------------------------
+            # 기존 방식:
+            #   offset 방향을 yaw 하나로 직접 지정
+            #
+            # 수정 방식:
+            #   flat 자세에서의 gripper 끝단 방향과
+            #   tilted 자세에서의 gripper 끝단 방향 차이를 계산한다.
+            #
+            # 보정식:
+            #   offset_dir_xy = (R_flat @ local_tip_dir - R_tilt @ local_tip_dir)[:2]
+            #
+            # 의미:
+            #   TCP를 기준으로 tilt하면서 끝단이 밀린 만큼,
+            #   TCP 목표점을 반대로 옮겨서 끝단이 jig 중심에 오도록 한다.
+            # --------------------------------------------------------
+            cross_tilt_yaw_rad = np.deg2rad(float(cross_tilt_yaw_deg))
+
+            tilted_rx = base_rx - tilt_deg * np.sin(cross_tilt_yaw_rad)
+            tilted_ry = base_ry + tilt_deg * np.cos(cross_tilt_yaw_rad)
+            final_rz = float(target_pose[5])
+
+            R_flat = self._pose6_to_R_zyx(
+                np.array(
+                    [
+                        0.0,
+                        0.0,
+                        0.0,
+                        base_rx,
+                        base_ry,
+                        final_rz,
+                    ],
+                    dtype=float,
+                )
+            )
+
+            R_tilt = self._pose6_to_R_zyx(
+                np.array(
+                    [
+                        0.0,
+                        0.0,
+                        0.0,
+                        tilted_rx,
+                        tilted_ry,
+                        final_rz,
+                    ],
+                    dtype=float,
+                )
+            )
+
+            # flat rx=90도 구조에서 TCP local -Y가 gripper 아래 방향이다.
+            local_tip_dir = np.array([0.0, -1.0, 0.0], dtype=float)
+
+            flat_tip_dir = R_flat @ local_tip_dir
+            tilted_tip_dir = R_tilt @ local_tip_dir
+
+            offset_dir_xy = (flat_tip_dir - tilted_tip_dir)[:2]
+            offset_norm = float(np.linalg.norm(offset_dir_xy))
+
+            if offset_norm < 1e-9:
+                self.get_logger().warn(
+                    "[PLACE CROSS OFFSET] offset direction norm is too small. "
+                    "Skip XY offset."
+                )
+                dx = 0.0
+                dy = 0.0
+                offset_dir_xy_unit = np.array([0.0, 0.0], dtype=float)
+            else:
+                offset_dir_xy_unit = offset_dir_xy / offset_norm
+                dx = offset_mm * offset_dir_xy_unit[0]
+                dy = offset_mm * offset_dir_xy_unit[1]
+
+            target_pose[0] += dx
+            target_pose[1] += dy
+
             self.get_logger().info(
                 f"[PLACE CROSS] rz fold[-90,0]: {raw_yaw:.3f} -> {target_pose[5]:.3f}, "
                 f"tilt_yaw_default=final_rz+45={cross_tilt_yaw_default_deg:.3f}, "
                 f"tilt_yaw_for_cross={cross_tilt_yaw_deg:.3f}, "
-                f"offset_ref_yaw={cross_offset_ref_yaw_deg:.3f}, "
-                f"offset_selected_yaw={offset_source_yaw_deg:.3f}, "
-                f"offset_flipped={offset_flipped}, "
+                f"flat_tip_dir={np.round(flat_tip_dir, 4).tolist()}, "
+                f"tilted_tip_dir={np.round(tilted_tip_dir, 4).tolist()}, "
+                f"offset_dir_xy={np.round(offset_dir_xy_unit, 4).tolist()}, "
                 f"offset dx={dx:.2f}mm, dy={dy:.2f}mm, "
                 f"apply extra tilt +{extra_tilt_deg:.2f}deg, "
                 f"target x={target_pose[0]:.2f}, y={target_pose[1]:.2f}, z={target_pose[2]:.2f}, "
@@ -1331,8 +1362,9 @@ class PegInHoleController(Node):
         #   corrected_rz=0   -> tilt_yaw=-45
         #
         # 십자가/object_id=2:
+        #   tilt_yaw_override_deg 사용
         #   기본은 final_rz+45
-        #   단, final_rz가 -90 근처이면 tilt_yaw_override_deg=0 사용
+        #   단, final_rz가 -90 근처이면 tilt_yaw=0 사용
         #
         # 원형/object_id=0:
         #   최종 place rz 기준
@@ -1414,6 +1446,35 @@ class PegInHoleController(Node):
         )
 
         return target_pose
+    
+    def relax_gripper_for_cross_insert(self):
+        """
+        십자가 삽입 시에만 그리퍼를 아주 짧게 열었다가 stop한다.
+
+        목적:
+            - 십자가가 jig에 일부 걸린 뒤, gripper가 너무 강하게 물고 있어서
+              leveling/위글링 중 peg가 자연스럽게 자리잡는 것을 방해하는 문제를 줄인다.
+
+        주의:
+            - 완전히 release하는 것이 아니라 짧은 open pulse 후 stop한다.
+            - open_time_sec가 너무 길면 peg가 빠질 수 있으므로 0.05~0.12초 정도부터 시작한다.
+        """
+        if self.ctx.current_target_id != 2:
+            return
+
+        open_time_sec = 0.08
+        settle_time_sec = 0.05
+
+        self.get_logger().info(
+            f"[GRIP RELAX] cross insert only. "
+            f"open pulse {open_time_sec:.2f}s then stop."
+        )
+
+        self.gripper.open()
+        time.sleep(open_time_sec)
+
+        self.gripper.stop()
+        time.sleep(settle_time_sec)
 
     def save_last_pick_pose(self):
         if self.ctx.current_peg_pick_pose is None:
@@ -1755,6 +1816,10 @@ class PegInHoleController(Node):
                 duration_sec=self.ctx.servo_insert_duration_sec,
                 log_name="SERVO_INSERT_DOWN",
             )
+
+            # 십자가는 삽입 후 leveling/위글링 전에 그리퍼를 살짝 풀어준다.
+            self.relax_gripper_for_cross_insert()
+
             self.state = TaskState.SERVO_LEVEL_J4_J5
 
         elif self.state == TaskState.SERVO_LEVEL_J4_J5:
