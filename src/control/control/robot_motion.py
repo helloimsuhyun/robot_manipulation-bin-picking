@@ -576,7 +576,7 @@ class RobotMotion:
 
         # 십자가만 leveling 시간이 살짝 더 필요하므로 timeout +1.0초
         if current_target_id == 2:
-            max_duration += 1.0
+            max_duration += 0.5
 
         stable_required = int(self.ctx.servo_level_target_stable_count)
 
@@ -604,9 +604,9 @@ class RobotMotion:
 
         # J6 위글링 설정
         # 안 돌면 7.0 유지, 너무 세면 5.0 / 3.0으로 낮추면 됨.
-        j6_wiggle_amp = 2.1
+        j6_wiggle_amp = 1.7
         j6_wiggle_freq_hz = 1.5
-        j6_wiggle_limit = 2.1
+        j6_wiggle_limit = 1.7
 
         try:
             while rclpy.ok():
