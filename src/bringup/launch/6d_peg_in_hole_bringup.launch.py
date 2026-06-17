@@ -203,7 +203,7 @@ def generate_launch_description():
             # ROI 가장자리 reject.
             # 0이면 hard reject 거의 없음.
             # 가장자리 후보가 선택되면 20~40으로 증가.
-            "empty_space_roi_edge_reject_px": 50.0,
+            "empty_space_roi_edge_reject_px": 30.0,
 
             # weighted score 가중치.
             # 물체와 멀수록 좋음 + 원래 pose6 위치와 가까울수록 좋음을 동시에 고려.
