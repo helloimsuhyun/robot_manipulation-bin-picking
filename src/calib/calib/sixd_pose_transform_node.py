@@ -1518,15 +1518,20 @@ class ObjectPoseTransformNode(Node):
     def apply_empty_space_override_if_needed(self, target: Dict[str, Any]) -> Dict[str, Any]:
         """For tilted_grasp negative output id, append selected empty-space world X/Y.
 
-        Important output policy:
+        Output policy:
           - Do NOT replace the original object grasp pose6.
           - Keep target_pose6 as the pose computed from the object 6D pose.
-          - If output id is negative and a valid empty-space candidate exists, attach
-            empty_space_world_xy_mm=[x_mm, y_mm].
+          - Normal object:
+                [id, pose6]                                      len=7
+          - Tilted object + valid empty-space:
+                [-id, pickup_pose6, empty_x, empty_y]             len=9
+          - Tilted object + no valid empty-space:
+                [-id, pickup_pose6, pickup_x, pickup_y, -99]      len=10
 
-        Therefore /vision/peg_targets becomes:
-          normal success:    [id, x, y, z, rx, ry, rz]                  len=7
-          tilted + empty:    [-id, x, y, z, rx, ry, rz, empty_x, empty_y] len=9
+        Meaning:
+          - data[1:7] is always the pickup pose6.
+          - data[7], data[8] are empty-space world XY if valid.
+          - if data[9] == -99, empty-space is invalid and data[7:9] is fallback pickup XY.
         """
         out = dict(target)
         target_pose6 = np.asarray(target["target_pose6"], dtype=np.float64).reshape(6).copy()
@@ -1536,11 +1541,11 @@ class ObjectPoseTransformNode(Node):
         enable_append = bool(self.get_parameter("empty_space_override_on_negative_tilted_id").value)
         should_append = bool(enable_append and tilted_grasp_used and target_id < 0)
 
-        # Keep original pose6 always.  The empty-space XY is additional metadata/output,
-        # not a replacement for pose6 X/Y.
+        # Always keep original pickup pose6.
+        # Empty-space XY is metadata appended after pose6, not replacement of pose6 x/y.
         out["target_pose6"] = target_pose6
 
-        # Keep old key names for log compatibility, but the behavior is append, not override.
+        # Reset empty-space fields first.
         out["empty_space_override_checked"] = bool(tilted_grasp_used and target_id < 0)
         out["empty_space_override_used"] = False
         out["empty_space_override_reason"] = "not_tilted_grasp_negative_output_id"
@@ -1548,7 +1553,10 @@ class ObjectPoseTransformNode(Node):
         out["empty_space_append_checked"] = bool(tilted_grasp_used and target_id < 0)
         out["empty_space_append_used"] = False
         out["empty_space_append_reason"] = "not_tilted_grasp_negative_output_id"
+
         out.pop("empty_space_world_xy_mm", None)
+        out.pop("empty_space_selected", None)
+        out.pop("empty_space_status_code", None)
 
         if not should_append:
             if not enable_append:
@@ -1559,25 +1567,59 @@ class ObjectPoseTransformNode(Node):
         base_T_ee = pose6_mm_deg_to_T_mm(self.pending_trigger_msg.data[3:9])
         validate_T(base_T_ee, name="empty_space_append_base_T_ee")
 
+        # fallback XY is original pickup pose6 x/y in base/world frame.
         fallback_xy = (float(target_pose6[0]), float(target_pose6[1]))
-        selected = self.select_empty_space_world_xy(base_T_ee, fallback_xy_mm=fallback_xy)
+
+        selected = self.select_empty_space_world_xy(
+            base_T_ee,
+            fallback_xy_mm=fallback_xy,
+        )
 
         if selected is None:
-            out["empty_space_override_reason"] = "no_valid_empty_space_candidate_no_append"
-            out["empty_space_append_reason"] = "no_valid_empty_space_candidate_no_append"
+            # No valid empty-space candidate.
+            # Still publish a tilted-success response with fallback pickup XY and status -99:
+            #   [-id, pickup_pose6, pickup_x, pickup_y, -99]
+            # This prevents the controller from mistaking the response for a normal len=7 success.
+            out["empty_space_world_xy_mm"] = [
+                float(fallback_xy[0]),
+                float(fallback_xy[1]),
+            ]
+            out["empty_space_selected"] = None
+            out["empty_space_status_code"] = -99.0
+
+            out["empty_space_override_used"] = False
+            out["empty_space_override_reason"] = (
+                "no_valid_empty_space_candidate_fallback_to_original_pose6_xy"
+            )
+
+            out["empty_space_append_used"] = False
+            out["empty_space_append_reason"] = (
+                "no_valid_empty_space_candidate_append_original_pose6_xy_with_minus99"
+            )
+
+            self.get_logger().warn(
+                "[EMPTY-SPACE-WORLD] no valid empty-space candidate. "
+                f"append fallback pickup_xy=({fallback_xy[0]:.1f}, {fallback_xy[1]:.1f})mm "
+                "status=-99"
+            )
+
             return out
 
         x_mm, y_mm = selected["selected_world_xy_mm"]
 
-        # Append-only data. Do not modify target_pose6, x/y, or target_T.
+        # Valid empty-space case:
+        #   [-id, pickup_pose6, empty_x, empty_y]
         out["empty_space_world_xy_mm"] = [float(x_mm), float(y_mm)]
         out["empty_space_selected"] = selected
+        out.pop("empty_space_status_code", None)
 
         out["empty_space_override_used"] = False
         out["empty_space_override_reason"] = "append_only_original_pose6_kept"
 
         out["empty_space_append_used"] = True
-        out["empty_space_append_reason"] = "tilted_grasp_negative_output_id_append_empty_space_xy"
+        out["empty_space_append_reason"] = (
+            "tilted_grasp_negative_output_id_append_empty_space_xy"
+        )
 
         return out
 
@@ -2049,30 +2091,55 @@ class ObjectPoseTransformNode(Node):
     def object_targets_to_msg_data(targets):
         """
         Object target success format:
+
             normal object:
-                [object_id, tcp_x_mm, tcp_y_mm, tcp_z_mm, tcp_rx_deg, tcp_ry_deg, tcp_rz_deg]
+                [object_id,
+                 tcp_x_mm, tcp_y_mm, tcp_z_mm, tcp_rx_deg, tcp_ry_deg, tcp_rz_deg]
                 len = 7
 
-            tilted object with empty-space candidate:
-                [-object_id, tcp_x_mm, tcp_y_mm, tcp_z_mm, tcp_rx_deg, tcp_ry_deg, tcp_rz_deg,
+            tilted object with valid empty-space:
+                [-object_id,
+                 pickup_x_mm, pickup_y_mm, pickup_z_mm,
+                 pickup_rx_deg, pickup_ry_deg, pickup_rz_deg,
                  empty_space_world_x_mm, empty_space_world_y_mm]
                 len = 9
 
+            tilted object without valid empty-space:
+                [-object_id,
+                 pickup_x_mm, pickup_y_mm, pickup_z_mm,
+                 pickup_rx_deg, pickup_ry_deg, pickup_rz_deg,
+                 pickup_x_mm, pickup_y_mm,
+                 -99]
+                len = 10
+
         Important:
-            For negative id, pose6 is still the original object grasp pose6.
-            Empty-space world X/Y is appended after pose6; pose6 X/Y is not replaced.
+            - For negative id, pose6 is still the original object pickup/grasp pose6.
+            - Empty-space XY is appended after pose6.
+            - pose6 X/Y is never replaced.
+            - status -99 means empty-space candidate is invalid/missing.
         """
         data = []
 
         for t in targets:
             obj_id = float(t["id"])
             pose6 = np.asarray(t["target_pose6"], dtype=np.float64).reshape(6)
+
             row = [obj_id] + pose6.tolist()
 
             extra_xy = t.get("empty_space_world_xy_mm", None)
             if int(round(obj_id)) < 0 and extra_xy is not None:
                 extra_xy = np.asarray(extra_xy, dtype=np.float64).reshape(2)
-                row.extend([float(extra_xy[0]), float(extra_xy[1])])
+
+                row.extend([
+                    float(extra_xy[0]),
+                    float(extra_xy[1]),
+                ])
+
+                # Only fallback/no-empty-space case has empty_space_status_code.
+                # Valid empty-space case keeps len=9.
+                status_code = t.get("empty_space_status_code", None)
+                if status_code is not None:
+                    row.append(float(status_code))
 
             data.extend(row)
 
