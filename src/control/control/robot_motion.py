@@ -550,13 +550,12 @@ class RobotMotion:
     def run_servo_t_level_j4_j5_until_reached(self) -> bool:
         """
         4번/5번 조인트는 기존 외부 토크로 자세 복귀한다.
-        십자가(object_id=2) 삽입 중에는 마지막 조인트(J6)에만
-        1 Hz sin 토크를 추가한다.
 
         핵심:
             - J4/J5 토크: 기존 smoothing/rate-limit 유지
-            - J6 위글링 토크: smoothing 이후 target_torque[5]에 직접 대입
-            → tau6가 j6_wiggle_raw를 실제로 따라가게 함
+            - J6 위글링 토크: 사각형(object_id=1)에서만 적용
+            - 십자가(object_id=2)는 J4/J5 leveling만 수행하고 J6 위글링은 하지 않는다.
+            - J1에는 측정된 마찰보상 중 1번 조인트 보상값만 추가한다.
 
         종료 조건:
             abs(q4_err) <= servo_level_j4_tol_deg
@@ -567,14 +566,14 @@ class RobotMotion:
             servo_level_max_duration_sec를 넘으면 timeout 종료 후 False 반환.
 
         추가:
-            십자가(object_id=2)는 SERVO_LEVEL_J4_J5 timeout을 1초 더 준다.
+            십자가(object_id=2)는 SERVO_LEVEL_J4_J5 timeout을 0.5초 더 준다.
         """
         current_target_id = int(getattr(self.ctx, "current_target_id", -1))
 
         base_max_duration = float(self.ctx.servo_level_max_duration_sec)
         max_duration = base_max_duration
 
-        # 십자가만 leveling 시간이 살짝 더 필요하므로 timeout +1.0초
+        # 십자가만 leveling 시간이 살짝 더 필요하므로 timeout +0.5초
         if current_target_id == 2:
             max_duration += 0.5
 
@@ -602,11 +601,30 @@ class RobotMotion:
         stable_count = 0
         reached = False
 
+        # ------------------------------------------------------------
         # J6 위글링 설정
-        # 안 돌면 7.0 유지, 너무 세면 5.0 / 3.0으로 낮추면 됨.
-        j6_wiggle_amp = 1.7
-        j6_wiggle_freq_hz = 1.5
-        j6_wiggle_limit = 1.7
+        # 현재는 사각형(object_id=1)에만 적용한다.
+        # ------------------------------------------------------------
+        j6_wiggle_amp = 0.7
+        j6_wiggle_freq_hz = 1.0
+        j6_wiggle_limit = 0.7
+
+        # ------------------------------------------------------------
+        # J1 마찰보상 설정
+        # 참고 코드의 measured friction coefficient 중 1번 조인트만 사용.
+        #
+        # Tf1 = scale1 * (Cfc1 * tanh(k * qdot1) + Vfc1 * qdot1)
+        #
+        # 주의:
+        #   여기서 jvel[0]은 deg/s 기준이다.
+        # ------------------------------------------------------------
+        j1_cfc = 6.7569
+        j1_vfc = 0.1515
+        j1_fric_scale = 0.01
+        j1_friction_curve_coef = 8.0e-1
+
+        # 안전 제한. 너무 약하면 10.0, 너무 세면 5.0 정도로 조절.
+        j1_friction_limit = 8.0
 
         try:
             while rclpy.ok():
@@ -658,7 +676,6 @@ class RobotMotion:
 
                 # ------------------------------------------------------------
                 # 1) 기존 J4/J5 토크는 그대로 smoothing/rate-limit 적용
-                #    여기서는 J6에 아무것도 더하지 않는다.
                 # ------------------------------------------------------------
                 target_torque = self._smooth_servo_torque(raw_torque, prev_target_torque)
 
@@ -668,13 +685,13 @@ class RobotMotion:
                 prev_target_torque[5] = 0.0
 
                 # ------------------------------------------------------------
-                # 2) 사각형/십자가일 때만 J6 위글링을 smoothing 이후 직접 추가
-                #    이렇게 해야 tau6가 j6_wiggle_raw를 실제로 따라간다.
+                # 2) 사각형일 때만 J6 위글링을 smoothing 이후 직접 추가
+                #    십자가는 J4/J5 leveling만 하고 J6 위글링은 하지 않는다.
                 # ------------------------------------------------------------
                 j6_wiggle_raw = 0.0
                 j6_wiggle_cmd = 0.0
 
-                if current_target_id in (1, 2):
+                if current_target_id == 1:
                     j6_wiggle_raw = float(j6_wiggle_amp) * np.sin(
                         2.0 * np.pi * float(j6_wiggle_freq_hz) * elapsed
                     )
@@ -688,6 +705,32 @@ class RobotMotion:
                     )
 
                     target_torque[5] = j6_wiggle_cmd
+
+                # ------------------------------------------------------------
+                # 3) J1 마찰보상만 추가
+                # ------------------------------------------------------------
+                # 참고 코드의 measured friction compensation 중 1번 조인트만 사용.
+                # target_torque[0]에만 더하고, 나머지 조인트에는 적용하지 않는다.
+                #
+                # 부호가 반대로 느껴지면 아래 target_torque[0] += 를 -= 로 바꾸면 된다.
+                # ------------------------------------------------------------
+                j1_friction_raw = float(
+                    j1_fric_scale
+                    * (
+                        j1_cfc * np.tanh(j1_friction_curve_coef * float(jvel[0]))
+                        + j1_vfc * float(jvel[0])
+                    )
+                )
+
+                j1_friction_comp = float(
+                    np.clip(
+                        j1_friction_raw,
+                        -float(j1_friction_limit),
+                        float(j1_friction_limit),
+                    )
+                )
+
+                target_torque[0] += j1_friction_comp
 
                 q4_ok = abs(q4_err) <= float(self.ctx.servo_level_j4_tol_deg)
                 q5_ok = abs(q5_err) <= float(self.ctx.servo_level_j5_tol_deg)
@@ -712,11 +755,15 @@ class RobotMotion:
                     self.node.get_logger().info(
                         "[SERVO_LEVEL_J4_J5] "
                         f"remain={max_duration - elapsed:.2f}s, "
-                        f"q2={jpos[1]:.2f}, q3={jpos[2]:.2f}, "
+                        f"q1={jpos[0]:.2f}, q2={jpos[1]:.2f}, q3={jpos[2]:.2f}, "
                         f"q4={jpos[3]:.2f}, q5={jpos[4]:.2f}, q6={jpos[5]:.2f}, "
                         f"q4_des={q4_des:.2f}, q5_des={q5_des:.2f}, "
                         f"q4_err={q4_err:.2f}, q5_err={q5_err:.2f}, "
                         f"q4_err_cmd={q4_err_cmd:.2f}, q5_err_cmd={q5_err_cmd:.2f}, "
+                        f"j1_vel={jvel[0]:.3f}, "
+                        f"j1_fric_raw={j1_friction_raw:.3f}, "
+                        f"j1_fric_comp={j1_friction_comp:.3f}, "
+                        f"tau1={target_torque[0]:.3f}, "
                         f"tau4={target_torque[3]:.3f}, "
                         f"tau5={target_torque[4]:.3f}, "
                         f"tau6={target_torque[5]:.3f}, "

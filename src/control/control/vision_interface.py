@@ -29,6 +29,9 @@ class VisionInterface:
             - 음수 id는 45도 틀어진 안전 grasp pose라는 의미이다.
             - pose6은 여전히 실제 peg를 잡는 TCP pose이다.
             - empty_x/empty_y는 잡은 뒤 임시로 평평하게 내려놓을 world XY 좌표이다.
+        peg_targets safe-grasp no-empty-space = [-object_id, x, y, z, rx, ry, rz, x, y, -99] # len(data)==10
+            - 마지막 -99는 임시 빈 공간이 없다는 marker이다.
+            - x/y는 그대로 사용하되, 제어부에서 다른 z 높이로 내려놓는다.
         peg_targets legacy = [T00, T01, ... T33, object_id]   # len(data)==17
             - 이전 4x4 matrix 방식 호환용이다.
         peg_targets failure = [visible_id0, visible_id1, ...] # 그 외 길이
@@ -277,10 +280,15 @@ class VisionInterface:
         # 최신 방식 B: tilted/safe grasp success
         # data = [-object_id, x, y, z, rx, ry, rz, empty_world_x, empty_world_y]
         #
+        # 최신 방식 C: tilted/safe grasp, but no empty space
+        # data = [-object_id, x, y, z, rx, ry, rz, target_x, target_y, -99]
+        #
         # 음수 id는 object 종류가 아니라 "안전 grasp 후 임시 재배치 필요" 플래그이다.
         # 따라서 shape 판단에는 abs(raw_id)를 사용하고, raw_id < 0이면
-        # regrasp_temp_xy_mm에 msg 끝의 empty XY를 저장한다.
-        if len(data) in (7, 9):
+        # regrasp_temp_xy_mm에 msg 뒤의 x/y를 저장한다.
+        # 마지막 값이 -99이면 빈 공간이 없다는 marker로 보고,
+        # 제어부에서 같은 x/y에 다른 z 높이로 내려놓도록 flag를 세운다.
+        if len(data) in (7, 9, 10):
             raw_object_id = int(round(float(data[0])))
             object_id = abs(raw_object_id)
             needs_regrasp = raw_object_id < 0
@@ -292,23 +300,48 @@ class VisionInterface:
                 )
                 return [], []
 
-            if needs_regrasp and len(data) != 9:
-                self.node.get_logger().warn(
-                    f"[VISION SUB] Negative 6D peg id={raw_object_id} requires len=9 "
-                    "[-id, pose6, empty_x, empty_y], but len=7 was received. Ignore for safety."
-                )
-                return [], []
-
-            if (not needs_regrasp) and len(data) == 9:
-                self.node.get_logger().warn(
-                    f"[VISION SUB] len=9 received with non-negative id={raw_object_id}. "
-                    "Treat as normal grasp and ignore appended empty XY."
-                )
-
             pose6 = np.asarray(data[1:7], dtype=np.float64)
             regrasp_temp_xy = None
+            regrasp_no_empty_space = False
+
             if needs_regrasp:
-                regrasp_temp_xy = np.asarray(data[7:9], dtype=np.float64)
+                if len(data) == 9:
+                    regrasp_temp_xy = np.asarray(data[7:9], dtype=np.float64)
+
+                elif len(data) == 10:
+                    marker = int(round(float(data[9])))
+
+                    if marker != -99:
+                        self.node.get_logger().warn(
+                            f"[VISION SUB] Negative 6D peg id={raw_object_id} received len=10, "
+                            f"but marker={marker}. Expected -99. Ignore for safety. "
+                            f"raw_data={data}"
+                        )
+                        return [], []
+
+                    regrasp_temp_xy = np.asarray(data[7:9], dtype=np.float64)
+                    regrasp_no_empty_space = True
+
+                else:
+                    self.node.get_logger().warn(
+                        f"[VISION SUB] Negative 6D peg id={raw_object_id} requires len=9 "
+                        "[-id, pose6, empty_x, empty_y] or len=10 "
+                        "[-id, pose6, x, y, -99], but len=7 was received. Ignore for safety."
+                    )
+                    return [], []
+
+            else:
+                if len(data) == 9:
+                    self.node.get_logger().warn(
+                        f"[VISION SUB] len=9 received with non-negative id={raw_object_id}. "
+                        "Treat as normal grasp and ignore appended XY."
+                    )
+
+                elif len(data) == 10:
+                    self.node.get_logger().warn(
+                        f"[VISION SUB] len=10 received with non-negative id={raw_object_id}. "
+                        "Treat as normal grasp and ignore appended XY/marker."
+                    )
 
             target = VisionTarget(
                 pose=pose6.copy(),
@@ -317,12 +350,14 @@ class VisionInterface:
                 raw_object_id=raw_object_id,
                 needs_regrasp=needs_regrasp,
                 regrasp_temp_xy_mm=None if regrasp_temp_xy is None else regrasp_temp_xy.copy(),
+                regrasp_no_empty_space=regrasp_no_empty_space,
             )
 
             self.node.get_logger().info(
                 f"[VISION SUB] 6D peg grasp pose received directly: "
                 f"raw_id={raw_object_id}, id={object_id} ({self.shape_name(object_id)}), "
                 f"needs_regrasp={needs_regrasp}, "
+                f"no_empty_space={regrasp_no_empty_space}, "
                 f"pose6={np.round(pose6, 3).tolist()}, "
                 f"regrasp_temp_xy={None if regrasp_temp_xy is None else np.round(regrasp_temp_xy, 3).tolist()}"
             )
@@ -359,6 +394,7 @@ class VisionInterface:
                 raw_object_id=object_id,
                 needs_regrasp=False,
                 regrasp_temp_xy_mm=None,
+                regrasp_no_empty_space=False,
             )
 
             self.node.get_logger().info(
@@ -389,6 +425,7 @@ class VisionInterface:
                 raw_object_id=object_id,
                 needs_regrasp=False,
                 regrasp_temp_xy_mm=None,
+                regrasp_no_empty_space=False,
             )
 
             self.node.get_logger().info(

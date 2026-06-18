@@ -163,8 +163,11 @@ class PegInHoleController(Node):
                 ("skip_once_xy_tol_mm", 20.0),
 
                 # -1/-2 safe grasp 후 임시로 평평하게 내려놓는 pose
-                # x/y는 /vision/peg_targets len=9의 마지막 두 값(empty_x, empty_y)을 사용한다.
+                # x/y는 /vision/peg_targets len=9/10의 뒤쪽 x,y를 사용한다.
                 ("regrasp_temp_place_z_mm", 90.0),
+                # /vision/peg_targets가 [-id, pose6, x, y, -99]를 주면
+                # 빈 공간이 없는 케이스로 보고 이 z 높이에 내려놓는다.
+                ("regrasp_no_empty_place_z_mm", 120.0),
                 ("regrasp_temp_approach_z_offset_mm", 50.0),
                 ("regrasp_temp_lift_z_offset_mm", 50.0),
                 ("regrasp_temp_flat_rx_deg", 90.0),
@@ -273,6 +276,7 @@ class PegInHoleController(Node):
             skip_once_xy_tol_mm=self._get_float_param("skip_once_xy_tol_mm"),
 
             regrasp_temp_place_z_mm=self._get_float_param("regrasp_temp_place_z_mm"),
+            regrasp_no_empty_place_z_mm=self._get_float_param("regrasp_no_empty_place_z_mm"),
             regrasp_temp_approach_z_offset_mm=self._get_float_param("regrasp_temp_approach_z_offset_mm"),
             regrasp_temp_lift_z_offset_mm=self._get_float_param("regrasp_temp_lift_z_offset_mm"),
             regrasp_temp_flat_rx_deg=self._get_float_param("regrasp_temp_flat_rx_deg"),
@@ -466,6 +470,9 @@ class PegInHoleController(Node):
             if selected_peg.regrasp_temp_xy_mm is None
             else np.asarray(selected_peg.regrasp_temp_xy_mm, dtype=float).reshape(2).copy()
         )
+        self.ctx.current_regrasp_no_empty_space = bool(
+            getattr(selected_peg, "regrasp_no_empty_space", False)
+        )
 
         if not self.ctx.current_needs_regrasp:
             self.ctx.current_regrasp_attempt_count = 0
@@ -476,6 +483,7 @@ class PegInHoleController(Node):
             f"id = {self.ctx.current_target_id} "
             f"({self.vision.shape_name(self.ctx.current_target_id)}), "
             f"needs_regrasp = {self.ctx.current_needs_regrasp}, "
+            f"no_empty_space = {self.ctx.current_regrasp_no_empty_space}, "
             f"regrasp_temp_xy = {None if self.ctx.current_regrasp_temp_xy_mm is None else np.round(self.ctx.current_regrasp_temp_xy_mm, 3).tolist()}, "
             f"remaining_jig_counts = {dict(self.ctx.remaining_jig_counts)}"
         )
@@ -522,6 +530,7 @@ class PegInHoleController(Node):
             self.ctx.current_raw_target_id = None
             self.ctx.current_needs_regrasp = False
             self.ctx.current_regrasp_temp_xy_mm = None
+            self.ctx.current_regrasp_no_empty_space = False
             return False
 
         selected_index = None
@@ -602,6 +611,7 @@ class PegInHoleController(Node):
         self.ctx.current_raw_target_id = None
         self.ctx.current_needs_regrasp = False
         self.ctx.current_regrasp_temp_xy_mm = None
+        self.ctx.current_regrasp_no_empty_space = False
 
         self.get_logger().warn(
             "[SELECT] No peg matched with active jig layout. "
@@ -1398,7 +1408,12 @@ class PegInHoleController(Node):
         입력 source:
             x/y = /vision/peg_targets len=9 응답의 마지막 두 값
                   [-id, pose6, empty_world_x, empty_world_y]
-            z   = regrasp_temp_place_z_mm + z_offset_mm
+            일반 케이스:
+                z = regrasp_temp_place_z_mm + z_offset_mm
+
+            빈 공간 없음 marker 케이스 [-id, pose6, x, y, -99]:
+                z = regrasp_no_empty_place_z_mm + z_offset_mm
+
             rpy = regrasp_temp_flat_* 파라미터
 
         이 pose는 peg를 잡는 pose가 아니라, 잡은 뒤 바닥에 평평하게 다시
@@ -1406,16 +1421,25 @@ class PegInHoleController(Node):
         """
         if self.ctx.current_regrasp_temp_xy_mm is None:
             raise RuntimeError(
-                "No regrasp temporary empty-space XY. "
-                "Negative id response must be len=9: [-id, pose6, empty_x, empty_y]."
+                "No regrasp temporary XY. "
+                "Negative id response must be len=9 [-id, pose6, empty_x, empty_y] "
+                "or len=10 [-id, pose6, x, y, -99]."
             )
 
         xy = np.asarray(self.ctx.current_regrasp_temp_xy_mm, dtype=float).reshape(2)
+
+        if bool(getattr(self.ctx, "current_regrasp_no_empty_space", False)):
+            base_z = float(self.ctx.regrasp_no_empty_place_z_mm)
+            z_mode = "no_empty_space"
+        else:
+            base_z = float(self.ctx.regrasp_temp_place_z_mm)
+            z_mode = "normal_empty_space"
+
         pose = np.array(
             [
                 float(xy[0]),
                 float(xy[1]),
-                float(self.ctx.regrasp_temp_place_z_mm) + float(z_offset_mm),
+                base_z + float(z_offset_mm),
                 float(self.ctx.regrasp_temp_flat_rx_deg),
                 float(self.ctx.regrasp_temp_flat_ry_deg),
                 float(self.ctx.regrasp_temp_flat_rz_deg),
@@ -1424,8 +1448,9 @@ class PegInHoleController(Node):
         )
 
         self.get_logger().info(
-            f"[REGRASP TEMP PLACE POSE] xy_from_topic=({xy[0]:.2f}, {xy[1]:.2f})mm, "
-            f"base_z={self.ctx.regrasp_temp_place_z_mm:.2f}mm, "
+            f"[REGRASP TEMP PLACE POSE] mode={z_mode}, "
+            f"xy_from_topic=({xy[0]:.2f}, {xy[1]:.2f})mm, "
+            f"base_z={base_z:.2f}mm, "
             f"z_offset={float(z_offset_mm):.2f}mm, pose={np.round(pose, 3)}"
         )
         return pose
@@ -1462,19 +1487,8 @@ class PegInHoleController(Node):
         if self.ctx.current_target_id != 2:
             return
 
-        open_time_sec = 0.08
-        settle_time_sec = 0.05
 
-        self.get_logger().info(
-            f"[GRIP RELAX] cross insert only. "
-            f"open pulse {open_time_sec:.2f}s then stop."
-        )
 
-        self.gripper.open()
-        time.sleep(open_time_sec)
-
-        self.gripper.stop()
-        time.sleep(settle_time_sec)
 
     def save_last_pick_pose(self):
         if self.ctx.current_peg_pick_pose is None:
@@ -1519,6 +1533,7 @@ class PegInHoleController(Node):
         self.ctx.current_raw_target_id = None
         self.ctx.current_needs_regrasp = False
         self.ctx.current_regrasp_temp_xy_mm = None
+        self.ctx.current_regrasp_no_empty_space = False
 
     def clear_recovery_pose(self):
         self.ctx.last_pick_up_pose = None
@@ -1672,7 +1687,8 @@ class PegInHoleController(Node):
                 self.get_logger().warn(
                     f"[REGRASP] raw_id={self.ctx.current_raw_target_id} requires temporary flat place. "
                     f"attempt={self.ctx.current_regrasp_attempt_count}/{self.ctx.regrasp_max_attempts}, "
-                    f"empty_xy={np.round(self.ctx.current_regrasp_temp_xy_mm, 3).tolist()}"
+                    f"empty_xy={np.round(self.ctx.current_regrasp_temp_xy_mm, 3).tolist()}, "
+                    f"no_empty_space={self.ctx.current_regrasp_no_empty_space}"
                 )
                 time.sleep(0.5)
                 self.state = TaskState.MOVE_TO_REGRASP_TEMP_APPROACH

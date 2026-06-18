@@ -74,6 +74,10 @@ class VisionTarget:
     needs_regrasp: bool = False
     regrasp_temp_xy_mm: np.ndarray | None = None
 
+    # True이면 비전에서 [-id, pose6, x, y, -99]를 받은 케이스다.
+    # 의미: 임시로 내려놓을 빈 공간이 없으므로, 같은 x/y를 쓰되 다른 z 높이로 내려놓는다.
+    regrasp_no_empty_space: bool = False
+
 
 @dataclass
 class TaskContext:
@@ -193,12 +197,16 @@ class TaskContext:
     current_raw_target_id: int | None = None
     current_needs_regrasp: bool = False
     current_regrasp_temp_xy_mm: np.ndarray | None = None
+    current_regrasp_no_empty_space: bool = False
     current_regrasp_attempt_count: int = 0
 
     # 임시 regrasp place pose 파라미터
     # x/y는 비전 토픽의 len=9 응답 끝 두 값(empty_x, empty_y)을 사용하고,
     # z와 자세는 아래 파라미터로 고정한다.
     regrasp_temp_place_z_mm: float = 81.0
+    # [-id, pose6, x, y, -99] 수신 시 사용하는 대체 place 높이.
+    # x/y는 topic의 x/y를 그대로 쓰고, z만 이 값으로 바꾼다.
+    regrasp_no_empty_place_z_mm: float = 120.0
     regrasp_temp_approach_z_offset_mm: float = 50.0
     regrasp_temp_lift_z_offset_mm: float = 50.0
     regrasp_temp_flat_rx_deg: float = 90.0
